@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
 """Verify the Git LFS movies, build a FAT32 disk, and stage compressed web blocks."""
-import argparse, gzip, hashlib, json, subprocess, sys
+import argparse, gzip, hashlib, json, re, subprocess, sys
 from pathlib import Path
 from package_disk import build_image, sha256_file
 ROOT = Path(__file__).resolve().parent.parent
+
+def version_converter_entrypoint(site):
+    """A refreshed HTML page must not reuse a cached previous converter."""
+    version = sha256_file(site/'converter.mjs')[:16]
+    page = site/'convert.html'
+    text, count = re.subn(r'(src="\./converter\.mjs)(?:\?[^" ]*)?(")',
+                         lambda match: match[1]+'?v='+version+match[2], page.read_text())
+    if count != 1:
+        raise ValueError('Expected one converter module entrypoint')
+    page.write_text(text)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -37,6 +47,7 @@ def main():
     subprocess.run([sys.executable, str(ROOT/'tools'/'stage_media.py'), str(args.output),
                     '--expected-sha256', report['image_sha256'], '--site', str(args.site),
                     '--compression', 'gzip'], check=True)
+    version_converter_entrypoint(args.site)
 
 if __name__ == '__main__':
     main()
