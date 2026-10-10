@@ -1,0 +1,23 @@
+[package]
+name = "ue2-web"
+description = "C64 Ultimate browser frontend using the same firmware and C64/reSID cores"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+autobins = false
+
+[lib]
+name = "ue2_web"
+path = "src/main.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# SID worker pool ABI; enabled by stable web builds, optional for library tests.
+sid-partition = []
+
+[dependencies]
+ue2-host = { path = "../ue2-host" }
+anyhow = "1"
+ue2-core = { path = "../ue2-core" }
+c64-bridge = { path = "../c64-bridge" }

@@ -1,0 +1,1741 @@
+//! delta_ring.rs — reverse-debug Phase 1b: the always-on FULL-DELTA undo ring.
+//!
+//! Phase 1a (`cpu_history.rs`) is a CPU-only ring (PC + post-instruction regs +
+//! opcode) that `chis` reads. This module ADDS the other half a real *reverse-step*
+//! needs: per retired instruction, the **CPU pre-state** AND every **memory/IO write
+//! that instruction performed** (`{addr, old_value, new_value}`). With both halves an
+//! entry is *self-sufficient to UNDO*: write the `old_value`s back (reverse order) and
+//! restore the CPU registers → the machine sits at the state BEFORE that instruction.
+//!
+//! WHY a SECOND ring (not extend `CpuHistEntry`): `CpuHistEntry` stores POST-instruction
+//! registers with the trace-`p` representation (N/Z + B masked out) — it is the `chis`
+//! display row, locked to a 24-byte layout the perf/layout test pins. Reverse-step needs
+//! the COMPOSITE pre-state P (N/Z/B intact, byte-exact restore) plus a variable-length
+//! write list. Different shape, different lifetime concern → a sibling ring. Both are fed
+//! from the SAME `execute_one` retire point (no second decode/step).
+//!
+//! ALWAYS-ON, NO PRE-ARMING (user decision 2026-06-26): the write capture is NOT gated on
+//! a trace. The bus write path already knows `old_value` (Spec 753 capture, same spot);
+//! `execute_one` forwards each write into this ring every instruction. So a crash's run-up
+//! is ALWAYS reverse-debuggable — `trace on` is only an on-demand DUMP of this ring.
+//!
+//! HOT-PATH DISCIPLINE (~1 MHz): `begin` stamps a scratch pre-state header; `record_write`
+//! is one append into a pre-allocated write slab; `commit` writes the finished entry header
+//! + advances two cursors. NO allocation, NO formatting, one `enabled` branch. Both slabs
+//! are built once at `Machine::new` and never grow.
+//!
+//! MEMORY: sized for ~10 s of 6502 history on every C64 model — the instruction rate is
+//! taken at the fastest runnable model's clock (`ring_instr_per_second`), so a model
+//! switch never shrinks the window. ~3.1M instr × 24 B (entry) + ~3.1M caller chains × 8 B
+//! + ~3.9M writes × 4 B ≈ 110 MiB at the default; tunable via `TRX64_REVERSE_SECONDS`
+//! (default 10) and killed by `TRX64_CPUHISTORY=0` (shared kill-switch with Phase 1a — one
+//! knob).
+//!
+//! CONTRACT (the hard one): reverse-step restores CPU + RAM + IO-register *bytes*, NOT chip
+//! internal counters (VIC raster / CIA timers / sprite-DMA). After a reverse-step the
+//! machine is for INSPECTION, not resume-forward — to resume forward, restore a checkpoint
+//! anchor (the cycle-exact ring). This module never touches those counters.
+//!
+//! CLONE / SNAPSHOT: like Phase 1a, the ring is LIVE-TIMELINE state, not machine state. A
+//! COW fork / restored snapshot starts FRESH (empty), so `Clone` returns an empty ring of
+//! the same capacities (O(1)); it is never serialized into a `.c64re` snapshot.
+//!
+//! RING DUMP (Spec time-travel-tooling Piece 2): the EXCEPTION to "never serialized" —
+//! the `.c64rering` container deliberately persists the FULL reverse-debug buffer for the
+//! tester→dev hand-off. `to_dump`/`from_dump` round-trip the whole ring (both slabs +
+//! heads + caps + armed flag). This is a separate, opt-in container, NOT the per-state
+//! `.c64re` snapshot (that still gets a fresh ring).
+
+use serde::{Deserialize, Serialize};
+
+/// One recorded memory/IO write. `#[repr(C)]`, 4 bytes: `addr` (u16) + `old_value` +
+/// `new_value` (u8 each). `old_value` is the byte that was at `addr` BEFORE the write
+/// (the undo info); `new_value` is what the instruction stored (for `who_wrote`'s
+/// `old→new` report). Padded to 4 by alignment.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct WriteRec {
+    /// Target address of the write.
+    pub addr: u16,
+    /// Byte at `addr` BEFORE the write (undo value).
+    pub old_value: u8,
+    /// Byte the instruction wrote (for the `old→new` report).
+    pub new_value: u8,
+}
+
+/// One retired-instruction delta record: the CPU PRE-state header + a slice into the
+/// shared write slab (`[write_start, write_start + write_count)`, mapped through the
+/// slab's modulus). `#[repr(C)]`: u64 `cycle` first (8-aligned), then the u32
+/// `write_start`, the u16 `pc`, the u16 `write_count`, then the 6 register bytes →
+/// rounds up to 24 bytes.
+///
+/// REGISTERS are the PRE-execute state (the state to land on after undoing this
+/// instruction). `p` is the **COMPOSITE** status byte (N/Z/B/all flags intact, =
+/// `C64Core6510::status()`), so a restore is byte-exact — unlike `CpuHistEntry.p`,
+/// which masks N/Z/B for the trace.
+///
+/// OPCODE/OPERANDS (`opcode`/`b1`/`b2`) are set at RETIRE by `set_opcode` from the
+/// SAME decoded fields `cpu_history.push` receives (the post-execute fetch), so a
+/// `build_from_ring` trace carries a REAL disasm column (LDA/STA/JMP/…), not a
+/// blank/BRK one. Unset (interrupt-only dispatch with no opcode body) they stay 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct DeltaEntry {
+    /// CPU master clock stamp at this instruction's retire (= `CpuHistEntry.cycle`).
+    pub cycle: u64,
+    /// Monotonic index of this entry's first write in the shared write slab. The
+    /// entry's writes are `write_slab[(write_start + k) % writes_cap]` for
+    /// `k in 0..write_count`. Stale once `write_head - write_start > writes_cap`
+    /// (the slab wrapped over them) — see `writes_for`.
+    pub write_start: u32,
+    /// Program counter BEFORE this instruction (the opcode address = landing PC).
+    pub pc: u16,
+    /// Number of writes this instruction performed (0..=~8).
+    pub write_count: u16,
+    /// Accumulator BEFORE this instruction.
+    pub a: u8,
+    /// X BEFORE this instruction.
+    pub x: u8,
+    /// Y BEFORE this instruction.
+    pub y: u8,
+    /// Stack pointer BEFORE this instruction.
+    pub sp: u8,
+    /// COMPOSITE processor status BEFORE this instruction (all flags intact).
+    pub p: u8,
+    /// Opcode byte of this instruction (set at retire via `set_opcode`; 0 if the
+    /// dispatch had no normal opcode body, e.g. an interrupt-only push).
+    pub opcode: u8,
+    /// Operand byte 1 (low) — set with `opcode` at retire; 0 for 1-byte opcodes.
+    pub b1: u8,
+    /// Operand byte 2 (high) — set with `opcode` at retire; 0 for <3-byte opcodes.
+    pub b2: u8,
+}
+
+/// TRX64 feature-request #2 (`whowrote` caller chain) — the top 1..3 return-stack
+/// frames captured at a write, so `whowrote` can attribute a write done by a SHARED
+/// primitive (copy/store/loader called from many sites) to the CALLER, not just the
+/// leaf PC. `#[repr(C)]`: three u16 return addresses + a `depth` count (how many were
+/// actually read off the stack, 0..=3) + 1 pad = 8 bytes.
+///
+/// RING-SIZE DECISION (the one to flag): NOT packed into `DeltaEntry` (which is exactly
+/// 24 B with NO spare bytes — adding 6 B would round it to 32 B = +33% on the 72 MB
+/// entry slab ≈ +24 MB, and break the pinned 24-B layout + the dump codec). Instead a
+/// SEPARATE parallel slab sized to the entry slab: 8 B × entry_cap ≈ +24 MB at the 10 s
+/// default. The chain is CAPTURED ONLY for instructions that actually wrote (the caller
+/// gates the stack read on `in_flight_write_count() > 0`), so the ~1 MHz hot path pays
+/// nothing for the load/branch/compare majority; the slab slot for a no-write entry
+/// stays zeroed (`depth == 0`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(C)]
+pub struct CallerChain {
+    /// Up to three return addresses read off the stack at the write (innermost first):
+    /// `frames[0]` = the immediate caller's return address, `[1]`/`[2]` = its callers.
+    /// Unused entries are 0; `depth` says how many are valid.
+    pub frames: [u16; 3],
+    /// How many `frames` were actually read (0..=3). 0 ⇒ no chain captured (a no-write
+    /// entry, or the stack was empty / unreadable).
+    pub depth: u8,
+}
+
+/// TRX64 feature-request #1 (loop/halt ONSET capture) — the PINNED record of the
+/// control transfer that ENTERED a tight self-loop / halt-trap, captured the FIRST
+/// instant the loop is detected and EXEMPT from ring eviction so it survives no matter
+/// how long the loop then spins. See `TRX64_FEATURE_REQUESTS.md` (Wasteland_EF) #1.
+///
+/// WHY pinned-not-in-ring: a tight `JMP self` / branch-to-self floods both rings with
+/// its own body within milliseconds, so by the time `triage` runs the transfer that
+/// jumped INTO the halt has already scrolled out ("transfer older than the ring"). This
+/// record is a single struct held BESIDE the ring slabs (never overwritten by forward
+/// capture), so the entry transfer is recoverable after seconds of spinning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LoopOnset {
+    /// PC of the instruction that transferred control INTO the loop body (the
+    /// JSR/JMP/RTS/branch/fall-through that landed at `dst_pc`). This is the loop's
+    /// entry transfer — the root-cause fact the ring otherwise loses first.
+    pub src_pc: u16,
+    /// Opcode byte of that entry-transfer instruction (0 if it predates ring coverage).
+    pub src_opcode: u8,
+    /// The address the loop body starts at (where control landed = the first PC of the
+    /// detected loop set).
+    pub dst_pc: u16,
+    /// Accumulator at loop entry (PRE-state of the entry-transfer instruction).
+    pub a: u8,
+    /// X at loop entry.
+    pub x: u8,
+    /// Y at loop entry.
+    pub y: u8,
+    /// Stack pointer at loop entry.
+    pub sp: u8,
+    /// Composite processor status at loop entry.
+    pub p: u8,
+    /// CPU master clock at loop entry (the entry-transfer instruction's cycle).
+    pub cycle: u64,
+}
+
+/// TRX64 feature-request #1 — how many times the PC must re-execute within the small
+/// loop window before the onset is declared (a self-loop is detected on the first
+/// iteration regardless). Tuned low: a real hang is hit within a handful of iterations,
+/// and a legitimate short loop that runs `K` times then exits simply re-arms when the
+/// PC escapes the set, so a false onset is cheap + self-correcting.
+pub const LOOP_ITER_THRESHOLD: u32 = 4;
+
+/// TRX64 feature-request #1 — the loop-body address window size: the PC must stay
+/// within a set of ≤ this many DISTINCT instruction addresses to count as a tight loop
+/// (matches the spec's "window ≤ ~8 instructions").
+pub const LOOP_WINDOW: usize = 8;
+
+/// Default reverse-history depth in seconds (user decision: 10 s). Overridable via
+/// `TRX64_REVERSE_SECONDS`.
+pub const DEFAULT_REVERSE_SECONDS: usize = 10;
+
+/// 6502 instructions per second at the PAL clock (985 248 Hz) — the estimate the ring is
+/// sized from. ~1M cyc/s ÷ ~3.5 cyc/instr ≈ ~300k instr/s; round to 300k so 10 s ≈ 3M
+/// instructions (the spec's figure). A faster clock retires more instructions a second,
+/// so the ring does not use this figure directly: see [`ring_instr_per_second`].
+pub const INSTR_PER_SECOND: usize = 300_000;
+
+/// The clock [`INSTR_PER_SECOND`] is the estimate for: PAL's.
+const INSTR_PER_SECOND_AT_HZ: u64 = 985_248;
+
+/// The instructions-per-second estimate at `cpu_hz`: the PAL figure scaled by the clock,
+/// rounded up.
+pub fn instr_per_second_at(cpu_hz: u32) -> usize {
+    (INSTR_PER_SECOND as u64 * cpu_hz as u64).div_ceil(INSTR_PER_SECOND_AT_HZ) as usize
+}
+
+/// The rate the ring is sized for, per second of hold: the estimate at the FASTEST clock
+/// of any model that runs here (today PAL-N's 1 023 440 Hz, 311 630 a second — PAL's own
+/// rate would hold ~9.6 s on NTSC and PAL-N).
+///
+/// Why one size for every model rather than a resize on a switch: `resize` rebuilds the
+/// slabs and drops the history by contract (it is the `revdepth` knob), so a ring that
+/// followed the model would lose its whole reverse-debug window at every switch and at
+/// every rewind across one. Nothing in the ring is tied to the model — an entry is one
+/// retired instruction and its writes — so a ring big enough for the fastest clock serves
+/// every row, a switch leaves it alone, and no model is ever short of its nominal seconds.
+/// What it costs on PAL: 3.9 % more entries (3 000 000 → 3 116 300 at 10 s), ~4.1 MiB.
+pub fn ring_instr_per_second() -> usize {
+    static RATE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RATE.get_or_init(|| {
+        let fastest = crate::model::models()
+            .iter()
+            .filter(|m| m.runs())
+            .map(|m| m.timing.cpu_hz)
+            .max()
+            .unwrap_or(INSTR_PER_SECOND_AT_HZ as u32);
+        instr_per_second_at(fastest).max(INSTR_PER_SECOND)
+    })
+}
+
+/// Writes-slab over-provision factor relative to the entry count. Real code averages
+/// well under one write per instruction (loads/branches/compares write nothing), but
+/// store-heavy bursts (block copies, stack pushes, RMW) cluster; 1.25× headroom keeps
+/// the write window aligned with the instruction window so reverse-step / who_wrote see
+/// a consistent depth. (3M instr → 3.75M writes × 8 B ≈ 30 MB.)
+pub const WRITES_PER_INSTR_NUM: usize = 5;
+pub const WRITES_PER_INSTR_DEN: usize = 4;
+
+/// Always-on full-delta undo ring (reverse-debug Phase 1b).
+///
+/// Two flat slabs:
+///  * `entries` — `entry_cap` `DeltaEntry` slots, circular by `entry_head % cap`.
+///  * `writes`  — `writes_cap` `WriteRec` slots, circular by `write_head % cap`.
+///
+/// `entry_head` / `write_head` are monotonic u64 counters (never wrap in practice).
+/// The hot path is `begin` (stash the pre-state header in `cur`), `record_write`
+/// (append into `writes`, bump the in-flight count), `commit` (publish the header,
+/// advance `entry_head`). Zero allocation; both slabs are fixed at construction.
+pub struct DeltaRing {
+    /// Entry slab (pre-state headers). Boxed: lives on the heap, not inline in `Machine`.
+    entries: Box<[DeltaEntry]>,
+    /// Write slab (`{addr, old, new}` per write). Boxed for the same reason.
+    writes: Box<[WriteRec]>,
+    /// Total entries ever committed (monotonic). Newest entry = `(entry_head-1) % cap`.
+    entry_head: u64,
+    /// Total writes ever appended (monotonic). Next write slot = `write_head % cap`.
+    write_head: u64,
+    /// Scratch header for the instruction currently executing (filled by `begin`,
+    /// published by `commit`). `write_start` is the `write_head` at `begin`.
+    cur: DeltaEntry,
+    /// Whether an instruction is in flight (between `begin` and `commit`). Guards a
+    /// stray `record_write` outside an instruction (defensive; never true in product).
+    in_flight: bool,
+    /// Kill-switch (shared `TRX64_CPUHISTORY` knob). When false the whole ring is inert.
+    enabled: bool,
+
+    // ── TRX64 feature-request #2 — `whowrote` caller chain (see `CallerChain`) ───────
+    /// Parallel caller-chain slab, sized to + indexed IDENTICALLY to `entries` (slot =
+    /// `entry_index % entry_cap`). `callers[slot]` holds the top return-stack frames the
+    /// instruction at `entries[slot]` saw — populated only for instructions that wrote
+    /// (the caller gates the stack read on `in_flight_write_count()`); a no-write slot
+    /// stays `depth == 0`. Boxed for the same reason as the entry slab.
+    callers: Box<[CallerChain]>,
+    /// Scratch caller chain for the in-flight instruction (set by `set_caller_chain`
+    /// between `begin` and `commit`; published into `callers[slot]` at `commit`). Reset
+    /// each `begin` so an instruction that does not capture leaves `depth == 0`.
+    cur_callers: CallerChain,
+
+    // ── TRX64 feature-request #1 — loop/halt ONSET capture (see `LoopOnset`) ────────
+    /// The PINNED entry-transfer record, captured the first instant a tight loop / halt
+    /// is detected and held BESIDE the ring (exempt from eviction). `None` until the
+    /// first onset; re-armed (cleared) when the PC escapes the loop window. NOT serialized
+    /// (live-timeline state, like the rest of the ring).
+    loop_onset: Option<LoopOnset>,
+    /// A small sliding buffer of the most recent committed entries (oldest→newest,
+    /// capped at `LOOP_WINDOW + 1`), used by the loop-onset detector. When the current
+    /// PC matches an EARLIER entry in this buffer, the PC is circling a small address
+    /// set; the body spans from that earlier occurrence to now, and the entry transfer
+    /// is the entry IMMEDIATELY BEFORE that earlier occurrence (the instruction that
+    /// jumped INTO the body). Bounded + pre-sized → no hot-path allocation after warm-up.
+    recent: Vec<DeltaEntry>,
+    /// How many times the PC has revisited an address already in `recent` since the loop
+    /// candidate first formed (consecutive re-executions of the same small set). Crosses
+    /// `LOOP_ITER_THRESHOLD` → declare a multi-instruction tight loop. Reset to 0 when
+    /// the candidate breaks (the PC leaves the set / the body grows too large).
+    loop_iters: u32,
+    /// The loop body's start PC for the in-progress candidate (the address that first
+    /// repeated), and the pinned entry-transfer candidate for it. Held while the
+    /// iteration count climbs toward the threshold so the pin lands the ORIGINAL entry
+    /// even after several body passes. `None` when no candidate is forming.
+    cand_dst: Option<u16>,
+    cand_src: Option<DeltaEntry>,
+}
+
+impl DeltaRing {
+    /// Build a ring sized from `TRX64_REVERSE_SECONDS` (default 10 s), honoring the
+    /// shared `TRX64_CPUHISTORY` kill-switch (default-ON).
+    pub fn new() -> Self {
+        let secs = match std::env::var("TRX64_REVERSE_SECONDS") {
+            Ok(v) => v.trim().parse::<usize>().unwrap_or(DEFAULT_REVERSE_SECONDS),
+            Err(_) => DEFAULT_REVERSE_SECONDS,
+        }
+        .max(1);
+        let (entry_cap, writes_cap) = Self::caps_for_seconds(secs);
+        Self::with_capacity(entry_cap, writes_cap)
+    }
+
+    /// Build a ring with explicit slab sizes (≥ 1 each), honoring the env kill-switch.
+    pub fn with_capacity(entry_cap: usize, writes_cap: usize) -> Self {
+        let ecap = entry_cap.max(1);
+        let wcap = writes_cap.max(1);
+        let enabled = match std::env::var("TRX64_CPUHISTORY") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "false" || v == "no")
+            }
+            Err(_) => true,
+        };
+        Self {
+            entries: vec![DeltaEntry::default(); ecap].into_boxed_slice(),
+            writes: vec![WriteRec::default(); wcap].into_boxed_slice(),
+            entry_head: 0,
+            write_head: 0,
+            cur: DeltaEntry::default(),
+            in_flight: false,
+            enabled,
+            callers: vec![CallerChain::default(); ecap].into_boxed_slice(),
+            cur_callers: CallerChain::default(),
+            loop_onset: None,
+            recent: Vec::with_capacity(LOOP_WINDOW + 1),
+            loop_iters: 0,
+            cand_dst: None,
+            cand_src: None,
+        }
+    }
+
+    /// Compute the (entry_cap, writes_cap) pair for a depth in seconds — the SAME
+    /// sizing `new()` applies from `TRX64_REVERSE_SECONDS`, exposed so a runtime
+    /// `set_reverse_depth` rebuilds the ring at a new depth with identical math.
+    /// Seconds are held on every model: the rate is [`ring_instr_per_second`], the fastest
+    /// runnable clock's.
+    pub fn caps_for_seconds(secs: usize) -> (usize, usize) {
+        let secs = secs.max(1);
+        let entry_cap = secs * ring_instr_per_second();
+        let writes_cap = entry_cap * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN;
+        (entry_cap, writes_cap)
+    }
+
+    /// RUNTIME RESIZE (reverse-debug depth knob). Rebuild both slabs at new
+    /// capacities for FUTURE capture and DROP all current history (the slabs are
+    /// freshly allocated). The `enabled` (kill-switch) state is preserved. This is
+    /// NOT on the hot path — it is a deliberate `runtime/set_reverse_depth` /
+    /// `revdepth` operation. It cannot retroactively extend history: a culprit that
+    /// already scrolled out of the old ring is gone; only capture from now on uses
+    /// the new depth. (Mirrors `with_capacity`, minus the env re-read — the live
+    /// `enabled` flag is kept so a depth change does not silently re-arm a
+    /// kill-switched ring.)
+    pub fn resize(&mut self, entry_cap: usize, writes_cap: usize) {
+        let ecap = entry_cap.max(1);
+        let wcap = writes_cap.max(1);
+        self.entries = vec![DeltaEntry::default(); ecap].into_boxed_slice();
+        self.writes = vec![WriteRec::default(); wcap].into_boxed_slice();
+        // TRX64 feature-request #2 — the caller-chain slab rides the entry-slab size.
+        self.callers = vec![CallerChain::default(); ecap].into_boxed_slice();
+        self.cur_callers = CallerChain::default();
+        self.entry_head = 0;
+        self.write_head = 0;
+        self.cur = DeltaEntry::default();
+        self.in_flight = false;
+        // TRX64 feature-request #1 — a resize is a fresh-capture boundary: drop the
+        // loop-onset state too (the pinned record + detector buffer) so a new depth
+        // starts with no stale loop pin.
+        self.loop_onset = None;
+        self.recent.clear();
+        self.loop_iters = 0;
+        self.cand_dst = None;
+        self.cand_src = None;
+        // `enabled` deliberately preserved.
+    }
+
+    /// Entry-slab capacity (max retained instructions).
+    #[inline]
+    pub fn entry_capacity(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Write-slab capacity (max retained writes).
+    #[inline]
+    pub fn writes_capacity(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// Number of valid entries currently retained (`min(entry_head, entry_cap)`).
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.entry_head as usize).min(self.entries.len())
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entry_head == 0
+    }
+
+    /// TRX64 feature-request #3 — whether the entry ring has WRAPPED (evicted its
+    /// oldest entries because more instructions retired than the slab holds). True ⇒ a
+    /// reverse query that bottoms out has hit the ring boundary, NOT an empty result:
+    /// older history existed but scrolled out → the window is too short (raise revdepth
+    /// / break earlier). The write slab wraps slightly ahead of the entry slab (it is
+    /// over-provisioned), so the entry-slab wrap is the conservative "history was lost"
+    /// signal.
+    #[inline]
+    pub fn entries_wrapped(&self) -> bool {
+        self.entry_head > self.entries.len() as u64
+    }
+
+    /// Whether the kill-switch left the ring armed.
+    #[inline]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Force the armed state (test hook + perf-bench toggle, like Phase 1a).
+    #[inline]
+    pub fn set_enabled(&mut self, on: bool) {
+        self.enabled = on;
+    }
+
+    // ── Spec time-travel-tooling Piece 2 — ring dump/restore ────────────────────
+    //
+    // Serialize the WHOLE ring (both slabs + the monotonic heads + caps + armed flag)
+    // for the `.c64rering` container, and reconstruct it elsewhere. The slabs are
+    // `#[repr(C)]` POD, so they round-trip as raw LE bytes (no field-by-field codec).
+    // Only the VALID window is dumped (a wrapped ring physically stores the last `cap`
+    // entries, but the logical order matters for who_wrote/reverse_step) — the restore
+    // re-lays them so `newest()`/`who_wrote`/`writes_for` see the identical sequence.
+
+    /// Dump the ring to a [`DeltaRingDump`] (the `.c64rering` payload). Captures the
+    /// valid entries oldest→newest with each entry's own writes inlined, so a restore
+    /// is independent of the physical slab wrap. NOT on the hot path.
+    pub fn to_dump(&self) -> DeltaRingDump {
+        let len = self.len();
+        let mut entries: Vec<DeltaEntry> = Vec::with_capacity(len);
+        let mut writes: Vec<WriteRec> = Vec::new();
+        let mut scratch: Vec<WriteRec> = Vec::new();
+        let cap = self.entries.len() as u64;
+        let start = self.entry_head - len as u64;
+        for k in 0..len as u64 {
+            let slot = ((start + k) % cap) as usize;
+            let mut e = self.entries[slot];
+            self.writes_for(&e, &mut scratch);
+            // Re-base the entry's write window onto the FLAT dump-writes vec so the
+            // restore can re-lay both slabs contiguously (write_start = running count).
+            e.write_start = writes.len() as u32;
+            e.write_count = scratch.len() as u16;
+            writes.extend_from_slice(&scratch);
+            entries.push(e);
+        }
+        DeltaRingDump {
+            entry_cap: self.entries.len() as u32,
+            writes_cap: self.writes.len() as u32,
+            enabled: self.enabled,
+            entries: entries.iter().flat_map(delta_entry_to_le).collect(),
+            writes: writes.iter().flat_map(write_rec_to_le).collect(),
+        }
+    }
+
+    /// Reconstruct a ring from a [`DeltaRingDump`] (the inverse of [`to_dump`]). Lays
+    /// the dumped entries + their writes into freshly sized slabs so the restored ring
+    /// answers `newest`/`who_wrote`/`writes_for`/`reverse_step` identically to the
+    /// source. The armed flag is restored from the dump.
+    pub fn from_dump(d: &DeltaRingDump) -> Self {
+        let mut ring = Self::with_capacity(d.entry_cap.max(1) as usize, d.writes_cap.max(1) as usize);
+        ring.enabled = d.enabled;
+        let dumped_entries: Vec<DeltaEntry> =
+            d.entries.chunks_exact(DELTA_ENTRY_LE).map(delta_entry_from_le).collect();
+        let dumped_writes: Vec<WriteRec> =
+            d.writes.chunks_exact(WRITE_REC_LE).map(write_rec_from_le).collect();
+        let ecap = ring.entries.len();
+        let wcap = ring.writes.len();
+        // Replay the dumped entries in order, re-issuing their writes against the fresh
+        // slabs so the monotonic heads + write windows match (same as live capture).
+        for e in &dumped_entries {
+            let lo = e.write_start as usize;
+            let hi = lo + e.write_count as usize;
+            let ws = dumped_writes.get(lo..hi).unwrap_or(&[]);
+            // begin → record each write → commit, but bypass the enabled gate so a
+            // ring dumped while armed restores its history even if the env later
+            // disabled it (the dump IS the history; honour it).
+            let entry = DeltaEntry {
+                write_start: ring.write_head as u32,
+                ..*e
+            };
+            for w in ws {
+                let slot = (ring.write_head % wcap as u64) as usize;
+                ring.writes[slot] = *w;
+                ring.write_head = ring.write_head.wrapping_add(1);
+            }
+            let slot = (ring.entry_head % ecap as u64) as usize;
+            ring.entries[slot] = DeltaEntry { write_count: e.write_count, ..entry };
+            ring.entry_head = ring.entry_head.wrapping_add(1);
+        }
+        ring
+    }
+
+    /// HOT PATH. Open the in-flight instruction: stash its CPU PRE-state header. The
+    /// `p` argument is the COMPOSITE status (all flags). `record_write` calls between
+    /// here and `commit` attach to this entry. No allocation.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin(&mut self, pc: u16, a: u8, x: u8, y: u8, sp: u8, p: u8, cycle: u64) {
+        if !self.enabled {
+            return;
+        }
+        self.cur = DeltaEntry {
+            cycle,
+            write_start: self.write_head as u32,
+            pc,
+            write_count: 0,
+            a,
+            x,
+            y,
+            sp,
+            p,
+            opcode: 0,
+            b1: 0,
+            b2: 0,
+        };
+        // TRX64 feature-request #2 — reset the in-flight caller chain so an instruction
+        // that does not capture one leaves the slot at depth 0.
+        self.cur_callers = CallerChain::default();
+        self.in_flight = true;
+    }
+
+    /// HOT PATH (light — a struct copy). TRX64 feature-request #2: stamp the in-flight
+    /// instruction's caller chain (top return-stack frames). Called from `execute_one`
+    /// ONLY when the instruction wrote at least one byte (the caller gates on
+    /// `in_flight_write_count()`), so the load/branch/compare majority pays nothing. A
+    /// no-op when the ring is gated off / no instruction is in flight.
+    #[inline]
+    pub fn set_caller_chain(&mut self, chain: CallerChain) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        self.cur_callers = chain;
+    }
+
+    /// TRX64 feature-request #2 — the number of writes the in-flight instruction has
+    /// recorded so far. Lets `execute_one` decide whether to pay the stack-read for the
+    /// caller chain (only writers need it). 0 when no instruction is in flight.
+    #[inline]
+    pub fn in_flight_write_count(&self) -> u16 {
+        if self.enabled && self.in_flight {
+            self.cur.write_count
+        } else {
+            0
+        }
+    }
+
+    /// HOT PATH. Stamp the in-flight instruction's decoded opcode + operand bytes onto
+    /// the pending entry, called at retire with the SAME `opcode`/`b1`/`b2` the
+    /// `cpu_history` ring receives (no second decode, no extra memory read). Lets a
+    /// `build_from_ring` trace carry a REAL disasm column instead of opcode-0 (= BRK
+    /// for every row). A no-op when the ring is gated off or no instruction is in
+    /// flight (an interrupt-only dispatch leaves the entry's opcode at 0).
+    #[inline]
+    pub fn set_opcode(&mut self, opcode: u8, b1: u8, b2: u8) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        self.cur.opcode = opcode;
+        self.cur.b1 = b1;
+        self.cur.b2 = b2;
+    }
+
+    /// HOT PATH. Append one write to the in-flight instruction. `old` = the byte at
+    /// `addr` BEFORE the store (the undo value), `new` = the stored byte. One slab
+    /// store + two counter bumps. Overwrites the oldest write slot once full.
+    #[inline]
+    pub fn record_write(&mut self, addr: u16, old: u8, new: u8) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        let cap = self.writes.len();
+        let slot = (self.write_head % cap as u64) as usize;
+        self.writes[slot] = WriteRec { addr, old_value: old, new_value: new };
+        self.write_head = self.write_head.wrapping_add(1);
+        self.cur.write_count = self.cur.write_count.saturating_add(1);
+    }
+
+    /// HOT PATH. Publish the in-flight instruction's header into the entry slab and
+    /// advance `entry_head`. A no-op if `begin` was gated off / never called. One
+    /// struct store + one counter bump.
+    #[inline]
+    pub fn commit(&mut self) {
+        if !self.enabled || !self.in_flight {
+            return;
+        }
+        let cap = self.entries.len();
+        let slot = (self.entry_head % cap as u64) as usize;
+        self.entries[slot] = self.cur;
+        // TRX64 feature-request #2 — publish the in-flight caller chain into the parallel
+        // slot (zeroed for a no-write / no-capture instruction).
+        self.callers[slot] = self.cur_callers;
+        self.entry_head = self.entry_head.wrapping_add(1);
+        self.in_flight = false;
+        // TRX64 feature-request #1 — feed the just-committed instruction to the
+        // loop-onset detector (the entry now carries pre-state regs + opcode/operands).
+        self.detect_loop_onset(self.cur);
+    }
+
+    /// HOT PATH (≈ a tiny fixed scan over `recent` per instruction; no allocation after
+    /// the buffer warms up). TRX64 feature-request #1 — loop/halt ONSET capture. Fed the
+    /// just-committed `DeltaEntry` (PRE-state regs + opcode/operands). Pins the entry
+    /// transfer the FIRST instant a tight loop / halt is detected, so it survives no
+    /// matter how long the loop then spins (the recurring "transfer older than the ring"
+    /// blind spot). The pin is one-shot until a timeline boundary re-arms it via `clear`.
+    #[inline]
+    fn detect_loop_onset(&mut self, e: DeltaEntry) {
+        // The pin is one-shot — once we have an onset we only need to keep the recent
+        // buffer warm (so a future `clear`/`resize` re-arm starts clean), no re-detect.
+        if self.loop_onset.is_some() {
+            push_recent(&mut self.recent, e);
+            return;
+        }
+
+        // ── (a) SELF-LOOP: a JMP-abs / branch whose target resolves to its OWN
+        // instruction address (`JMP *` / `BNE *`). Detected on the FIRST execution —
+        // the spin-storm has not even started, so pin immediately. The entry transfer is
+        // the instruction that ran IMMEDIATELY BEFORE this self-looping PC (the newest
+        // entry in `recent` — `e` is not pushed yet).
+        if is_self_branch(e.pc, e.opcode, e.b1, e.b2) {
+            let src = self.recent.last().copied().unwrap_or(e);
+            self.set_onset(src, e.pc);
+            push_recent(&mut self.recent, e);
+            return;
+        }
+
+        // ── (b) MULTI-INSTRUCTION tight loop: the PC circles a small set of addresses
+        // (the loop body, ≤ `LOOP_WINDOW` distinct PCs) for ≥ K iterations. We ANCHOR on
+        // the first address that repeats and count how many times the PC returns to that
+        // anchor (= one full loop iteration). Body instructions BETWEEN anchor returns
+        // are still "in the recent set", so they keep the candidate alive without
+        // resetting it; only a PC that leaves the recent set entirely (a genuine escape)
+        // breaks the candidate. The entry transfer is the instruction immediately before
+        // the anchor's earlier occurrence (what jumped INTO the body).
+        let in_recent = self.recent.iter().any(|p| p.pc == e.pc);
+        match self.cand_dst {
+            Some(anchor) if anchor == e.pc => {
+                // Returned to the loop anchor — one more full iteration.
+                self.loop_iters = self.loop_iters.saturating_add(1);
+                if self.loop_iters >= LOOP_ITER_THRESHOLD {
+                    let src = self.cand_src.unwrap_or(e);
+                    self.set_onset(src, anchor);
+                }
+            }
+            Some(_) if in_recent => {
+                // Traversing the loop body between anchor returns — candidate stays.
+            }
+            _ => {
+                if in_recent {
+                    // First repeat → a loop-body candidate forms, anchored at this PC.
+                    // Its entry transfer is the instruction before this PC's earlier
+                    // occurrence in `recent`.
+                    let back = self.recent.iter().rposition(|p| p.pc == e.pc).unwrap();
+                    let src = if back > 0 { self.recent[back - 1] } else { self.recent[0] };
+                    self.cand_dst = Some(e.pc);
+                    self.cand_src = Some(src);
+                    self.loop_iters = 1;
+                } else {
+                    // The PC left the recent set entirely → escaped; reset the candidate.
+                    self.loop_iters = 0;
+                    self.cand_dst = None;
+                    self.cand_src = None;
+                }
+            }
+        }
+
+        push_recent(&mut self.recent, e);
+    }
+
+    /// TRX64 feature-request #1 — pin the loop-onset record from the entry-transfer
+    /// instruction `src` and the loop-body start `dst`. The pinned regs/cycle are the
+    /// entry transfer's own PRE-state (the state the machine had on entering the loop).
+    #[inline]
+    fn set_onset(&mut self, src: DeltaEntry, dst: u16) {
+        self.loop_onset = Some(LoopOnset {
+            src_pc: src.pc,
+            src_opcode: src.opcode,
+            dst_pc: dst,
+            a: src.a,
+            x: src.x,
+            y: src.y,
+            sp: src.sp,
+            p: src.p,
+            cycle: src.cycle,
+        });
+    }
+
+    /// Drop all history (head reset) without freeing the slabs. Used on a cold reset /
+    /// media swap (the timeline boundary — don't present pre-boundary deltas as
+    /// continuous). The slabs are retained.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.entry_head = 0;
+        self.write_head = 0;
+        self.in_flight = false;
+        // TRX64 feature-request #1 — a timeline boundary (cold reset / media swap)
+        // RE-ARMS the loop-onset detector: drop the pinned record + the detector buffer
+        // so the next run captures its OWN loop entry, not one from before the boundary.
+        self.loop_onset = None;
+        self.recent.clear();
+        self.loop_iters = 0;
+        self.cand_dst = None;
+        self.cand_src = None;
+    }
+
+    /// TRX64 feature-request #1 — the PINNED loop/halt onset record (the entry transfer
+    /// captured the first instant a tight loop / halt was detected), or `None` if no
+    /// loop has been detected since the last timeline boundary. Survives ring eviction
+    /// (held beside the slabs), so `triage` can report `loop entry: $SRC → $DST @cyc N`
+    /// even after seconds of spinning. Read-only — does not mutate the ring.
+    #[inline]
+    pub fn loop_onset(&self) -> Option<LoopOnset> {
+        self.loop_onset
+    }
+
+    /// The newest committed entry (the last retired instruction), or `None` if empty.
+    /// Copy (the struct is 24 B). This is the one reverse-step undoes first.
+    pub fn newest(&self) -> Option<DeltaEntry> {
+        if self.entry_head == 0 {
+            return None;
+        }
+        let cap = self.entries.len();
+        let slot = ((self.entry_head - 1) % cap as u64) as usize;
+        Some(self.entries[slot])
+    }
+
+    /// Whether an entry's writes are still readable (the write slab has NOT wrapped
+    /// over them). The newest entry is always readable; an old one whose
+    /// `write_start + write_count` fell behind `write_head - writes_cap` is stale.
+    #[inline]
+    fn writes_readable(&self, e: &DeltaEntry) -> bool {
+        let wcap = self.writes.len() as u64;
+        // The oldest still-live write index. A write at logical index `i` is live iff
+        // `i >= write_head - wcap`. The entry's writes span [start, start+count).
+        let oldest_live = self.write_head.saturating_sub(wcap);
+        e.write_count == 0 || e.write_start as u64 >= oldest_live
+    }
+
+    /// Copy an entry's writes (in stored order: oldest→newest as recorded) into `out`,
+    /// clearing it first. Empty if the entry has no writes OR they have been
+    /// overwritten (the slab wrapped) — caller checks `out.len() == e.write_count` to
+    /// detect the stale case. NOT on the hot path.
+    pub fn writes_for(&self, e: &DeltaEntry, out: &mut Vec<WriteRec>) {
+        out.clear();
+        if e.write_count == 0 || !self.writes_readable(e) {
+            return;
+        }
+        let cap = self.writes.len();
+        for k in 0..e.write_count as u64 {
+            let slot = ((e.write_start as u64 + k) % cap as u64) as usize;
+            out.push(self.writes[slot]);
+        }
+    }
+
+    /// Pop the newest entry off the ring (un-commit it), exposing the prior entry as
+    /// the new newest. Used by `reverse_step` AFTER it has applied the undo, so a
+    /// second reverse-step targets the previous instruction. Also rewinds the write
+    /// cursor past that entry's writes (they have been undone and are no longer part of
+    /// the live forward timeline). Returns the popped entry, or `None` if empty.
+    ///
+    /// NOTE: rewinding `write_head` is safe because the popped entry is ALWAYS the
+    /// newest, so its writes are the most-recently-appended ones (`write_head -
+    /// write_count .. write_head`) — exactly the tail we drop.
+    pub fn pop_newest(&mut self) -> Option<DeltaEntry> {
+        if self.entry_head == 0 {
+            return None;
+        }
+        let e = self.newest().unwrap();
+        self.entry_head -= 1;
+        // Rewind the write cursor past this entry's writes (the newest tail).
+        self.write_head = self.write_head.saturating_sub(e.write_count as u64);
+        Some(e)
+    }
+
+    /// Scan the ring's writes BACKWARD (newest→oldest) for the last writer(s) of
+    /// `addr`, returning up to `limit` hits as `(entry, write)` pairs, newest first.
+    /// Stops early at the first entry whose writes have been overwritten (the readable
+    /// window's edge) — beyond it the answer is in the finalized trace, not the ring.
+    /// NOT on the hot path (a `who_wrote` query, not per-instruction).
+    pub fn who_wrote(&self, addr: u16, limit: usize) -> Vec<(DeltaEntry, WriteRec)> {
+        let mut hits = Vec::new();
+        if limit == 0 {
+            return hits;
+        }
+        let len = self.len();
+        if len == 0 {
+            return hits;
+        }
+        let cap = self.entries.len();
+        // Walk entries newest → oldest.
+        for back in 0..len as u64 {
+            let logical = self.entry_head - 1 - back;
+            let slot = (logical % cap as u64) as usize;
+            let e = self.entries[slot];
+            if !self.writes_readable(&e) {
+                // This entry's writes are gone → so are all older ones. Stop.
+                break;
+            }
+            if e.write_count == 0 {
+                continue;
+            }
+            // Scan this instruction's writes newest→oldest (a later write to the same
+            // addr in the same instruction — e.g. RMW dummy then real — wins).
+            let wcap = self.writes.len();
+            for wk in (0..e.write_count as u64).rev() {
+                let wslot = ((e.write_start as u64 + wk) % wcap as u64) as usize;
+                let w = self.writes[wslot];
+                if w.addr == addr {
+                    hits.push((e, w));
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                    break; // one hit per instruction is enough for the "who wrote" answer
+                }
+            }
+        }
+        hits
+    }
+
+    /// TRX64 feature-request #2 — like [`who_wrote`] but ALSO returns each hit's
+    /// [`CallerChain`] (the top return-stack frames the writing instruction saw), so a
+    /// write done by a SHARED primitive can be attributed to the call site, not just the
+    /// leaf PC. Same newest→oldest walk + readable-edge stop. The caller chain comes from
+    /// the parallel `callers` slab at the SAME slot as the entry (so it cannot drift from
+    /// its instruction). A no-capture entry returns a `depth == 0` chain.
+    pub fn who_wrote_with_callers(
+        &self,
+        addr: u16,
+        limit: usize,
+    ) -> Vec<(DeltaEntry, WriteRec, CallerChain)> {
+        let mut hits = Vec::new();
+        if limit == 0 {
+            return hits;
+        }
+        let len = self.len();
+        if len == 0 {
+            return hits;
+        }
+        let cap = self.entries.len();
+        for back in 0..len as u64 {
+            let logical = self.entry_head - 1 - back;
+            let slot = (logical % cap as u64) as usize;
+            let e = self.entries[slot];
+            if !self.writes_readable(&e) {
+                break;
+            }
+            if e.write_count == 0 {
+                continue;
+            }
+            let wcap = self.writes.len();
+            for wk in (0..e.write_count as u64).rev() {
+                let wslot = ((e.write_start as u64 + wk) % wcap as u64) as usize;
+                let w = self.writes[wslot];
+                if w.addr == addr {
+                    hits.push((e, w, self.callers[slot]));
+                    if hits.len() >= limit {
+                        return hits;
+                    }
+                    break;
+                }
+            }
+        }
+        hits
+    }
+
+    /// The cycle range currently covered by the entry ring (`Some((oldest, newest))`)
+    /// or `None` when empty. Lets a caller report the reverse window / decide
+    /// ring-vs-trace fallback.
+    pub fn cycle_span(&self) -> Option<(u64, u64)> {
+        let len = self.len();
+        if len == 0 {
+            return None;
+        }
+        let cap = self.entries.len();
+        let oldest_slot = ((self.entry_head - len as u64) % cap as u64) as usize;
+        let newest_slot = ((self.entry_head - 1) % cap as u64) as usize;
+        Some((self.entries[oldest_slot].cycle, self.entries[newest_slot].cycle))
+    }
+
+    /// reverse-debug Phase 1c — copy every retained entry whose `cycle` is in
+    /// `[lo, hi]` (inclusive), OLDEST → NEWEST (chronological), each paired with the
+    /// writes it performed (in stored order), into `out`. Clears `out` first.
+    ///
+    /// This is the slice the `trace/build_from_ring` daemon method encodes into a
+    /// `.c64retrace`: a targeted dump of a cycle window the UI scrub-bar selected. The
+    /// ring is push-ordered by `cycle` (the CPU clock is monotonic per Spec 743), so a
+    /// forward walk of the live window is already chronological.
+    ///
+    /// An entry whose write slab has wrapped (its writes are stale) is still emitted —
+    /// its `DeltaEntry` header lives in the entry ring — but with an EMPTY write list
+    /// (the bytes are gone). This matches `writes_for`'s stale behaviour; the CPU row is
+    /// always faithful, only the mem rows for a slab-evicted entry are lost. In the
+    /// 10 s default ring a 2-thumbnail window is always well inside both slabs.
+    ///
+    /// NOT on the hot path (an on-demand dump, not per-instruction).
+    pub fn slice_by_cycle(&self, lo: u64, hi: u64, out: &mut Vec<(DeltaEntry, Vec<WriteRec>)>) -> usize {
+        out.clear();
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        let len = self.len();
+        if len == 0 {
+            return 0;
+        }
+        let cap = self.entries.len();
+        let start = self.entry_head - len as u64;
+        let mut writes_scratch: Vec<WriteRec> = Vec::new();
+        for k in 0..len as u64 {
+            let slot = ((start + k) % cap as u64) as usize;
+            let e = self.entries[slot];
+            if e.cycle < lo || e.cycle > hi {
+                continue;
+            }
+            self.writes_for(&e, &mut writes_scratch);
+            out.push((e, std::mem::take(&mut writes_scratch)));
+        }
+        out.len()
+    }
+}
+
+impl Default for DeltaRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// CLONE = a FRESH, EMPTY ring of the same capacities + armed state (live-timeline
+/// state, not machine state — same reasoning as `CpuHistoryRing`). O(1) zeroed slabs.
+impl Clone for DeltaRing {
+    fn clone(&self) -> Self {
+        Self {
+            entries: vec![DeltaEntry::default(); self.entries.len()].into_boxed_slice(),
+            writes: vec![WriteRec::default(); self.writes.len()].into_boxed_slice(),
+            entry_head: 0,
+            write_head: 0,
+            cur: DeltaEntry::default(),
+            in_flight: false,
+            enabled: self.enabled,
+            // TRX64 feature-request #2 — a clone is a fresh empty caller slab too.
+            callers: vec![CallerChain::default(); self.entries.len()].into_boxed_slice(),
+            cur_callers: CallerChain::default(),
+            // TRX64 feature-request #1 — a clone is a FRESH timeline (like the slabs):
+            // start with no loop-onset pin + an empty detector.
+            loop_onset: None,
+            recent: Vec::with_capacity(LOOP_WINDOW + 1),
+            loop_iters: 0,
+            cand_dst: None,
+            cand_src: None,
+        }
+    }
+}
+
+// ── Ring dump payload (Spec time-travel-tooling Piece 2) ──────────────────────────
+
+/// LE byte width of a serialized [`DeltaEntry`] in a [`DeltaRingDump`].
+const DELTA_ENTRY_LE: usize = 8 + 4 + 2 + 2 + 6 + 3; // cycle,write_start,pc,write_count,5 regs,opcode/b1/b2 = 25
+/// LE byte width of a serialized [`WriteRec`].
+const WRITE_REC_LE: usize = 2 + 1 + 1; // addr,old,new = 4
+
+/// TRX64 feature-request #1 — whether `opcode` (with operands `b1`/`b2`) at address
+/// `pc` is a control transfer whose target resolves to its OWN instruction = a tight
+/// self-loop (`JMP $self` or a relative branch back to itself, the classic `BNE *` /
+/// `JMP *` halt spin).
+///
+/// * `JMP $4C abs` — target = the absolute operand `(b1,b2)`; self iff it equals `pc`.
+/// * relative branch (`BPL/BMI/BVC/BVS/BCC/BCS/BNE/BEQ`) — a 2-byte instruction; the
+///   target is `(pc + 2) + (b1 as i8)`; self iff `b1 == 0xFE` (= −2), the encoding of
+///   "branch back to my own opcode" (the infinite-spin idiom).
+#[inline]
+fn is_self_branch(pc: u16, opcode: u8, b1: u8, b2: u8) -> bool {
+    match opcode {
+        // JMP abs to its own address.
+        0x4C => u16::from_le_bytes([b1, b2]) == pc,
+        // Relative branches: operand −2 lands back on the branch opcode itself.
+        0x10 | 0x30 | 0x50 | 0x70 | 0x90 | 0xB0 | 0xD0 | 0xF0 => b1 == 0xFE,
+        _ => false,
+    }
+}
+
+/// TRX64 feature-request #1 — push `e` onto the loop-onset detector's bounded recent
+/// buffer (oldest→newest), dropping the oldest once it exceeds `LOOP_WINDOW + 1`. The
+/// `+1` keeps both the loop body (≤ `LOOP_WINDOW`) AND the entry-transfer instruction
+/// before it in the window so a body-start repeat can still resolve its entry. After
+/// warm-up this is a copy + (when full) a single `remove(0)` of a ≤9-element Vec — no
+/// allocation. (A `remove(0)` on a tiny Vec is cheaper than a VecDeque's overhead here.)
+#[inline]
+fn push_recent(recent: &mut Vec<DeltaEntry>, e: DeltaEntry) {
+    if recent.len() >= LOOP_WINDOW + 1 {
+        recent.remove(0);
+    }
+    recent.push(e);
+}
+
+fn delta_entry_to_le(e: &DeltaEntry) -> [u8; DELTA_ENTRY_LE] {
+    let mut o = [0u8; DELTA_ENTRY_LE];
+    o[0..8].copy_from_slice(&e.cycle.to_le_bytes());
+    o[8..12].copy_from_slice(&e.write_start.to_le_bytes());
+    o[12..14].copy_from_slice(&e.pc.to_le_bytes());
+    o[14..16].copy_from_slice(&e.write_count.to_le_bytes());
+    o[16] = e.a;
+    o[17] = e.x;
+    o[18] = e.y;
+    o[19] = e.sp;
+    o[20] = e.p;
+    o[21] = e.opcode;
+    o[22] = e.b1;
+    o[23] = e.b2;
+    o
+}
+
+fn delta_entry_from_le(b: &[u8]) -> DeltaEntry {
+    DeltaEntry {
+        cycle: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+        write_start: u32::from_le_bytes(b[8..12].try_into().unwrap()),
+        pc: u16::from_le_bytes(b[12..14].try_into().unwrap()),
+        write_count: u16::from_le_bytes(b[14..16].try_into().unwrap()),
+        a: b[16],
+        x: b[17],
+        y: b[18],
+        sp: b[19],
+        p: b[20],
+        opcode: b[21],
+        b1: b[22],
+        b2: b[23],
+    }
+}
+
+fn write_rec_to_le(w: &WriteRec) -> [u8; WRITE_REC_LE] {
+    let mut o = [0u8; WRITE_REC_LE];
+    o[0..2].copy_from_slice(&w.addr.to_le_bytes());
+    o[2] = w.old_value;
+    o[3] = w.new_value;
+    o
+}
+
+fn write_rec_from_le(b: &[u8]) -> WriteRec {
+    WriteRec {
+        addr: u16::from_le_bytes(b[0..2].try_into().unwrap()),
+        old_value: b[2],
+        new_value: b[3],
+    }
+}
+
+/// Serializable snapshot of a whole [`DeltaRing`] for the `.c64rering` container. The
+/// two slabs ride as flat LE byte payloads (`#[serde(with)]` base64) — compact even
+/// before the container's outer gzip. `entries` holds the valid window oldest→newest
+/// (each entry's `write_start`/`write_count` index into the flat `writes`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeltaRingDump {
+    pub entry_cap: u32,
+    pub writes_cap: u32,
+    pub enabled: bool,
+    /// Flat LE entry payload (`entries.len()/DELTA_ENTRY_LE` records).
+    pub entries: Vec<u8>,
+    /// Flat LE write payload (`writes.len()/WRITE_REC_LE` records).
+    pub writes: Vec<u8>,
+}
+
+impl DeltaRingDump {
+    /// Number of valid entries carried (for the container's `RingDumpInfo`).
+    pub fn entry_count(&self) -> usize {
+        self.entries.len() / DELTA_ENTRY_LE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: record a whole instruction (begin + writes + commit). Stamps a
+    /// deterministic opcode/operand so the build_from_ring disasm round-trip is
+    /// checkable: `opcode = pc.low`, `b1 = pc.high`, `b2 = 0`.
+    fn instr(
+        r: &mut DeltaRing,
+        pc: u16,
+        regs: (u8, u8, u8, u8, u8),
+        cycle: u64,
+        writes: &[(u16, u8, u8)],
+    ) {
+        let (a, x, y, sp, p) = regs;
+        r.begin(pc, a, x, y, sp, p, cycle);
+        r.set_opcode(pc as u8, (pc >> 8) as u8, 0);
+        for &(addr, old, new) in writes {
+            r.record_write(addr, old, new);
+        }
+        r.commit();
+    }
+
+    /// TRX64 feature-request #1 — record an instruction with an EXPLICIT opcode/operand
+    /// (so a JMP/branch is decoded as such by the loop-onset detector). Default regs.
+    fn instr_op(r: &mut DeltaRing, pc: u16, opcode: u8, b1: u8, b2: u8, cycle: u64) {
+        r.begin(pc, 0, 0, 0, 0xff, 0, cycle);
+        r.set_opcode(opcode, b1, b2);
+        r.commit();
+    }
+
+    #[test]
+    fn is_self_branch_classifies_self_loops() {
+        // JMP $0801 at $0801 = self-loop; JMP elsewhere is not.
+        assert!(is_self_branch(0x0801, 0x4C, 0x01, 0x08));
+        assert!(!is_self_branch(0x0801, 0x4C, 0x00, 0x08));
+        // BNE *-... with operand $FE (−2) branches back to its own opcode = self-loop.
+        assert!(is_self_branch(0x1000, 0xD0, 0xFE, 0x00));
+        assert!(is_self_branch(0x4000, 0xF0, 0xFE, 0x00)); // BEQ self
+        // BNE with any other operand is not a self-loop.
+        assert!(!is_self_branch(0x1000, 0xD0, 0x10, 0x00));
+        // A non-branch opcode is never a self-loop.
+        assert!(!is_self_branch(0x1000, 0xEA, 0xFE, 0x00)); // NOP
+    }
+
+    #[test]
+    fn loop_onset_pins_self_jmp_entry_and_survives_spin_storm() {
+        // FEATURE #1: a `JMP $self` halt-trap. The entry transfer (a JSR that ran just
+        // before the spin) must be PINNED at onset and survive a tiny ring that the
+        // spin-storm then completely wraps over.
+        let mut r = DeltaRing::with_capacity(4, 8); // tiny: the storm wraps it in 4 instr.
+        r.set_enabled(true);
+        // The entry transfer: a JSR @ $07A6 with distinctive regs lands at $0900.
+        r.begin(0x07a6, 0x11, 0x22, 0x33, 0xfb, 0x24, 5000);
+        r.set_opcode(0x20, 0x00, 0x09); // JSR $0900
+        r.commit();
+        // The self-loop body: JMP $0900 at $0900, spun thousands of times.
+        for i in 0..5000u64 {
+            instr_op(&mut r, 0x0900, 0x4C, 0x00, 0x09, 5001 + i);
+        }
+        // The ring slab (4 entries) is long since full of $0900 spin entries…
+        assert_eq!(r.len(), 4);
+        assert!(r.newest().unwrap().pc == 0x0900);
+        // …but the PINNED onset still names the JSR that entered the loop.
+        let lo = r.loop_onset().expect("loop onset pinned");
+        assert_eq!(lo.src_pc, 0x07a6, "entry transfer PC pinned");
+        assert_eq!(lo.src_opcode, 0x20, "entry transfer opcode (JSR) pinned");
+        assert_eq!(lo.dst_pc, 0x0900, "loop body start pinned");
+        assert_eq!(lo.cycle, 5000, "entry cycle pinned");
+        assert_eq!((lo.a, lo.x, lo.y, lo.sp, lo.p), (0x11, 0x22, 0x33, 0xfb, 0x24));
+    }
+
+    #[test]
+    fn loop_onset_pins_branch_to_self() {
+        // FEATURE #1: a `BNE *` (operand −2) infinite branch.
+        let mut r = DeltaRing::with_capacity(8, 16);
+        r.set_enabled(true);
+        instr_op(&mut r, 0x2000, 0xEA, 0, 0, 100); // NOP (the predecessor / entry)
+        for i in 0..200u64 {
+            instr_op(&mut r, 0x2001, 0xD0, 0xFE, 0, 101 + i); // BNE *  (self)
+        }
+        let lo = r.loop_onset().expect("branch-to-self pinned");
+        assert_eq!(lo.src_pc, 0x2000, "predecessor NOP is the entry transfer");
+        assert_eq!(lo.dst_pc, 0x2001, "the self-branch is the loop body");
+        assert_eq!(lo.cycle, 100);
+    }
+
+    #[test]
+    fn loop_onset_pins_multi_instruction_tight_loop() {
+        // FEATURE #1: a 3-instruction body looped via a back-branch (NOT a self-branch),
+        // detected by the "PC stays in a small set for ≥ K iterations" heuristic. The
+        // PINNED entry must be the instruction that JUMPED INTO the body, not a body
+        // instruction.
+        let mut r = DeltaRing::with_capacity(64, 128);
+        r.set_enabled(true);
+        // Entry transfer: JMP $3000 from $5000 (regs distinctive).
+        r.begin(0x5000, 0xAA, 0xBB, 0xCC, 0xf0, 0x20, 9000);
+        r.set_opcode(0x4C, 0x00, 0x30); // JMP $3000
+        r.commit();
+        // 3-instruction body: $3000 (LDA), $3002 (CMP), $3004 (BNE $3000 — back-branch,
+        // operand reaches $3000 but is NOT −2, so it is NOT a self-branch). Loop it
+        // many times; the multi-instr heuristic must fire.
+        let mut cyc = 9001u64;
+        for _ in 0..20 {
+            instr_op(&mut r, 0x3000, 0xA9, 0x00, 0, cyc); cyc += 1;
+            instr_op(&mut r, 0x3002, 0xC9, 0x00, 0, cyc); cyc += 1;
+            instr_op(&mut r, 0x3004, 0xD0, 0xFA, 0, cyc); cyc += 1; // BNE $3000 (−6)
+        }
+        let lo = r.loop_onset().expect("multi-instruction loop pinned");
+        assert_eq!(lo.src_pc, 0x5000, "the JMP into the body is the entry transfer");
+        assert_eq!(lo.src_opcode, 0x4C);
+        assert_eq!(lo.dst_pc, 0x3000, "loop body start = first body PC");
+        assert_eq!(lo.cycle, 9000);
+    }
+
+    #[test]
+    fn loop_onset_rearms_after_clear() {
+        // FEATURE #1: a timeline boundary (clear) re-arms the detector — a new loop
+        // captures its OWN entry, not the pre-boundary one.
+        let mut r = DeltaRing::with_capacity(8, 16);
+        r.set_enabled(true);
+        instr_op(&mut r, 0x100, 0xEA, 0, 0, 1);
+        for i in 0..50u64 {
+            instr_op(&mut r, 0x101, 0x4C, 0x01, 0x01, 2 + i); // JMP $0101 self
+        }
+        assert!(r.loop_onset().is_some());
+        r.clear();
+        assert!(r.loop_onset().is_none(), "clear re-arms (drops the pin)");
+        // A fresh loop after the boundary pins its own entry.
+        instr_op(&mut r, 0x800, 0xEA, 0, 0, 1000);
+        for i in 0..50u64 {
+            instr_op(&mut r, 0x801, 0x4C, 0x01, 0x08, 1001 + i); // JMP $0801 self
+        }
+        let lo = r.loop_onset().expect("fresh loop pinned after clear");
+        assert_eq!(lo.src_pc, 0x800);
+        assert_eq!(lo.dst_pc, 0x801);
+    }
+
+    #[test]
+    fn loop_onset_not_set_for_normal_straight_line_code() {
+        // FEATURE #1: straight-line forward execution must NOT trip the detector (no
+        // false onset). The PC advances monotonically through distinct addresses.
+        let mut r = DeltaRing::with_capacity(64, 128);
+        r.set_enabled(true);
+        for i in 0..40u64 {
+            // Distinct, monotonically increasing PCs (NOPs) — never revisits an address.
+            instr_op(&mut r, 0x1000 + (i as u16) * 2, 0xEA, 0, 0, 100 + i);
+        }
+        assert!(r.loop_onset().is_none(), "straight-line code never pins a loop");
+    }
+
+    #[test]
+    fn loop_onset_pin_is_one_shot_keeps_first_entry() {
+        // FEATURE #1: the pin is captured ONCE at onset; later spinning must NOT
+        // overwrite it with a body instruction as the "src".
+        let mut r = DeltaRing::with_capacity(4, 8);
+        r.set_enabled(true);
+        instr_op(&mut r, 0x600, 0x20, 0x00, 0x07, 10); // JSR $0700 (entry)
+        for i in 0..1000u64 {
+            instr_op(&mut r, 0x700, 0x4C, 0x00, 0x07, 11 + i); // JMP $0700 self
+        }
+        let lo1 = r.loop_onset().unwrap();
+        // Spin more — the pin must be UNCHANGED (still the JSR @ $0600).
+        for i in 0..1000u64 {
+            instr_op(&mut r, 0x700, 0x4C, 0x00, 0x07, 2000 + i);
+        }
+        let lo2 = r.loop_onset().unwrap();
+        assert_eq!(lo1, lo2, "the onset pin is one-shot (not re-captured per spin)");
+        assert_eq!(lo2.src_pc, 0x600);
+    }
+
+    /// FEATURE #2 helper: record an instruction that writes `addr` AND carries a caller
+    /// chain (begin → set_caller_chain → record_write → commit), mirroring the
+    /// execute_one capture order.
+    fn instr_write_with_chain(
+        r: &mut DeltaRing,
+        pc: u16,
+        cycle: u64,
+        addr: u16,
+        new: u8,
+        chain: &[u16],
+    ) {
+        r.begin(pc, 0, 0, 0, 0xff, 0, cycle);
+        r.set_opcode(0x8d, addr as u8, (addr >> 8) as u8); // STA abs
+        r.record_write(addr, 0, new);
+        // execute_one only captures the chain when the instruction wrote — assert that
+        // gate holds here, then publish.
+        assert_eq!(r.in_flight_write_count(), 1);
+        let mut cc = CallerChain::default();
+        for (k, f) in chain.iter().take(3).enumerate() {
+            cc.frames[k] = *f;
+            cc.depth = (k + 1) as u8;
+        }
+        r.set_caller_chain(cc);
+        r.commit();
+    }
+
+    #[test]
+    fn who_wrote_with_callers_distinguishes_two_call_sites() {
+        // FEATURE #2: the SAME leaf store routine ($8800) writes $0A81 from TWO different
+        // call sites. who_wrote_with_callers must return DISTINCT caller chains so the
+        // operation (not just the leaf) is identifiable.
+        let mut r = DeltaRing::with_capacity(64, 128);
+        r.set_enabled(true);
+        // Call site A: $0B05 -> $0AC0 -> $8800 (the leaf store).
+        instr_write_with_chain(&mut r, 0x8800, 100, 0x0a81, 0x11, &[0x0ac0, 0x0b05]);
+        // An unrelated write in between.
+        instr_write_with_chain(&mut r, 0x8800, 110, 0x0200, 0x55, &[0x1234]);
+        // Call site B: $0C09 -> $0AC0 -> $8800 (same leaf, different outer caller).
+        instr_write_with_chain(&mut r, 0x8800, 120, 0x0a81, 0x22, &[0x0ac0, 0x0c09]);
+
+        let hits = r.who_wrote_with_callers(0x0a81, 8);
+        assert_eq!(hits.len(), 2, "two writers of $0A81");
+        // Newest first → call site B.
+        let (_, w0, c0) = &hits[0];
+        assert_eq!(w0.new_value, 0x22);
+        assert_eq!(c0.depth, 2);
+        assert_eq!(c0.frames[0], 0x0ac0);
+        assert_eq!(c0.frames[1], 0x0c09, "site B's outer caller");
+        // Then call site A.
+        let (_, w1, c1) = &hits[1];
+        assert_eq!(w1.new_value, 0x11);
+        assert_eq!(c1.frames[1], 0x0b05, "site A's outer caller — DISTINCT from B");
+        assert_ne!(c0.frames[1], c1.frames[1], "the two call sites are distinguished");
+    }
+
+    #[test]
+    fn caller_chain_absent_for_no_write_instruction() {
+        // FEATURE #2: a non-writing instruction (a branch/compare) carries NO caller
+        // chain (depth 0) — the capture is gated on writes, so the load/branch majority
+        // pays nothing and leaves the slot zeroed.
+        let mut r = DeltaRing::with_capacity(16, 32);
+        r.set_enabled(true);
+        // A no-write instruction: in_flight_write_count must be 0 (the execute_one gate).
+        r.begin(0x2000, 0, 0, 0, 0xff, 0, 10);
+        r.set_opcode(0xea, 0, 0); // NOP
+        assert_eq!(r.in_flight_write_count(), 0, "no writes → caller chain not captured");
+        r.commit();
+        // A writing instruction WITH a chain, so the ring is non-empty for the query.
+        instr_write_with_chain(&mut r, 0x8800, 20, 0x0400, 0x41, &[0x0a00]);
+        let hits = r.who_wrote_with_callers(0x0400, 4);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].2.depth, 1);
+        assert_eq!(hits[0].2.frames[0], 0x0a00);
+    }
+
+    #[test]
+    fn entries_wrapped_reports_ring_eviction() {
+        // FEATURE #3: entries_wrapped is the ring-exhaustion signal — false until the
+        // entry slab evicts, true once it has.
+        let mut r = DeltaRing::with_capacity(4, 16);
+        r.set_enabled(true);
+        assert!(!r.entries_wrapped(), "fresh ring not wrapped");
+        for i in 0..4u64 {
+            instr(&mut r, 0x100 + i as u16, (0, 0, 0, 0xff, 0), i, &[]);
+        }
+        assert!(!r.entries_wrapped(), "exactly-full ring has NOT yet evicted");
+        // One more retire evicts the oldest → wrapped.
+        instr(&mut r, 0x999, (0, 0, 0, 0xff, 0), 99, &[]);
+        assert!(r.entries_wrapped(), "ring evicted its oldest entry → wrapped");
+        // A clear resets the wrap state (fresh timeline).
+        r.clear();
+        assert!(!r.entries_wrapped(), "clear resets the wrap state");
+    }
+
+    #[test]
+    fn entry_and_write_layout_bounded() {
+        assert_eq!(std::mem::size_of::<DeltaEntry>(), 24, "DeltaEntry layout drifted");
+        assert_eq!(std::mem::size_of::<WriteRec>(), 4, "WriteRec layout drifted");
+        // FEATURE #2: the caller-chain slab entry is a compact 8 B (3×u16 + depth + pad),
+        // so the parallel slab is ~24 MB at the 10 s default — NOT the +33% the 24→32 B
+        // DeltaEntry growth would have cost (the documented ring-size decision).
+        assert_eq!(std::mem::size_of::<CallerChain>(), 8, "CallerChain layout drifted");
+    }
+
+    #[test]
+    fn begin_record_commit_roundtrip() {
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        instr(&mut r, 0x1000, (1, 2, 3, 0xfd, 0x30), 100, &[(0x0400, 0x20, 0x41)]);
+        assert_eq!(r.len(), 1);
+        let e = r.newest().unwrap();
+        assert_eq!(e.pc, 0x1000);
+        assert_eq!(e.a, 1);
+        assert_eq!(e.sp, 0xfd);
+        assert_eq!(e.p, 0x30);
+        // `instr` stamps opcode = pc.low, b1 = pc.high (deterministic decode marker).
+        assert_eq!(e.opcode, 0x00, "opcode = pc.low");
+        assert_eq!(e.b1, 0x10, "b1 = pc.high");
+        assert_eq!(e.b2, 0x00);
+        assert_eq!(e.write_count, 1);
+        let mut w = Vec::new();
+        r.writes_for(&e, &mut w);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0], WriteRec { addr: 0x0400, old_value: 0x20, new_value: 0x41 });
+    }
+
+    #[test]
+    fn multi_write_instruction_order_preserved() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        // An instruction (e.g. an interrupt push or RMW) with 3 writes.
+        instr(
+            &mut r,
+            0x2000,
+            (0, 0, 0, 0xff, 0x24),
+            500,
+            &[(0x01ff, 0xaa, 0x20), (0x01fe, 0xbb, 0x00), (0x01fd, 0xcc, 0x24)],
+        );
+        let e = r.newest().unwrap();
+        assert_eq!(e.write_count, 3);
+        let mut w = Vec::new();
+        r.writes_for(&e, &mut w);
+        assert_eq!(w.len(), 3);
+        assert_eq!(w[0].addr, 0x01ff);
+        assert_eq!(w[1].addr, 0x01fe);
+        assert_eq!(w[2].addr, 0x01fd);
+    }
+
+    #[test]
+    fn pop_newest_exposes_prior_and_rewinds_writes() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        instr(&mut r, 0x100, (0, 0, 0, 0xff, 0), 10, &[(0x10, 0, 1)]);
+        instr(&mut r, 0x102, (0, 0, 0, 0xff, 0), 12, &[(0x11, 0, 2), (0x12, 0, 3)]);
+        assert_eq!(r.len(), 2);
+        // Pop the newest (2 writes) → write_head rewinds by 2, len 1.
+        let popped = r.pop_newest().unwrap();
+        assert_eq!(popped.pc, 0x102);
+        assert_eq!(popped.write_count, 2);
+        assert_eq!(r.len(), 1);
+        let now = r.newest().unwrap();
+        assert_eq!(now.pc, 0x100);
+        let mut w = Vec::new();
+        r.writes_for(&now, &mut w);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].addr, 0x10);
+    }
+
+    #[test]
+    fn entry_ring_wraps() {
+        let mut r = DeltaRing::with_capacity(4, 64);
+        r.set_enabled(true);
+        for i in 0..10u64 {
+            instr(&mut r, 0x300 + i as u16, (0, 0, 0, 0xff, 0), 1000 + i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 4, "entry len caps at entry_cap after wrap");
+        // Newest is the last push.
+        assert_eq!(r.newest().unwrap().pc, 0x300 + 9);
+        // The oldest surviving entry is i=6 (last 4 = 6,7,8,9).
+        let (oldest_cyc, newest_cyc) = r.cycle_span().unwrap();
+        assert_eq!(oldest_cyc, 1006);
+        assert_eq!(newest_cyc, 1009);
+    }
+
+    #[test]
+    fn who_wrote_finds_last_writer_newest_first() {
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        // $01F5 written three times by three instructions; who_wrote must list newest first.
+        instr(&mut r, 0xa00, (0, 0, 0, 0xff, 0), 1, &[(0x01f5, 0x00, 0x11)]);
+        instr(&mut r, 0xb00, (0, 0, 0, 0xff, 0), 2, &[(0x0200, 0x00, 0x99)]); // unrelated
+        instr(&mut r, 0xc00, (0, 0, 0, 0xff, 0), 3, &[(0x01f5, 0x11, 0x22)]);
+        instr(&mut r, 0xd00, (0, 0, 0, 0xff, 0), 4, &[(0x01f5, 0x22, 0x33)]);
+        let hits = r.who_wrote(0x01f5, 5);
+        assert_eq!(hits.len(), 3);
+        // Newest first: $D00 (3) → $C00 (2) → $A00 (1).
+        assert_eq!(hits[0].0.pc, 0xd00);
+        assert_eq!(hits[0].1, WriteRec { addr: 0x01f5, old_value: 0x22, new_value: 0x33 });
+        assert_eq!(hits[1].0.pc, 0xc00);
+        assert_eq!(hits[2].0.pc, 0xa00);
+        // limit honored.
+        let one = r.who_wrote(0x01f5, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0.pc, 0xd00);
+        // unknown addr → no hits.
+        assert!(r.who_wrote(0x9999, 5).is_empty());
+    }
+
+    #[test]
+    fn who_wrote_picks_last_write_within_an_instruction() {
+        // A single instruction that writes $50 twice (RMW dummy-then-real); who_wrote
+        // must report the LATER (real) write.
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        instr(&mut r, 0x400, (0, 0, 0, 0xff, 0), 7, &[(0x0050, 0x05, 0x05), (0x0050, 0x05, 0x06)]);
+        let hits = r.who_wrote(0x0050, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.new_value, 0x06, "last write within the instruction wins");
+    }
+
+    #[test]
+    fn stale_writes_stop_who_wrote_at_window_edge() {
+        // Tiny write slab forces the oldest entry's writes to be overwritten while the
+        // entry header still lives. who_wrote must stop at the readable edge, not read
+        // garbage.
+        let mut r = DeltaRing::with_capacity(8, 4); // 4-write slab.
+        r.set_enabled(true);
+        // 6 instructions, 1 write each → write_head=6, slab holds the last 4 writes.
+        for i in 0..6u64 {
+            instr(&mut r, 0x500 + i as u16, (0, 0, 0, 0xff, 0), 100 + i, &[(0x80, i as u8, (i + 1) as u8)]);
+        }
+        // The 2 oldest writes (i=0,1) are overwritten; entries 0,1 are stale.
+        let hits = r.who_wrote(0x80, 99);
+        // Only entries whose writes survived (i=2..5 = 4 writes) are reported.
+        assert_eq!(hits.len(), 4, "who_wrote stops at the readable write window");
+        assert_eq!(hits[0].0.pc, 0x505, "newest reported first");
+    }
+
+    #[test]
+    fn disabled_records_nothing() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(false);
+        instr(&mut r, 0x1, (0, 0, 0, 0, 0), 1, &[(0x10, 0, 1)]);
+        assert_eq!(r.len(), 0);
+        assert!(r.newest().is_none());
+        assert!(r.who_wrote(0x10, 5).is_empty());
+    }
+
+    #[test]
+    fn clear_drops_history_keeps_capacity() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(true);
+        for i in 0..5u64 {
+            instr(&mut r, i as u16, (0, 0, 0, 0xff, 0), i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 5);
+        r.clear();
+        assert_eq!(r.len(), 0);
+        assert_eq!(r.entry_capacity(), 8);
+        assert_eq!(r.writes_capacity(), 32);
+        instr(&mut r, 0x9, (0, 0, 0, 0xff, 0), 9, &[]);
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn slice_by_cycle_selects_window_chronologically() {
+        // reverse-debug Phase 1c — the cycle-window slice the trace/build_from_ring
+        // dump encodes. Build a known stream, slice [b,c] and assert it returns EXACTLY
+        // the in-range entries (oldest→newest) with their writes, and excludes the rest.
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        // 5 instructions at cycles 100,110,120,130,140 with distinct writes.
+        instr(&mut r, 0x1000, (0, 0, 0, 0xff, 0), 100, &[(0x10, 0xaa, 0x01)]);
+        instr(&mut r, 0x1001, (1, 0, 0, 0xff, 0), 110, &[(0x11, 0xbb, 0x02), (0x12, 0xcc, 0x03)]);
+        instr(&mut r, 0x1002, (2, 0, 0, 0xff, 0), 120, &[]); // no writes (branch/compare)
+        instr(&mut r, 0x1003, (3, 0, 0, 0xff, 0), 130, &[(0x13, 0xdd, 0x04)]);
+        instr(&mut r, 0x1004, (4, 0, 0, 0xff, 0), 140, &[(0x14, 0xee, 0x05)]);
+
+        // Window [110, 130] → entries at 110, 120, 130 (3 of the 5).
+        let mut out: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        let n = r.slice_by_cycle(110, 130, &mut out);
+        assert_eq!(n, 3, "three entries in [110,130]");
+        // Oldest → newest order.
+        assert_eq!(out[0].0.cycle, 110);
+        assert_eq!(out[0].0.pc, 0x1001);
+        assert_eq!(out[1].0.cycle, 120);
+        assert_eq!(out[2].0.cycle, 130);
+        // Out-of-range entries (100, 140) excluded.
+        assert!(out.iter().all(|(e, _)| e.cycle >= 110 && e.cycle <= 130));
+        // Writes round-trip exactly (order + bytes).
+        assert_eq!(out[0].1.len(), 2);
+        assert_eq!(out[0].1[0], WriteRec { addr: 0x11, old_value: 0xbb, new_value: 0x02 });
+        assert_eq!(out[0].1[1], WriteRec { addr: 0x12, old_value: 0xcc, new_value: 0x03 });
+        assert_eq!(out[1].1.len(), 0, "no-write entry has an empty write list");
+        assert_eq!(out[2].1.len(), 1);
+        assert_eq!(out[2].1[0], WriteRec { addr: 0x13, old_value: 0xdd, new_value: 0x04 });
+
+        // Reversed args normalise to the same window.
+        let mut out2: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        assert_eq!(r.slice_by_cycle(130, 110, &mut out2), 3);
+        assert_eq!(out2[0].0.cycle, 110);
+
+        // A window outside the ring is empty.
+        let mut out3: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        assert_eq!(r.slice_by_cycle(500, 600, &mut out3), 0);
+        assert!(out3.is_empty());
+
+        // A single-cycle window picks exactly one entry.
+        let mut out4: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        assert_eq!(r.slice_by_cycle(120, 120, &mut out4), 1);
+        assert_eq!(out4[0].0.pc, 0x1002);
+    }
+
+    #[test]
+    fn set_opcode_roundtrips_through_slice_not_brk() {
+        // Regression for the build_from_ring "all-BRK disasm" bug: opcodes stamped via
+        // set_opcode must survive into the cycle-window slice (what write_delta_entry
+        // encodes), NOT come back as 0 (= BRK for every row).
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        // Drive set_opcode directly with real 6502 opcodes (LDA #imm, JMP abs, STA abs).
+        r.begin(0x0801, 0, 0, 0, 0xff, 0x20, 1000);
+        r.set_opcode(0xA9, 0x41, 0x00); // LDA #$41
+        r.commit();
+        r.begin(0x0803, 0x41, 0, 0, 0xff, 0x20, 1003);
+        r.set_opcode(0x8D, 0x00, 0x04); // STA $0400
+        r.record_write(0x0400, 0x20, 0x41);
+        r.commit();
+        r.begin(0x0806, 0x41, 0, 0, 0xff, 0x20, 1007);
+        r.set_opcode(0x4C, 0x00, 0x08); // JMP $0800
+        r.commit();
+
+        let mut out: Vec<(DeltaEntry, Vec<WriteRec>)> = Vec::new();
+        let n = r.slice_by_cycle(1000, 1007, &mut out);
+        assert_eq!(n, 3);
+        // The opcodes round-trip exactly — NOT 0/BRK.
+        assert_eq!(out[0].0.opcode, 0xA9);
+        assert_eq!(out[0].0.b1, 0x41);
+        assert_eq!(out[1].0.opcode, 0x8D);
+        assert_eq!(out[1].0.b1, 0x00);
+        assert_eq!(out[1].0.b2, 0x04);
+        assert_eq!(out[2].0.opcode, 0x4C);
+        assert_eq!(out[2].0.b2, 0x08);
+        assert!(out.iter().all(|(e, _)| e.opcode != 0x00), "no entry decodes as BRK");
+    }
+
+    #[test]
+    fn set_opcode_noop_when_disabled_or_no_instruction() {
+        let mut r = DeltaRing::with_capacity(8, 32);
+        // Disabled: set_opcode does nothing (no panic, no state).
+        r.set_enabled(false);
+        r.set_opcode(0xA9, 0x41, 0x00);
+        assert!(r.newest().is_none());
+        // Enabled but no in-flight instruction: set_opcode is a no-op, opcode stays 0.
+        r.set_enabled(true);
+        r.set_opcode(0xA9, 0x41, 0x00); // before any begin()
+        r.begin(0x1000, 0, 0, 0, 0xff, 0, 1);
+        r.commit(); // committed without set_opcode → interrupt-only-style entry
+        assert_eq!(r.newest().unwrap().opcode, 0, "no set_opcode → opcode 0 (interrupt-only)");
+    }
+
+    #[test]
+    fn caps_for_seconds_matches_new_sizing() {
+        // The per-second sizing the runtime knob uses must equal what `new()` derives.
+        let (e, w) = DeltaRing::caps_for_seconds(10);
+        assert_eq!(e, 10 * ring_instr_per_second());
+        assert_eq!(w, e * WRITES_PER_INSTR_NUM / WRITES_PER_INSTR_DEN);
+        // Clamp: 0 seconds floors to 1.
+        let (e0, _w0) = DeltaRing::caps_for_seconds(0);
+        assert_eq!(e0, ring_instr_per_second());
+    }
+
+    /// Spec 863 — the nominal seconds hold on every C64 model, not only on PAL. The rate
+    /// is the estimate at the fastest runnable clock, so NTSC (1 022 730 Hz) and PAL-N
+    /// (1 023 440 Hz) hold their 10 s — PAL's own 300 000/s held them ~9.6 s — and PAL
+    /// holds a little more than it asks for.
+    #[test]
+    fn the_ring_holds_its_seconds_on_every_model() {
+        let hold = |cpu_hz: u32, secs: usize| {
+            let (e, _) = DeltaRing::caps_for_seconds(secs);
+            (e as f64 / instr_per_second_at(cpu_hz) as f64, ())
+        };
+        for m in crate::model::models().iter().filter(|m| m.runs()) {
+            for secs in [1usize, DEFAULT_REVERSE_SECONDS, 600] {
+                let (instr, _) = hold(m.timing.cpu_hz, secs);
+                assert!(instr >= secs as f64, "{} holds {instr:.3} s of {secs}", m.name);
+            }
+        }
+        for name in ["c64-ntsc", "c64-paln"] {
+            let m = crate::model::find(name).unwrap();
+            assert!(m.runs(), "{name} runs");
+            let (instr, _) = hold(m.timing.cpu_hz, DEFAULT_REVERSE_SECONDS);
+            assert!(instr >= DEFAULT_REVERSE_SECONDS as f64, "{name}: {instr:.3} s");
+            // What the PAL figure alone would have held — the gap this closes.
+            let pal_sized = (DEFAULT_REVERSE_SECONDS * INSTR_PER_SECOND) as f64 / instr_per_second_at(m.timing.cpu_hz) as f64;
+            assert!(pal_sized < 9.7, "{name} on a PAL-sized ring: {pal_sized:.3} s");
+        }
+        // The rate is PAL-N's clock (the fastest that runs) and PAL's sizing grows by it.
+        assert_eq!(instr_per_second_at(985_248), INSTR_PER_SECOND, "the PAL estimate is unchanged");
+        assert_eq!(ring_instr_per_second(), instr_per_second_at(1_023_440));
+        assert_eq!(ring_instr_per_second(), 311_630);
+        let (e, w) = DeltaRing::caps_for_seconds(DEFAULT_REVERSE_SECONDS);
+        assert_eq!((e, w), (3_116_300, 3_895_375));
+        let bytes = |e: usize, w: usize| {
+            e * (std::mem::size_of::<DeltaEntry>() + std::mem::size_of::<CallerChain>())
+                + w * std::mem::size_of::<WriteRec>()
+        };
+        let grew = bytes(e, w) - bytes(3_000_000, 3_750_000);
+        assert_eq!(grew, 4_303_100, "PAL pays ~4.1 MiB for the NTSC/PAL-N hold");
+    }
+
+    #[test]
+    fn resize_rebuilds_slabs_drops_history_keeps_enabled() {
+        // Reverse-depth knob: resize SHRINKS/GROWS both slabs, DROPS history, keeps the
+        // armed flag — exactly the runtime/set_reverse_depth contract.
+        let mut r = DeltaRing::with_capacity(16, 64);
+        r.set_enabled(true);
+        for i in 0..10u64 {
+            instr(&mut r, 0x100 + i as u16, (0, 0, 0, 0xff, 0), i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 10);
+        // SHRINK to a tiny ring → history gone, new caps applied, still enabled.
+        r.resize(4, 5);
+        assert_eq!(r.entry_capacity(), 4);
+        assert_eq!(r.writes_capacity(), 5);
+        assert_eq!(r.len(), 0, "resize drops all history");
+        assert!(r.is_empty());
+        assert!(r.enabled(), "resize preserves the armed flag");
+        // The shrunk ring still records and caps at the new size (4-entry wrap).
+        for i in 0..6u64 {
+            instr(&mut r, 0x200 + i as u16, (0, 0, 0, 0xff, 0), 100 + i, &[(i as u16, 0, 1)]);
+        }
+        assert_eq!(r.len(), 4, "post-resize ring caps at the NEW capacity");
+        assert_eq!(r.newest().unwrap().pc, 0x200 + 5);
+        // GROW back and confirm a wider window is retained.
+        r.resize(32, 64);
+        assert_eq!(r.entry_capacity(), 32);
+        assert_eq!(r.len(), 0);
+        for i in 0..20u64 {
+            instr(&mut r, 0x300 + i as u16, (0, 0, 0, 0xff, 0), 200 + i, &[]);
+        }
+        assert_eq!(r.len(), 20, "grown ring retains the full 20 (< 32 cap)");
+    }
+
+    #[test]
+    fn ram_estimate_for_default_depth_is_about_96mb() {
+        // The set_reverse_depth RAM figure (delta entries 24B + writes 4B + cpuhistory
+        // 24B) must land near the documented ~96 MB for the 10 s default, so the daemon
+        // reports a truthful cost. (This pins the per-second sizing the knob reports.)
+        let secs = 10usize;
+        let (e, w) = DeltaRing::caps_for_seconds(secs);
+        let cpu_cap = secs * ring_instr_per_second(); // cpu-history scaled to depth by the knob
+        let bytes = e * std::mem::size_of::<DeltaEntry>()
+            + w * std::mem::size_of::<WriteRec>()
+            + cpu_cap * std::mem::size_of::<crate::cpu_history::CpuHistEntry>();
+        let mb = bytes as f64 / (1024.0 * 1024.0);
+        // 72 MB (entries) + 15 MB (writes) + 72 MB (cpuhistory@depth) ≈ 159 MB.
+        // (The 96 MB doc figure predates scaling cpu-history with depth; assert a sane
+        // band so an accidental ×10 sizing bug is caught.)
+        assert!(mb > 120.0 && mb < 200.0, "10s rings ≈ {mb:.0} MB (expected 120..200)");
+    }
+
+    #[test]
+    fn resize_preserves_disabled_killswitch() {
+        // A kill-switched ring stays inert across a resize (no silent re-arm).
+        let mut r = DeltaRing::with_capacity(8, 32);
+        r.set_enabled(false);
+        r.resize(4, 8);
+        assert!(!r.enabled(), "resize must not re-arm a kill-switched ring");
+        instr(&mut r, 0x1, (0, 0, 0, 0, 0), 1, &[(0x10, 0, 1)]);
+        assert_eq!(r.len(), 0, "disabled ring records nothing after resize");
+    }
+
+    #[test]
+    fn clone_is_empty_same_capacity() {
+        let mut r = DeltaRing::with_capacity(32, 64);
+        r.set_enabled(true);
+        for i in 0..10u64 {
+            instr(&mut r, i as u16, (0, 0, 0, 0xff, 0), i, &[(i as u16, 0, 1)]);
+        }
+        let c = r.clone();
+        assert_eq!(c.entry_capacity(), 32);
+        assert_eq!(c.writes_capacity(), 64);
+        assert_eq!(c.len(), 0, "clone starts empty");
+        assert!(c.enabled());
+    }
+}

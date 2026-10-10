@@ -1,0 +1,24 @@
+name: Encoder checks
+on:
+  push:
+    branches: [main]
+    paths: ['encoder/**', 'site/**', 'tests/**', 'tools/**', '.github/workflows/ci.yml']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - run: cargo test --locked --manifest-path encoder/Cargo.toml
+      - run: cargo check --locked --manifest-path encoder/Cargo.toml --features gpu
+      - run: python3 tools/build_encoder_wasm.py
+      - run: node --test tests/*.test.mjs

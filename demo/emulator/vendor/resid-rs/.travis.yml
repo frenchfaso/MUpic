@@ -1,0 +1,32 @@
+language: rust
+sudo: false
+
+matrix:
+  include:
+    - rust: stable
+      env: DESCRIPTION="stable Rust"
+
+    - rust: beta
+      env: DESCRIPTION="Rust with no_std"
+      script:
+        - cargo test --lib --no-default-features
+        - cargo test --tests --no-default-features
+
+before_install:
+  - set -e
+  - rustup self update
+
+script:
+  - cargo test --lib
+  - cargo test --tests
+
+after_script:
+  - set +e
+
+cache: cargo
+before_cache:
+  - chmod -R a+r $HOME/.cargo
+
+notifications:
+  email:
+    on_success: never

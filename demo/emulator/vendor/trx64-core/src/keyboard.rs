@@ -1,0 +1,551 @@
+//! C64 keyboard matrix model + scriptable input queue.
+//!
+//! Faithful port of the TS golden's `peripherals/keyboard.ts` (Sprint 79 /
+//! Spec 403). Real C64 has an 8×8 key matrix scanned by CIA1: PA drives the
+//! columns (active-low), PB reads the rows (active-low). `session/type` queues
+//! timed key presses; the CIA1 PB read returns the active row mask for whatever
+//! columns the CPU is currently driving.
+//!
+//! Cycle model: the TS keyboard advances `cycleNow` by each instruction's cycle
+//! cost (integrated-session.ts:947 `keyboard.advance(totalCycles)`), so
+//! `cycleNow == c64Cpu.cycles`. In TRX64 the CPU master clock `cpu6510.clk` is
+//! that same accumulated cycle count, so the FullBus passes `clk` straight in as
+//! the read-time "now" — no separate advance bookkeeping needed.
+
+/// PETSCII key name → matrix coordinate `[col, row]` (0-based), matching the TS
+/// `KEY_MATRIX`. Real hardware: PA = column drive (active-low), PB = row read
+/// (active-low). KERNAL SCNKEY scan code = col*8 + row.
+fn key_matrix(key: &str) -> Option<(u8, u8)> {
+    let c = match key {
+        // Col 7
+        "RUN_STOP" => (7, 7), "Q" => (7, 6), "C_EQ" => (7, 5), "SPACE" => (7, 4),
+        "2" => (7, 3), "CTRL" => (7, 2), "LARROW" => (7, 1), "1" => (7, 0),
+        // Col 6
+        "/" => (6, 7), "UP_ARROW" => (6, 6), "=" => (6, 5), "R_SHIFT" => (6, 4),
+        "HOME" => (6, 3), ";" => (6, 2), "*" => (6, 1), "POUND" => (6, 0),
+        // Col 5
+        "," => (5, 7), "@" => (5, 6), ":" => (5, 5), "." => (5, 4),
+        "-" => (5, 3), "L" => (5, 2), "P" => (5, 1), "+" => (5, 0),
+        // Col 4
+        "N" => (4, 7), "O" => (4, 6), "K" => (4, 5), "M" => (4, 4),
+        "0" => (4, 3), "J" => (4, 2), "I" => (4, 1), "9" => (4, 0),
+        // Col 3
+        "V" => (3, 7), "U" => (3, 6), "H" => (3, 5), "B" => (3, 4),
+        "8" => (3, 3), "G" => (3, 2), "Y" => (3, 1), "7" => (3, 0),
+        // Col 2
+        "X" => (2, 7), "T" => (2, 6), "F" => (2, 5), "C" => (2, 4),
+        "6" => (2, 3), "D" => (2, 2), "R" => (2, 1), "5" => (2, 0),
+        // Col 1
+        "L_SHIFT" => (1, 7), "E" => (1, 6), "S" => (1, 5), "Z" => (1, 4),
+        "4" => (1, 3), "A" => (1, 2), "W" => (1, 1), "3" => (1, 0),
+        // Col 0
+        "CRSR_DN" => (0, 7), "F5" => (0, 6), "F3" => (0, 5), "F1" => (0, 4),
+        "F7" => (0, 3), "CRSR_RT" => (0, 2), "RETURN" => (0, 1), "DEL" => (0, 0),
+        _ => return None,
+    };
+    Some(c)
+}
+
+/// Shifted PETSCII characters → their unshifted base key (the key is pressed
+/// together with L_SHIFT). Mirrors the TS `SHIFTED_CHARS`.
+fn shifted_base(ch: char) -> Option<&'static str> {
+    Some(match ch {
+        '"' => "2",
+        '(' => "8",
+        ')' => "9",
+        '?' => "/",
+        '<' => ",",
+        '>' => ".",
+        '[' => ":",
+        ']' => ";",
+        '!' => "1",
+        '#' => "3",
+        '$' => "4",
+        '%' => "5",
+        '&' => "6",
+        '\'' => "7",
+        _ => return None,
+    })
+}
+
+/// Resolve a typed character to its matrix key + whether SHIFT must be held.
+fn lookup_char(ch: char) -> Option<(String, bool)> {
+    if ch == ' ' {
+        return Some(("SPACE".to_string(), false));
+    }
+    if ch == '\n' || ch == '\r' {
+        return Some(("RETURN".to_string(), false));
+    }
+    if ch == '\t' {
+        return None;
+    }
+    let up = ch.to_ascii_uppercase().to_string();
+    if key_matrix(&up).is_some() {
+        return Some((up, false));
+    }
+    if let Some(base) = shifted_base(ch).or_else(|| shifted_base(ch.to_ascii_uppercase())) {
+        if key_matrix(base).is_some() {
+            return Some((base.to_string(), true));
+        }
+    }
+    None
+}
+
+#[derive(Clone, Debug)]
+struct KeyEvent {
+    key: String,
+    start_cycle: u64,
+    end_cycle: u64,
+}
+
+/// Scriptable keyboard-matrix backend for CIA1 PA(column)/PB(row).
+///
+/// Two parallel input sources, both folded into `read_rows_for_pa`:
+///   - `events`: the timed-event queue (`type_text` schedules `[start,end)`
+///     windows, gated on the cycle). Unchanged from Sprint 79.
+///   - `live_pressed`: the Spec 310 *held-key* set — a key stays pressed until
+///     an explicit release and is queryable via `pressed_keys()`. 1:1 with the
+///     c64re `KeyboardMatrix.livePressed: Set<KeyName>` (keyboard.ts:65).
+///
+/// The held set is purely additive: when it is empty, `read_rows_for_pa` is
+/// byte-identical to the timed-event-only path, so all type_text-based gates
+/// are unchanged.
+#[derive(Clone, Debug, Default)]
+pub struct KeyboardMatrix {
+    events: Vec<KeyEvent>,
+    /// Spec 310 — held keys (browser keydown without a matching keyup). Stores
+    /// the c64re key id (e.g. "A", "L_SHIFT", "RUN_STOP"), matching the TS
+    /// `Set<KeyName>` so `pressed_keys()` returns the same names the WS layer
+    /// reports. Insertion order preserved (mirrors JS `Set` iteration order)
+    /// so `pressed_keys()` is deterministic.
+    live_pressed: Vec<String>,
+}
+
+impl KeyboardMatrix {
+    pub fn new() -> Self {
+        Self {
+            events: Vec::new(),
+            live_pressed: Vec::new(),
+        }
+    }
+
+    /// Queue a text string as a sequence of timed key presses starting at
+    /// `now_cycle`. Each character holds for `hold_cycles`, with `gap_cycles`
+    /// between presses. Shifted characters also queue an L_SHIFT for the same
+    /// window. Returns the number of source characters consumed (matches the
+    /// TS `queued: text.length` response field — counts every char, including
+    /// any skipped ones, exactly like the TS `text.length`).
+    pub fn type_text(&mut self, now_cycle: u64, text: &str, hold_cycles: u64, gap_cycles: u64) {
+        let mut off: u64 = 0;
+        for ch in text.chars() {
+            let Some((key, shift)) = lookup_char(ch) else { continue };
+            let start = now_cycle + off;
+            let end = start + hold_cycles;
+            self.events.push(KeyEvent { key, start_cycle: start, end_cycle: end });
+            if shift {
+                self.events.push(KeyEvent {
+                    key: "L_SHIFT".to_string(),
+                    start_cycle: start,
+                    end_cycle: end,
+                });
+            }
+            off += hold_cycles + gap_cycles;
+        }
+    }
+
+    /// Drop all queued events AND the held-key set (reset / cold-reset path).
+    /// Mirrors the TS `KeyboardMatrix.clear()` (keyboard.ts:142) which wipes
+    /// `events` + `livePressed`. The reset path in c64re calls this via the
+    /// `kb.clear?.()` probe (integrated-session.ts:737).
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.live_pressed.clear();
+    }
+
+    /// Spec 310 — mark a key as held (browser keydown). 1:1 with the TS
+    /// `setKeyDown` (keyboard.ts:104): adds to the held set, no-op if already
+    /// present. `key` is a c64re key id (see `key_matrix`); unknown ids are
+    /// still recorded (so `pressed_keys()` round-trips) but contribute nothing
+    /// to the row mask, exactly like the TS (`KEY_MATRIX[key]` miss → skipped).
+    pub fn key_down(&mut self, key: &str) {
+        if !self.live_pressed.iter().any(|k| k == key) {
+            self.live_pressed.push(key.to_string());
+        }
+    }
+
+    /// Spec 310 — release a held key (browser keyup). 1:1 with `setKeyUp`
+    /// (keyboard.ts:105): removes from the held set, no-op if absent.
+    pub fn key_up(&mut self, key: &str) {
+        self.live_pressed.retain(|k| k != key);
+    }
+
+    /// Spec 310 — release every held key. 1:1 with `releaseAllLive`
+    /// (keyboard.ts:106). Does NOT touch the timed-event queue.
+    pub fn release_keys(&mut self) {
+        self.live_pressed.clear();
+    }
+
+    /// Spec 310 — the held-key set as a list of c64re key ids. 1:1 with
+    /// `livePressedKeys` (keyboard.ts:107) — iteration order = insertion order.
+    pub fn pressed_keys(&self) -> Vec<String> {
+        self.live_pressed.clone()
+    }
+
+    /// Active row mask (active-low: bit cleared = key pressed) for the columns
+    /// currently driven low by `pa_value`, evaluated at cycle `now`. Mirrors the
+    /// TS `readRowsForPa` — folds BOTH the timed events (cycle-window gated) AND
+    /// the held-key set (Spec 310) into the mask. With no keys held the result
+    /// is byte-identical to the events-only path.
+    pub fn read_rows_for_pa(&self, now: u64, pa_value: u8) -> u8 {
+        let mut row_mask: u8 = 0xff;
+        self.for_each_active_key(now, |col, row| {
+            if pa_value & (1 << col) == 0 {
+                row_mask &= !(1 << row);
+            }
+        });
+        row_mask
+    }
+
+    /// The OTHER direction: active column mask (active-low) for the rows driven
+    /// low by `pb_value`. The mirror of [`read_rows_for_pa`], because the matrix
+    /// is a grid of switches and a switch does not care which side is driven.
+    ///
+    /// PORT OF: the first loop of VICE `read_ciapa` (c64cia1.c:298-320), which
+    /// walks the port-B lines being driven and pulls down the port-A lines each
+    /// pressed key connects them to (`rev_keyarr`).
+    ///
+    /// This existed nowhere, and the `$DC00` read said so in its own comment:
+    /// *"the keyboard back-scan (= 0xff in the dominant case — KERNAL never
+    /// drives PB columns)"*. True of the KERNAL, false of games: the title's IRQ
+    /// scanner drives PB, reads PA, and bails out the moment it reads `$ff` — so
+    /// no key it ever pressed reached the game.
+    ///
+    /// Ghost keys are NOT modelled, here or in [`read_rows_for_pa`]. VICE
+    /// eliminates them in this direction (the `tmp & PRB & DDRB` branch) and
+    /// force-lows them in the other (`ciapb_forcelow`); both directions here are
+    /// the plain per-key OR. Adding it to one side only would make the two
+    /// disagree, which is worse than a known, symmetric gap.
+    pub fn read_columns_for_pb(&self, now: u64, pb_value: u8) -> u8 {
+        let mut col_mask: u8 = 0xff;
+        self.for_each_active_key(now, |col, row| {
+            if pb_value & (1 << row) == 0 {
+                col_mask &= !(1 << col);
+            }
+        });
+        col_mask
+    }
+
+    /// Every key held down at `now`, as its `(column, row)` matrix position —
+    /// the timed events (`type_text`, cycle-window gated) and the Spec 310 held
+    /// set together. Both scan directions read the same switches, so they walk
+    /// the same iteration.
+    fn for_each_active_key(&self, now: u64, mut f: impl FnMut(u8, u8)) {
+        for ev in &self.events {
+            if now < ev.start_cycle || now >= ev.end_cycle {
+                continue;
+            }
+            if let Some((col, row)) = key_matrix(&ev.key) {
+                f(col, row);
+            }
+        }
+        // Spec 310 — held keys (browser passthrough), no cycle gating.
+        for key in &self.live_pressed {
+            if let Some((col, row)) = key_matrix(key) {
+                f(col, row);
+            }
+        }
+    }
+}
+
+// ── Joystick model (Spec 310 / Sprint 93.1) ────────────────────────────────
+//
+// 1:1 PORT of the c64re TS `peripherals/keyboard.ts` joystick backend
+// (keyboard.ts:180-203). Real C64 wires joystick port 2 to CIA1 PA bits 0-4
+// (active-low) and joystick port 1 to CIA1 PB bits 0-4 (active-low). When read,
+// a pulled bit indicates a pressed direction / fire. The session mutates this
+// small state object; the CIA1 PA/PB read backends AND the joystick mask into
+// the post-DDR latch value so the CPU sees the joystick (NOT an override — a
+// digital pull-down ANDed with the latch, per VICE c64cia1.c read_joyport_dig).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JoystickState {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub fire: bool,
+}
+
+/// keyboard.ts:189-193 — joystick bit positions (active-low when pulled).
+pub const JOY_BIT_UP: u8 = 1 << 0;
+pub const JOY_BIT_DOWN: u8 = 1 << 1;
+pub const JOY_BIT_LEFT: u8 = 1 << 2;
+pub const JOY_BIT_RIGHT: u8 = 1 << 3;
+pub const JOY_BIT_FIRE: u8 = 1 << 4;
+
+/// keyboard.ts:195-203 — `joystickActiveLowMask`. Start from 0xff (all released
+/// = all bits high) and clear a bit for each pressed direction / fire. The CIA1
+/// PA ($DC00, port 2) / PB ($DC01, port 1) read ANDs this mask into the post-DDR
+/// latch value, exactly like VICE `read_joyport_dig`.
+pub fn joystick_active_low_mask(s: &JoystickState) -> u8 {
+    let mut mask: u8 = 0xff;
+    if s.up {
+        mask &= !JOY_BIT_UP;
+    }
+    if s.down {
+        mask &= !JOY_BIT_DOWN;
+    }
+    if s.left {
+        mask &= !JOY_BIT_LEFT;
+    }
+    if s.right {
+        mask &= !JOY_BIT_RIGHT;
+    }
+    if s.fire {
+        mask &= !JOY_BIT_FIRE;
+    }
+    mask & 0xff
+}
+
+/// What CIA1 port A ($DC00) actually presents on its pins: the post-DDR latch,
+/// the keyboard back-scan, and joystick port 2 pulling bits low.
+/// VICE `c64cia1.c:337 read_ciapa` — `(val & (PRA|~DDRA)) & read_joyport_dig(JOY2)`,
+/// where `val` is the column read for whatever port B is driving (`old_pb`, itself
+/// ANDed with joystick 1).
+///
+/// This lives here, once, because it had been written out twice — in the CPU's
+/// `FullBus::io_read` and NOT in the side-effect-free `Machine::read_full`, which
+/// returned the bare CIA latch instead. The monitor therefore could not see a
+/// keypress or a joystick at all: `m dc00` answered with the last value the
+/// KERNAL wrote, and every attempt to debug input by reading $DC00 measured
+/// nothing. Reading these two registers has no side effect (unlike $DC0D), so
+/// the peek has no reason to give a different answer than the CPU gets.
+pub fn cia1_pa_pins(
+    kb: &KeyboardMatrix,
+    now: u64,
+    pra: u8,
+    ddra: u8,
+    prb: u8,
+    ddrb: u8,
+    joy1: &JoystickState,
+    joy2: &JoystickState,
+) -> u8 {
+    let pb_out = ((prb | !ddrb) & joystick_active_low_mask(joy1)) & 0xff;
+    let val = kb.read_columns_for_pb(now, pb_out);
+    ((val & ((pra | !ddra) & 0xff)) & joystick_active_low_mask(joy2)) & 0xff
+}
+
+/// What CIA1 port B ($DC01) presents: the keyboard rows for whatever port A is
+/// driving, the driven-high latch bits, and joystick port 1.
+/// VICE `c64cia1.c:425-431 read_ciapb` — `((val & (PRB|~DDRB)) | (DDRB & PRB)) & JOY1`.
+/// Same story as [`cia1_pa_pins`]: one copy, used by the CPU read and the peek.
+pub fn cia1_pb_pins(
+    kb: &KeyboardMatrix,
+    now: u64,
+    pra: u8,
+    ddra: u8,
+    prb: u8,
+    ddrb: u8,
+    joy1: &JoystickState,
+) -> u8 {
+    let pa_out = (pra | !ddra) & 0xff;
+    let val = kb.read_rows_for_pa(now, pa_out);
+    let val_out_hi = ddrb & prb;
+    (((val & ((prb | !ddrb) & 0xff)) | val_out_hi) & joystick_active_low_mask(joy1)) & 0xff
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The matrix is a grid of switches, and a switch does not care which side
+    /// is driven. Reading it BACKWARDS — drive the rows, read the columns — must
+    /// see the same key.
+    ///
+    /// A real title's IRQ scanner does exactly this, and it is why no key ever
+    /// reached the game: the back-scan was not modelled and returned $ff.
+    #[test]
+    fn the_matrix_reads_the_same_key_from_either_side() {
+        let mut kb = KeyboardMatrix::new();
+        kb.key_down("SPACE"); // col 7, row 4
+
+        // Forward: drive column 7, read the rows → row 4 pulled low.
+        let pa_col7 = 0xff & !(1 << 7);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col7), 0xff & !(1 << 4));
+
+        // Backward: drive row 4, read the columns → column 7 pulled low.
+        let pb_row4 = 0xff & !(1 << 4);
+        assert_eq!(
+            kb.read_columns_for_pb(0, pb_row4),
+            0xff & !(1 << 7),
+            "SPACE must be visible when the ROWS are driven"
+        );
+
+        // A row the key is not on pulls nothing.
+        assert_eq!(kb.read_columns_for_pb(0, 0xff & !(1 << 3)), 0xff);
+        // Nothing driven at all pulls nothing.
+        assert_eq!(kb.read_columns_for_pb(0, 0xff), 0xff);
+        // Every row driven (PRB = $00) — the title's actual first half-scan.
+        assert_eq!(kb.read_columns_for_pb(0, 0x00), 0xff & !(1 << 7));
+    }
+
+    /// Timed events (`type_text`) feed the back-scan too, on the same cycle
+    /// window — one iteration over the switches serves both directions.
+    #[test]
+    fn the_back_scan_sees_typed_keys_within_their_window() {
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "L", 100, 50); // col 5, row 2
+        let pb_row2 = 0xff & !(1 << 2);
+        assert_eq!(kb.read_columns_for_pb(0, pb_row2), 0xff & !(1 << 5));
+        assert_eq!(kb.read_columns_for_pb(150, pb_row2), 0xff, "expired");
+    }
+
+    #[test]
+    fn type_load_directory_resolves_quote_with_shift() {
+        // LOAD"$",8 — the '"' is shifted (base key "2"), '$' is shifted (base "4").
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "LOAD\"$\",8\r", 100, 50);
+        // First char 'L' at col 5 row 2 → during [0,100) PA driving col5 low pulls row2.
+        let pa_no_col5 = 0xff; // no column driven low
+        assert_eq!(kb.read_rows_for_pa(0, pa_no_col5), 0xff, "no column driven = no rows");
+        let pa_col5 = 0xff & !(1 << 5);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col5), 0xff & !(1 << 2), "L pulls row2 on col5");
+    }
+
+    #[test]
+    fn shifted_quote_queues_left_shift() {
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "\"", 100, 50);
+        // '"' base key "2" = col7 row3; plus L_SHIFT = col1 row7.
+        let pa_col7 = 0xff & !(1 << 7);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col7), 0xff & !(1 << 3));
+        let pa_col1 = 0xff & !(1 << 1);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff & !(1 << 7), "L_SHIFT on col1 row7");
+    }
+
+    #[test]
+    fn events_expire_after_hold() {
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "A", 100, 50);
+        let pa_col1 = 0xff & !(1 << 1); // 'A' = col1 row2
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff & !(1 << 2));
+        assert_eq!(kb.read_rows_for_pa(100, pa_col1), 0xff, "expired at end_cycle");
+    }
+
+    #[test]
+    fn no_held_keys_is_byte_identical_to_events_only() {
+        // The held set is additive: with nothing held, the read path matches
+        // the pre-Spec-310 events-only behaviour for every column/cycle.
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "LOAD\"$\",8\r", 100, 50);
+        assert!(kb.pressed_keys().is_empty());
+        for now in [0u64, 50, 99, 150, 300] {
+            for pa in 0u16..=0xff {
+                let pa = pa as u8;
+                // Re-derive the events-only mask inline and compare.
+                let mut expected: u8 = 0xff;
+                for ev in &kb.events {
+                    if now < ev.start_cycle || now >= ev.end_cycle {
+                        continue;
+                    }
+                    if let Some((col, row)) = key_matrix(&ev.key) {
+                        if pa & (1 << col) == 0 {
+                            expected &= !(1 << row);
+                        }
+                    }
+                }
+                assert_eq!(kb.read_rows_for_pa(now, pa), expected, "now={now} pa={pa:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn held_key_presses_until_key_up_regardless_of_cycle() {
+        // key_down 'A' (col1 row2): pressed at ANY cycle, with no timed window.
+        let mut kb = KeyboardMatrix::new();
+        let pa_col1 = 0xff & !(1 << 1);
+        // Nothing held yet.
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff);
+        kb.key_down("A");
+        assert_eq!(kb.pressed_keys(), vec!["A".to_string()]);
+        // Pressed at cycle 0, at a huge cycle, everywhere in between.
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff & !(1 << 2));
+        assert_eq!(kb.read_rows_for_pa(9_999_999, pa_col1), 0xff & !(1 << 2));
+        // Only pulls the row when its column is driven low.
+        let pa_other = 0xff & !(1 << 5);
+        assert_eq!(kb.read_rows_for_pa(0, pa_other), 0xff, "A not on col5");
+        // key_up releases it.
+        kb.key_up("A");
+        assert!(kb.pressed_keys().is_empty());
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff, "released");
+    }
+
+    #[test]
+    fn key_down_is_idempotent_and_key_up_unknown_is_noop() {
+        let mut kb = KeyboardMatrix::new();
+        kb.key_down("Q");
+        kb.key_down("Q");
+        assert_eq!(kb.pressed_keys(), vec!["Q".to_string()], "no duplicate");
+        kb.key_up("NOT_HELD"); // no-op
+        assert_eq!(kb.pressed_keys(), vec!["Q".to_string()]);
+    }
+
+    #[test]
+    fn release_keys_clears_held_but_not_timed_events() {
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "A", 100, 50); // timed 'A' in [0,100)
+        kb.key_down("Q"); // held 'Q' = col7 row6
+        kb.release_keys();
+        assert!(kb.pressed_keys().is_empty(), "held cleared");
+        // The timed 'A' event survives release_keys.
+        let pa_col1 = 0xff & !(1 << 1);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff & !(1 << 2), "timed A still there");
+    }
+
+    #[test]
+    fn held_and_timed_combine_in_one_read() {
+        // Hold L_SHIFT (col1 row7) while a timed '2' (col7 row3) is in window:
+        // a single PA-drive of either column reflects its key.
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "2", 100, 50); // '2' = col7 row3
+        kb.key_down("L_SHIFT"); // col1 row7
+        let pa_col7 = 0xff & !(1 << 7);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col7), 0xff & !(1 << 3), "timed 2");
+        let pa_col1 = 0xff & !(1 << 1);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff & !(1 << 7), "held L_SHIFT");
+        // Drive both columns at once → both rows pulled.
+        let pa_both = 0xff & !(1 << 7) & !(1 << 1);
+        assert_eq!(
+            kb.read_rows_for_pa(0, pa_both),
+            0xff & !(1 << 3) & !(1 << 7),
+            "both rows"
+        );
+    }
+
+    #[test]
+    fn clear_wipes_held_and_events() {
+        let mut kb = KeyboardMatrix::new();
+        kb.type_text(0, "A", 100, 50);
+        kb.key_down("Q");
+        kb.clear();
+        assert!(kb.pressed_keys().is_empty());
+        let pa_col1 = 0xff & !(1 << 1);
+        assert_eq!(kb.read_rows_for_pa(0, pa_col1), 0xff, "events gone too");
+    }
+
+    #[test]
+    fn joystick_mask_released_is_all_high() {
+        // keyboard.ts:196 — nothing pressed → 0xff (no bits pulled).
+        assert_eq!(joystick_active_low_mask(&JoystickState::default()), 0xff);
+    }
+
+    #[test]
+    fn joystick_mask_pulls_active_low_bits() {
+        // keyboard.ts:189-203 — up=bit0, down=bit1, left=bit2, right=bit3, fire=bit4.
+        let up = JoystickState { up: true, ..Default::default() };
+        assert_eq!(joystick_active_low_mask(&up), 0xff & !JOY_BIT_UP);
+        let fire = JoystickState { fire: true, ..Default::default() };
+        assert_eq!(joystick_active_low_mask(&fire), 0xff & !(1 << 4));
+        let all = JoystickState { up: true, down: true, left: true, right: true, fire: true };
+        assert_eq!(joystick_active_low_mask(&all), 0xff & !0x1f);
+    }
+}

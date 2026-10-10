@@ -1,0 +1,23 @@
+[package]
+name = "trx64-core"
+edition = "2021"
+version = "0.11.0"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+ue2-host = { path = "../../crates/ue2-host" }
+# Serializable device/model state and versioned pure Rust SID snapshots.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Spec 863 — `models.toml`, the C64 model rows, parsed once at startup.
+toml = "0.9"
+
+resid-rs = { path = "../resid-rs", features = ["vice-analog", "snapshot-serde"] }
+
+[features]
+# Exact bitplane lookups trade throughput for lower resident memory.
+compact-sid = ["resid-rs/vice-packed-tables"]
+
+# Spec 873 — the folder device reports the host volume's real free space (statvfs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,1526 @@
+//! full.rs — the assembled full-C64 memory bus (FullBus).
+//!
+//! Composition (ADR-010/012/021): the cycle-exact CPU (cpu.rs), VIC-II (vic.rs),
+//! CIA1/CIA2 (cia.rs) and 1541 drive (drive.rs) — each byte-exact in isolation —
+//! wired into the real machine through a single `Bus` impl that reproduces the TS
+//! oracle's `HeadlessMemoryBus` (memory-bus.ts) + `integrated-session.ts` run loop:
+//!
+//!   * PLA banking via the $00/$01 CPU port (LORAM/HIRAM/CHAREN; GAME/EXROM=1, no
+//!     cart). 32-entry memconfig table (= buildMemConfigTable), selected each
+//!     $00/$01 write. RAM $0000-$9FFF, BASIC $A000-$BFFF, IO/char $D000-$DFFF,
+//!     KERNAL $E000-$FFFF — per the live config.
+//!   * IO routing: VIC $D000-$D3FF, SID $D400-$D7FF (register shadow), colorRAM
+//!     $D800-$DBFF (low nibble + $F0 open-bus high nibble), CIA1 $DC00-$DCFF,
+//!     CIA2 $DD00-$DDFF.
+//!   * ROMs in SEPARATE arrays; the RAM under the ROM/IO windows keeps its
+//!     power-on DRAM-fill (writes-through-ROM + the trace `old`/oldValue byte read
+//!     RAM underneath, never ROM — memory-bus.ts gotcha).
+//!   * VIC ticked per CPU master cycle (Bus::tick + BA-low stealing, vic.rs).
+//!   * Both CIAs share the CPU master clock; their timer state machines advance
+//!     lazily to `clk` on each register access (rclk = clk, C64SC offsets = 0).
+//!   * Cross-chip IRQ: CIA1 ∨ VIC → CPU IRQ line; CIA2 → CPU NMI line, sampled by
+//!     the CPU at the instruction boundary (cpu.rs interrupt pipeline).
+
+use crate::cia::{Cia, CIAT_TABLEN};
+use crate::cpu::Bus;
+use crate::sid::Sid6581;
+use crate::vic::VicII;
+
+/// $8000-$9FFF mapping (= memory-bus.ts MemConfigEntry.bank8, ts:62).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Bank8 {
+    Ram,
+    CartLo,
+}
+
+/// $A000-$BFFF mapping (= MemConfigEntry.bankA, ts:64).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BankA {
+    Ram,
+    Basic,
+    CartHi,
+}
+
+/// $E000-$FFFF mapping (= MemConfigEntry.bankE, ts:68).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BankE {
+    Ram,
+    Kernal,
+    CartHiUltimax,
+}
+
+/// One pre-built memconfig entry (= memory-bus.ts MemConfigEntry). The bank8/
+/// bank_a/bank_e enums carry the cartridge windows (cart_lo / cart_hi /
+/// cart_hi_ultimax) exactly like the TS string-enums; the `basic`/`kernal`/`io`/
+/// `char_rom` booleans are KEPT (derived from the enums) so the no-cart read/write
+/// path stays byte-identical to the pre-cart code.
+#[derive(Clone, Copy)]
+pub struct MemConfig {
+    /// $8000-$9FFF: RAM or cart ROML.
+    pub bank8: Bank8,
+    /// $A000-$BFFF: RAM / BASIC / cart ROMH.
+    pub bank_a: BankA,
+    /// $E000-$FFFF: RAM / KERNAL / cart ROMH (ultimax).
+    pub bank_e: BankE,
+    /// $A000-$BFFF maps BASIC ROM (= bank_a == Basic).
+    pub basic: bool,
+    /// $E000-$FFFF maps KERNAL ROM (= bank_e == Kernal).
+    pub kernal: bool,
+    /// $D000-$DFFF maps I/O (= bankD == io).
+    pub io: bool,
+    /// $D000-$DFFF maps CHARGEN ROM (when !io) (= bankD == char).
+    pub char_rom: bool,
+    /// True when GAME=0 && EXROM=1 (ultimax board overlay). Drives the open-bus
+    /// windows ($1000-$7FFF, $C000-$CFFF, the $A000/$E000 non-cart-hi fallthrough).
+    pub ultimax: bool,
+}
+
+/// Build the 32-entry memconfig table exactly like memory-bus.ts
+/// `buildMemConfigTable` (ts:987-1019). Index = LORAM|HIRAM<<1|CHAREN<<2|
+/// EXROM<<3|GAME<<4. The cart windows (cart_lo / cart_hi / cart_hi_ultimax) are
+/// set per ultimax / 16K-cart rules; the booleans are derived so the no-cart path
+/// (EXROM=GAME=1 ⇒ idx 0x18-0x1f, never ultimax, never cart) is byte-identical to
+/// the prior table.
+pub fn build_memconfig_table() -> [MemConfig; 32] {
+    let mut table = [MemConfig {
+        bank8: Bank8::Ram,
+        bank_a: BankA::Ram,
+        bank_e: BankE::Ram,
+        basic: false,
+        kernal: false,
+        io: false,
+        char_rom: false,
+        ultimax: false,
+    }; 32];
+    for (idx, entry) in table.iter_mut().enumerate() {
+        let loram = idx & 0x01 != 0;
+        let hiram = idx & 0x02 != 0;
+        let charen = idx & 0x04 != 0;
+        let exrom = idx & 0x08 != 0;
+        let game = idx & 0x10 != 0;
+        // ts:996 — Ultimax mode: GAME=0 AND EXROM=1.
+        let ultimax = !game && exrom;
+
+        // ts:998-1000 — bank8 (kept as two separate conditions verbatim with the
+        // TS `if (ultimax) ...; else if (loram && hiram && !exrom) ...`).
+        #[allow(clippy::if_same_then_else)]
+        let bank8 = if ultimax {
+            Bank8::CartLo
+        } else if loram && hiram && !exrom {
+            Bank8::CartLo
+        } else {
+            Bank8::Ram
+        };
+
+        // ts:1002-1005 — bankA.
+        let bank_a = if ultimax {
+            BankA::Ram // unmapped in Ultimax
+        } else if loram && hiram && !exrom && !game {
+            BankA::CartHi // 16K cart
+        } else if loram && hiram {
+            BankA::Basic
+        } else {
+            BankA::Ram
+        };
+
+        // ts:1007-1009 — bankD.
+        let io = if ultimax {
+            true // I/O always in Ultimax
+        } else {
+            (loram || hiram) && charen
+        };
+        let char_rom = !ultimax && (loram || hiram) && !charen;
+
+        // ts:1011-1012 — bankE.
+        let bank_e = if ultimax {
+            BankE::CartHiUltimax
+        } else if hiram {
+            BankE::Kernal
+        } else {
+            BankE::Ram
+        };
+
+        *entry = MemConfig {
+            bank8,
+            bank_a,
+            bank_e,
+            basic: matches!(bank_a, BankA::Basic),
+            kernal: matches!(bank_e, BankE::Kernal),
+            io,
+            char_rom,
+            ultimax,
+        };
+    }
+    table
+}
+
+/// The assembled full-C64 bus, borrowing every subsystem from the `Machine`.
+/// One per run (built in `run_for_full*`), so the borrows are scoped to the loop.
+pub struct FullBus<'a> {
+    pub ram: &'a mut [u8; 0x10000],
+    pub basic_rom: &'a [u8; 0x2000],
+    pub kernal_rom: &'a [u8; 0x2000],
+    pub char_rom: &'a [u8; 0x1000],
+    /// IO register shadow ($D000-$DFFF) for open-bus reads of unclaimed regs.
+    pub io: &'a mut [u8; 0x1000],
+    pub vic: &'a mut VicII,
+    pub cia1: &'a mut Cia,
+    pub cia2: &'a mut Cia,
+    pub cia_table: &'a [u16; CIAT_TABLEN],
+    /// 32-byte SID register shadow ($D400-$D41F) — write-only store for parity.
+    /// Spec 855: this is CHIP 0, the one every existing path already names.
+    pub sid_regs: &'a mut [u8; 32],
+    /// SID 6581 oscillator + envelope state machine (for $D41B osc3 / $D41C env3).
+    /// Spec 855: chip 0's model.
+    pub sid: &'a mut Sid6581,
+    /// Spec 855 D3 — chips 1.., each with its own register file and model.
+    /// Empty on a stock machine, and then nothing below costs anything.
+    pub sid_extra: &'a mut [crate::sid::SidChip],
+    /// Spec 855 D2 — the host's decode table. Empty means the pre-855 machine:
+    /// `$D400-$D7FF` mirrored onto chip 0 and nothing claimed in `$DE00-$DFFF`.
+    pub sid_map: &'a [crate::sid::SidMapping],
+    /// Spec 855 D4 — the machine's audio subscriber, borrowed for this run.
+    pub sid_trace: &'a mut crate::sid::SidTrace,
+    /// Spec 855 D5 — the host's read/peek overrides, borrowed for this run.
+    pub sid_host: &'a mut crate::sid::SidHostAccess,
+    /// Spec 876 — the POT lines and chip 0's `$D419`/`$D41A` latch, borrowed for this run.
+    pub pot: &'a mut crate::pot::PotLines,
+    /// Live memconfig (selected by $00/$01 writes).
+    pub config: MemConfig,
+    pub memconfig_table: &'a [MemConfig; 32],
+    /// CPU-port latches.
+    pub port_dir: u8,
+    pub port_data: u8,
+    /// Master clock, advanced by `tick` (shared with CPU + CIAs).
+    pub clk: u64,
+    /// Last CIA2 port-A OUTPUT byte pushed to $DD00 (= IEC/VIC-bank). A write to
+    /// $DD00/$DD02 that changes the composed output re-pushes it as a $DD00 bus
+    /// write (TS `iecWrite`). Seeded from the live CIA2 PA output so the FIRST
+    /// change is detected correctly.
+    pub cia2_pa_out: u8,
+    /// Side-effect writes queued by the immediately-preceding `write()`
+    /// (`(addr, value, old)`), drained by the CPU `store` into the trace.
+    pub side_effects: Vec<(u16, u8, u8)>,
+    /// Side-effect reads queued by the immediately-preceding `read()`
+    /// (`(addr, value)`), drained by the CPU `load_read` into the trace. Carries
+    /// the IEC `iecReadPins` indirection record on a CIA2 PA ($DD00) read.
+    pub read_side_effects: Vec<(u16, u8)>,
+    /// The 1541 drive — borrowed so a $DD00 access can push-flush it to the exact
+    /// C64 clock before sampling/applying the IEC lines (cross-domain sync).
+    pub drive: &'a mut crate::drive::Drive1541,
+    /// Spec 871 — drive position B, on the same bus. Off by default: not clocked,
+    /// not folded.
+    pub drive_b: &'a mut crate::drive::Drive1541,
+    /// Spec 873/874 — the IEC devices on the bus (folders, a host's own), advanced at
+    /// every sync point after the drives. Empty on a stock machine: one length test per
+    /// sync point.
+    pub iec_devices: &'a mut crate::iec_device::IecDevices,
+    /// IEC wired-AND core (C64 CIA2 PA ↔ drive VIA1 PB), borrowed from the Machine.
+    pub iec: &'a mut crate::iec::IecCore,
+    /// Keyboard matrix (CIA1 PA column drive ↔ PB row read). Read on a $DC01
+    /// access to inject queued `session/type` key presses.
+    pub keyboard: &'a crate::keyboard::KeyboardMatrix,
+    /// Spec 310 / Sprint 93.1 — joystick port 1 (CIA1 PB bits 0-4, active-low),
+    /// folded into the $DC01 PB read. 1:1 with c64re `joystick1`.
+    pub joystick1: crate::keyboard::JoystickState,
+    /// Joystick port 2 (CIA1 PA bits 0-4, active-low), folded into the $DC00 PA
+    /// read. 1:1 with c64re `joystick2`. Copied by value (read-only this cycle).
+    pub joystick2: crate::keyboard::JoystickState,
+    /// Monotonic C64-clock the drives have been advanced up to (push-flush
+    /// reference). One for both positions: they are always caught up together.
+    pub drive_c64_ref: u64,
+    /// The attached cartridge mapper (= memory-bus.ts `cartridge`, ts:118), or
+    /// None for the stock no-cart machine. Borrowed `&mut` because a $DE00-$DFFF
+    /// IO write mutates the mapper's bank/control register. The mapper is consulted
+    /// SYNCHRONOUSLY from read()/write() (a per-access bus hook, NOT a clocked
+    /// device — no tick). When None the banking is exactly the pre-cart path.
+    pub cartridge: Option<&'a mut Box<dyn crate::cart::CartMapper>>,
+    /// Spec 785 C1 — the ARMED cartridge read-set accumulator, or None.
+    ///
+    /// `Some` only while `Machine::cart_read_armed`; every other construction site
+    /// (the monitor's `read_full_live`/`write_full`, the bus tests) passes None, so
+    /// a monitor peek/poke can never enter a title's read-set and the disarmed read
+    /// path is the pre-785 one.
+    pub cart_reads: Option<&'a mut crate::cart::CartReadSet>,
+    /// Spec 785 C1 — suspends read-set accounting for the duration of ONE bus
+    /// read. Set by `full_sc`'s store paths around the pre-write old-byte read:
+    /// that read is trace/undo INSTRUMENTATION (VICE does not perform it), so the
+    /// cartridge never sees it and it must not be counted. A write to RAM under a
+    /// banked-in cart ROM would otherwise fabricate one cart read per store.
+    pub cart_account_suspend: bool,
+    /// Spec 850 — the machine profile's own device on the expansion port (Spec 852's UCI
+    /// block on the `u64` profile), or None.
+    pub port_profile: Option<&'a mut Box<dyn crate::expansion::ExpansionDevice>>,
+    /// Spec 850 — a host's device on the expansion port, or None.
+    pub port_host: Option<&'a mut Box<dyn crate::expansion::ExpansionDevice>>,
+    /// Spec 850 D5 — addresses whose writes the port's devices see whatever the banking;
+    /// None when nobody snoops, which keeps the write path one branch.
+    pub snoop: Option<&'a crate::expansion::SnoopSet>,
+    /// Spec 850 — the kind of access being served, set per access by `full_sc`; `Host`
+    /// on the monitor paths.
+    pub access_kind: crate::expansion::AccessKind,
+    /// Spec 850 — the BA steal before the pending read: all stolen cycles, and those with
+    /// AEC still high. Cleared after every access.
+    pub stalled: u32,
+    pub stalled_on_bus: u32,
+    /// Spec 850 D4 — a device asked the run to end at the next instruction boundary.
+    pub device_stop: bool,
+    /// Spec 850 D6 — the IRQ/NMI the host itself drives onto the port.
+    pub host_lines: crate::expansion::PortLines,
+    /// Spec 850 — `Machine::port_active` at construction: a device, a host line, or an
+    /// expansion interrupt still pending. Constant for the run, so the per-cycle sample
+    /// costs one load on a stock machine.
+    pub port_active: bool,
+    /// Spec 856 D2 — set by any access that is not a plain RAM or plain ROM read: IO while
+    /// it is mapped, a cartridge window, the processor port, a snooped address. The turbo
+    /// fast path runs instructions back to back only while this stays clear, because an
+    /// IRQ acknowledge inside one PHI2 cycle reaches `IntStatus` through nothing but the
+    /// boundary restamp. Conservative on purpose: a false positive costs one sync, a
+    /// missed one storms every handler.
+    pub io_touched: bool,
+    /// Spec 857 D4 — `Machine::cia_alarm_check` for this run: `process_alarms` compares
+    /// against the CIAs' predicted alarm clocks instead of catching them up every time.
+    pub cia_alarm_check: bool,
+}
+
+/// The ROMH the VIC fetches through under a REAL ultimax board, or `None` for every
+/// ordinary machine (= VICE's `export.ultimax_phi1` gate plus a non-NULL
+/// `ultimax_romh_phi1_ptr`).
+///
+/// Three conditions, and all three are load-bearing. The board must actually be in
+/// ultimax (GAME=0, EXROM=1). The cart must not be a FAKE-ultimax one — GMod3 and GMod4
+/// hold the lines permanently and resolve their own windows, so the VIC reads the
+/// ordinary map there exactly as the CPU does (VICE's `mem_read_without_ultimax`). And
+/// the mapper must drive $E000 at all: the families whose ultimax mode exists only to
+/// open a flash programming window answer `None`, and the fetch falls back — VICE's
+/// NULL pointer, spelled as an `Option`.
+///
+/// A free function and not a method on purpose: `&self` borrows the WHOLE bus, and the
+/// view is built beside a `&mut self.vic`. Taking the two fields it needs keeps the
+/// borrows disjoint, which is the same reason `VicMemView` exists at all.
+#[inline]
+pub(crate) fn vic_romh_window<'c>(
+    ultimax: bool,
+    cart: Option<&'c Box<dyn crate::cart::CartMapper>>,
+) -> Option<&'c [u8]> {
+    let c = cart?;
+    if !ultimax || c.fake_ultimax() {
+        return None;
+    }
+    c.vic_romh()
+}
+
+impl<'a> FullBus<'a> {
+    /// Recompute the live memconfig from the $00/$01 latches + cartridge EXROM/GAME
+    /// lines (= memory-bus.ts memPlaConfigChanged, ts:854-871, VERBATIM).
+    #[inline]
+    pub fn pla_config_changed(&mut self) {
+        // ts:855 — port = (~dir | data) & 7 — input pins pulled HIGH.
+        let port = ((!self.port_dir | self.port_data) & 0x07) as usize;
+        let loram = port & 0x01;
+        let hiram = (port >> 1) & 0x01;
+        let charen = (port >> 2) & 0x01;
+        // ts:858-862 — cartridge lines; no cart: EXROM=1, GAME=1 (released).
+        let (exrom, game) = match self.cartridge.as_ref() {
+            Some(c) => {
+                let lines = c.get_lines();
+                ((lines.exrom & 1) as usize, (lines.game & 1) as usize)
+            }
+            None => (1usize, 1usize),
+        };
+        // ts:869 — idx = LORAM | HIRAM<<1 | CHAREN<<2 | EXROM<<3 | GAME<<4.
+        let idx = (loram | (hiram << 1) | (charen << 2) | (exrom << 3) | (game << 4)) & 0x1f;
+        self.config = self.memconfig_table[idx];
+    }
+
+    /// ts:237-251 — getBankInfo: the banking-context struct passed to every
+    /// cartridge read/write/peek. The read-only mappers only read
+    /// cpu_port_direction/value (and ignore them for banking), so this is mostly
+    /// carried for 1:1 fidelity.
+    #[inline]
+    fn get_bank_info(&self) -> crate::cart::BankInfo {
+        let lines = self.cartridge.as_ref().map(|c| c.get_lines());
+        crate::cart::BankInfo {
+            cpu_port_direction: self.port_dir,
+            cpu_port_value: self.port_data,
+            basic_visible: self.config.basic,
+            kernal_visible: self.config.kernal,
+            io_visible: self.config.io,
+            char_visible: self.config.char_rom,
+            cartridge_attached: self.cartridge.is_some(),
+            cartridge_exrom: lines.map(|l| l.exrom),
+            cartridge_game: lines.map(|l| l.game),
+            // GMOD2's IO1 read mixes the EEPROM DO bit with open-bus low bits; the
+            // stock C64 float bus is 0xFF here (= open_bus()). Read-only mappers
+            // ignore phi1.
+            phi1: 0xff,
+        }
+    }
+
+    /// VICE computeCpuPortDataRead simplified for the no-datasette stock C64
+    /// (capacitor bits 6,7 → 0 in input mode; the boot ROM never relies on decay).
+    #[inline]
+    fn cpu_port_data_read(&self) -> u8 {
+        let dir = self.port_dir;
+        let data = self.port_data;
+        let pullup = 0x17u8;
+        let data_out = data & dir;
+        let mut retval = (data | !dir) & (data_out | pullup);
+        // Bit 5 (CASS_MOTOR): cleared in input mode (no datasette pullup).
+        if dir & 0x20 == 0 {
+            retval &= 0xdf;
+        }
+        // Bits 6,7: input mode → 0 (capacitor decayed / never charged at boot).
+        if dir & 0x40 == 0 {
+            retval &= !0x40;
+        }
+        if dir & 0x80 == 0 {
+            retval &= !0x80;
+        }
+        retval
+    }
+
+    /// Push-flush the drive to the current C64 `clk`, then refresh the IEC core's
+    /// drive-side contribution from the drive's live VIA1 PB output and re-fold the
+    /// bus. Mirrors VICE `drive_cpu_execute_{one,all}(clock)` followed by the
+    /// drv_data[8]/drv_bus[8]/cpu_port recompute that the kernel overlay performs at
+    /// each $DD00 read/write instant.
+    #[inline]
+    fn iec_push_flush(&mut self) {
+        self.iec_push_flush_to(self.clk);
+    }
+
+    /// Push-flush the drive to an explicit C64-clock target. VICE passes
+    /// `maincpu_clk` on a $DD00 READ (iecbus_cpu_read_conf1) but
+    /// `maincpu_clk + !write_offset` = `maincpu_clk + 1` on a $DD00 WRITE
+    /// (iecbus_cpu_write_conf1, x64sc write_offset=0 — c64cia2.c:162). The extra
+    /// cycle on writes shifts the drive's sampling instant by one C64 cycle, which
+    /// the IEC handshake timing depends on.
+    #[inline]
+    fn iec_push_flush_to(&mut self, target: u64) {
+        self.iec_catch_up_to(target);
+        // READ path (and end-of-instruction): a full re-fold publishes the live
+        // `cpu_port` the C64 reads at $DD00 bits 6/7 (= VICE iecbus_cpu_read_conf1
+        // returning the freshly-folded cpu_port). The cpu_bus is unchanged here, so
+        // this single fold against the current cpu_bus is exact.
+        // VICE via1d1541.c store_prb / iec_drive_write(~byte): the drive's PB
+        // output folds into the bus as `~pb_out` (iec.rs iec_drive_write inverts via
+        // the `~data ^ cpu_bus` formula by receiving the already-inverted byte).
+        // Spec 870: into the drive's own slot, and not at all while it is off or held.
+        // Spec 871: both positions, each into its slot.
+        crate::drive::pair_fold_into_iec(self.drive, self.drive_b, self.iec, self.cia2_pa_out);
+        // Spec 873 §4 / 874 §5 — then the IEC devices, against the lines as they now
+        // stand.
+        if !self.iec_devices.is_empty() {
+            crate::iec_device::iec_devices_sync(self.iec_devices, self.iec, target);
+        }
+    }
+
+    /// Catch the drive up to `target` and refresh `drv_data_8` from its live VIA1
+    /// PB output WITHOUT folding the wired-AND bus. The WRITE path uses this: it
+    /// must re-read the drive pull (the catch-up's `$1800` stores never propagate
+    /// `drv_data_8` into the shared IEC core in TRX64), but the wired-AND fold is
+    /// then performed exactly ONCE by `c64_store_dd00` against the NEW cpu_bus —
+    /// matching VICE `iecbus_cpu_write_conf1` (execute_one → update_cpu_bus →
+    /// ATN-edge → single drv_bus recompute → update_ports). The extra fold that
+    /// `iec_push_flush_to` performs against the OLD pre-write cpu_bus is what
+    /// transiently wedged the $04E2 BIT $DD00 / BVC handshake loop.
+    #[inline]
+    fn iec_catch_up_to(&mut self, target: u64) {
+        // Feed the drive the current bus state so a `$1800` PB read during its
+        // catch-up run sees the live C64-driven CLK/DATA/ATN lines. Also feed the
+        // C64-side intent (cpu_bus) — constant across this catch-up — so a `$1800`
+        // STORE inside the run re-folds the wired-AND and the drive sees its own
+        // CLK/DATA pull on the next read (= via1d1541.c store_prb cross-domain sync).
+        // Spec 871: both drive positions are caught up before either is written back.
+        self.drive_c64_ref = crate::drive::pair_catch_up(
+            self.drive,
+            self.drive_b,
+            self.iec,
+            target,
+            self.drive_c64_ref,
+            self.cia2_pa_out,
+        );
+    }
+
+    /// I/O read dispatch ($D000-$DFFF, IO config). Mirrors memory-bus.ts read().
+    #[inline]
+    fn io_read(&mut self, addr: u16) -> u8 {
+        self.io_touched = true;
+        match addr {
+            0xd000..=0xd3ff => {
+                // Spec 851 — the U64's SuperCPU detection sits at a full address.
+                if let Some(v) = self.vic.u64_extra_read(addr) {
+                    return v;
+                }
+                // $D01E (sprite-sprite) / $D01F (sprite-background) collision
+                // registers (mirrored every $40): compute the live collision
+                // latches from the current frozen state, fire the collision IRQ on
+                // the 0→nonzero edge, then read-clear (read_reg_mut). Every other
+                // VIC register is an ordinary register read.
+                match (addr as u8) & 0x3f {
+                    0x1e | 0x1f => {
+                        self.recompute_collisions();
+                        self.vic.read_reg_mut(addr as u8)
+                    }
+                    _ => self.vic.read_reg(addr as u8),
+                }
+            }
+            0xd400..=0xd7ff => {
+                // SID: 32-byte register mirror every $20.
+                // $D419/$D41A (POT X/Y) → chip 0's POT latch (Spec 876); $FF on
+                // chips 1.., which have no POT lines.
+                // $D41B (OSC3) → voice-3 oscillator output MSB (live computed).
+                // $D41C (ENV3) → voice-3 envelope value (live computed).
+                // All other registers: write-only shadow byte (B-level round-trip).
+                //
+                // Spec 855: a host table may put another chip in this range, and
+                // OSC3/ENV3 are per chip. With no table this is chip 0 and the
+                // masking below is what it always was.
+                let (chip, reg) = match crate::sid::resolve_sid(self.sid_map, addr) {
+                    Some(hit) => hit,
+                    None => (0, (addr as usize - 0xd400) & 0x1f),
+                };
+                self.sid_chip_read(chip, reg)
+            }
+            0xd800..=0xdbff => {
+                // Color RAM: low nibble stored in `io` shadow, high nibble open bus ($F0).
+                let v = self.io[(addr as usize) - 0xd000];
+                (v & 0x0f) | 0xf0
+            }
+            0xdc00..=0xdcff => {
+                // CIA1 PA ($DC00) carries the keyboard COLUMN lines AND joystick
+                // port 2 (bits 0-4, active-low). VICE c64cia1.c:337 read_ciapa:
+                // byte = (val & (PRA|~DDRA)) & read_joyport_dig(JOY2), where
+                // `val` is the keyboard BACK-SCAN — the columns pulled low by the
+                // keys sitting on whichever rows port B is driving.
+                //
+                // That back-scan used to be assumed 0xff, on the grounds that the
+                // KERNAL never drives PB. The KERNAL does not; games do. A title we
+                // scans the matrix both ways in its IRQ — DDRB=$ff, PRB=$00, read
+                // $DC00 — and bails out the instant it reads $ff, so with the
+                // assumption baked in NO key ever reached the game. Measured on
+                // the live machine: its handler ran 477 times and queued nothing.
+                //
+                // `pb_out` is what port B is actually driving (= VICE `old_pb`),
+                // ANDed with joystick 1, which pulls the same lines low.
+                if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
+                    crate::keyboard::cia1_pa_pins(
+                        self.keyboard,
+                        self.clk,
+                        self.cia1.peek(0xdc00),
+                        self.cia1.peek(0xdc02),
+                        self.cia1.peek(0xdc01),
+                        self.cia1.peek(0xdc03),
+                        &self.joystick1,
+                        &self.joystick2,
+                    )
+                }
+                // CIA1 PB ($DC01) carries the keyboard ROW lines AND joystick
+                // port 1 (bits 0-4, active-low). VICE c64cia1.c:425-431 read_ciapb:
+                // byte = (val & (PRB|~DDRB)) | (DDRB & PRB), then ANDed with
+                // joystick-port-1 (read_joyport_dig(JOY1)). `val` = keyboard row
+                // pull-down for the PA column drive (paOut = PRA|~DDRA). KERNAL
+                // programs DDRB=0 so the latch term collapses to `val`, but we
+                // compute the full formula + joy1 AND for fidelity (c64re
+                // cia1.ts:101-112).
+                else if (addr & 0xf) == crate::cia::CIA_PRB as u16 {
+                    crate::keyboard::cia1_pb_pins(
+                        self.keyboard,
+                        self.clk,
+                        self.cia1.peek(0xdc00),
+                        self.cia1.peek(0xdc02),
+                        self.cia1.peek(0xdc01),
+                        self.cia1.peek(0xdc03),
+                        &self.joystick1,
+                    )
+                } else {
+                    self.cia1.read(addr, self.clk, self.cia_table)
+                }
+            }
+            0xdd00..=0xddff => {
+                // CIA2 register 0 = port A ($DD00) carries the IEC input lines on
+                // bits 6/7. VICE read_ciapa: value = ((PRA|~DDRA)&0x3f) |
+                // iecbus_callback_read(clk). The callback push-flushes the drive,
+                // re-folds the wired-AND bus, and returns the cached cpu_port —
+                // and (via iecReadPins → c64Read($DD00) → emitC64Access) emits an
+                // EXTRA bus-access read record of cpu_port BEFORE the CPU's own
+                // load record. We reproduce both: the indirection record (queued as
+                // a read side-effect) and the composed PA byte.
+                if (addr & 0xf) == crate::cia::CIA_PRA as u16 {
+                    self.iec_push_flush();
+                    // = iecbus_cpu_read_conf1(clk): returns the freshly-folded
+                    // cpu_port (the drive catch-up was done by iec_push_flush).
+                    let pins = self.iec.iecbus_callback_read(self.clk);
+                    // iecReadPins indirection record (= emitC64Access read at $DD00).
+                    self.read_side_effects.push((0xdd00, pins));
+                    let pra = self.cia2.peek(0xdd00);
+                    let ddra = self.cia2.peek(0xdd02);
+                    (((pra | !ddra) & 0x3f) | pins) & 0xff
+                } else {
+                    self.cia2.read(addr, self.clk, self.cia_table)
+                }
+            }
+            // $DE00-$DFFF — cart IO1/IO2 (ts:407-410). The cart is consulted ONLY
+            // when I/O is visible (guaranteed: io_read is reached only via the io
+            // branch). Some ⇒ the mapper byte; None (or no cart, or a write-only
+            // mapper like MagicDesk/Ocean) ⇒ THE OPEN BUS.
+            //
+            // The open bus is the VIC's last phi1 fetch, not a shadow of what was
+            // last written here. PORT OF: `viciisc/vicii-phi1.c:34` —
+            // `uint8_t vicii_read_phi1(void) { return vicii.last_read_phi1; }` —
+            // which is what `c64io.c:353-354` returns when no I/O device claims the
+            // read.
+            //
+            // What this replaces, and why it mattered: the fallback used to be
+            // `self.io[...]`, the write-through shadow that `io_write` stores for
+            // the whole $D000-$DFFF window. That made an EMPTY expansion port
+            // behave like RAM — write $55 to $DF00, read $55 back, for ever. Every
+            // program that probes for a cartridge or an REU by writing a pattern
+            // and reading it back was told the device is present. The 17xx REU
+            // probe in a Level-Squeezer "+E" cruncher is the case that surfaced it
+            // (issue #19): on real hardware the read-back is a raster-dependent
+            // phi1 byte that practically never matches, the probe fails, and the
+            // program takes its no-REU path; here it matched, and the cruncher
+            // drove a device that was not there.
+            //
+            // The shadow is still WRITTEN (io_write stores the whole window in one
+            // line, and $D800-$DBFF colour RAM genuinely needs it) — it is simply
+            // no longer what this range READS.
+            _ => {
+                if (0xde00..=0xdfff).contains(&addr) {
+                    // Spec 855 §7 — a host may map a SID in here, where it shares
+                    // the range with the expansion chain: a cartridge, the UCI,
+                    // the REU's mirror, a sampler. Which decode sits in front is
+                    // NOT settled — the U64-II top level that would show it is not
+                    // in the open firmware tree — so the host says so per window
+                    // and nothing is assumed here.
+                    //
+                    // `ahead_of_expansion` therefore means exactly what it says:
+                    // the SID answers first. The other way round the chain wins
+                    // outright and the SID is not consulted, which is the simple
+                    // reading — `port_read` resolves to a byte rather than an
+                    // Option, so "the chain first, the SID if nobody answered"
+                    // cannot be expressed without reshaping it. When somebody
+                    // reads the RTL, that is the decision to revisit.
+                    if let Some((chip, reg)) = crate::sid::resolve_sid(self.sid_map, addr) {
+                        if self.sid_map.iter().any(|m| m.contains(addr) && m.ahead_of_expansion) {
+                            return self.sid_chip_read(chip, reg);
+                        }
+                    }
+                    // Spec 850 — the port's devices see the read too, and answer
+                    // before the cartridge; with none attached this is the line above.
+                    return self.port_read(addr);
+                }
+                self.io[(addr as usize) - 0xd000]
+            }
+        }
+    }
+
+    /// VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base):
+    /// PORT OF: `core/ciacore.c:810` + `c64/c64cia2.c:150-151`. The byte the CIA
+    /// puts on port A is `PRA | ~DDRA` — an INPUT pin contributes 1, because the
+    /// pin floats high on the pull-up, not 0. `store_ciapa` then takes `~byte & 3`.
+    /// Masking with `PRA & DDRA` instead reads an input bank bit as 0 and lands the
+    /// VIC 3 banks away: the KERNAL leaves `DDRA = $3F` so both forms agree, but a
+    /// fastloader that drives $DD00 itself (Spindle writes `DDRA = $3C`) leaves the
+    /// bank bits as inputs and every fetch goes to the wrong 16 KB.
+    ///
+    /// Used by the per-cycle VIC fetch view (tick/check_ba) + the static collision
+    /// recompute.
+    #[inline]
+    pub(crate) fn vic_bank_base(&self) -> u16 {
+        let pra = self.cia2.peek(0xdd00);
+        let ddra = self.cia2.peek(0xdd02);
+        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
+        bank.wrapping_mul(0x4000)
+    }
+
+    /// Recompute the $D01E/$D01F collision latches from the current frozen state
+    /// and merge them into the VIC (firing the collision IRQ on the 0→nonzero
+    /// edge). Called when the CPU reads $D01E/$D01F so a polled collision register
+    /// reflects the rendered sprite/graphics overlap of the current frame.
+    ///
+    /// The masks are produced by the static pixel renderer (`render_collisions`),
+    /// the same source the screenshot pipeline uses, so the collision bits are
+    /// pixel-consistent with the displayed frame. `apply_collisions` ports the
+    /// VICE edge-trigger (vicii-cycle.c:407-433) verbatim.
+    fn recompute_collisions(&mut self) {
+        // Colour RAM low nibbles live in the I/O shadow at $D800-$DBFF.
+        let mut color_ram = [0u8; 0x0400];
+        for (i, c) in color_ram.iter_mut().enumerate() {
+            *c = self.io[0x0800 + i] & 0x0f;
+        }
+        // VIC bank base from CIA2 port-A bits 0-1 (= Machine::vic_bank_base).
+        let pra = self.cia2.peek(0xdd00);
+        let ddra = self.cia2.peek(0xdd02);
+        let bank = (((pra | !ddra) & 0x03) ^ 0x03) as u16;
+        let bank_base = bank.wrapping_mul(0x4000);
+
+        let inp = crate::render::RenderInput {
+            regs: &self.vic.regs,
+            ram: self.ram,
+            char_rom: self.char_rom,
+            color_ram: &color_ram,
+            bank_base,
+            model: self.vic.model(),
+        };
+        let (ss, sb) = crate::render::render_collisions(&inp);
+        self.vic.apply_collisions(ss, sb);
+    }
+
+    /// I/O write dispatch ($D000-$DFFF, IO config).
+    #[inline]
+    fn io_write(&mut self, addr: u16, value: u8) {
+        self.io_touched = true;
+        // Keep the open-bus shadow for unclaimed-register reads.
+        self.io[(addr as usize) - 0xd000] = value;
+        match addr {
+            0xd000..=0xd3ff => self.vic.write_reg(addr as u8, value),
+            0xd400..=0xd7ff => {
+                let (chip, reg) = match crate::sid::resolve_sid(self.sid_map, addr) {
+                    Some(hit) => hit,
+                    None => (0, (addr as usize - 0xd400) & 0x1f),
+                };
+                self.sid_chip_write(chip, reg, value);
+            }
+            0xd800..=0xdbff => { /* color RAM: shadow already stored above */ }
+            0xdc00..=0xdcff => {
+                // Spec 876 D3 — `$DC00`/`$DC02` move the POT mux: settle the latch under
+                // the selection that stood until now, before the write changes it.
+                let reg = (addr & 0xf) as usize;
+                if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
+                    self.pot.settle(self.clk, crate::pot::select(self.cia1.pa_output()));
+                }
+                self.cia1.write(addr, value, self.clk, self.cia_table)
+            }
+            0xdd00..=0xddff => {
+                self.cia2.write(addr, value, self.clk, self.cia_table);
+                // CIA2 port-A output drives the IEC bus + VIC bank. A $DD00 (PRA)
+                // or $DD02 (DDRA) write that changes the composed output re-pushes
+                // it to $DD00 (= TS iecWrite → c64Write($DD00, or)). The push is
+                // recorded BEFORE the originating store's own trace record.
+                let reg = (addr & 0xf) as usize;
+                if reg == crate::cia::CIA_PRA || reg == crate::cia::CIA_DDRA {
+                    let new_out = self.cia2.pa_output();
+                    if new_out != self.cia2_pa_out {
+                        // The $DD00 IO shadow becomes the new output; `old` = prior
+                        // shadow at $DD00 (the trace old byte for an IO write is
+                        // omitted anyway — hasOld=0 for $D000-$DFFF — so 0 is fine).
+                        let old = self.io[0xdd00 - 0xd000];
+                        self.io[0xdd00 - 0xd000] = new_out;
+                        self.cia2_pa_out = new_out;
+                        self.side_effects.push((0xdd00, new_out, old));
+                        // IEC: drive the wired-AND bus from the new CIA2 PA output.
+                        // VICE iecbus_cpu_write_conf1 order: execute_one(drive catch-up)
+                        // to the write instant FIRST, then iec_update_cpu_bus(~PA), ATN
+                        // edge → drive VIA1 CA1, recompute drv_bus[8], update ports — a
+                        // SINGLE fold against the NEW cpu_bus. We catch the drive up and
+                        // refresh drv_data_8 from its live PB (no fold here), then let
+                        // `c64_store_dd00` perform that one authoritative fold. The
+                        // write instant is maincpu_clk + 1 (x64sc write_offset=0).
+                        self.iec_catch_up_to(self.clk + 1);
+                        // = (*iecbus_callback_write)(~PA, clk) → iecbus_cpu_write_conf1
+                        // for the single-1541 (Conf1): iec_update_cpu_bus → ATN-edge →
+                        // per-type drv_bus[8] recompute → iec_update_ports. Returns the
+                        // ATN edge(s) to deliver to the drive VIA1 (the inline VICE
+                        // `viacore_signal(via1d1541, VIA_SIG_CA1, ...)`).
+                        let old_atn = self.iec.iec_old_atn;
+                        let atn_edges = self.iec.iecbus_callback_write((!new_out) & 0xff, self.clk + 1);
+                        // ATN-edge → drive VIA1 CA1: the C64 driving ATN raises the
+                        // drive's attention IRQ (DOS $FE67 → $E85B). VICE
+                        // iecbus_cpu_write_conf1 signals VIA1 CA1 right after the
+                        // ATN-edge detect, before the drv_bus recompute. We stamp it at
+                        // the drive clock the push-flush just reached. The hardware
+                        // ATN-acknowledge (drive auto-pulls DATA) is already folded by
+                        // the recompute_drv_bus cpu_bus term inside the conf1 write.
+                        for (dnr, edge) in atn_edges {
+                            // Spec 871: to the drive at that unit — both see ATN. Spec
+                            // 872: VIA1 CA1 for a 1541, the CIA's FLAG for a 1581.
+                            crate::drive::pair_deliver_atn_edge(self.drive, self.drive_b, dnr, edge);
+                        }
+                        // Spec 873 §4 — the IEC devices see the new C64 lines at the
+                        // write cycle (VICE: at the C64's next access). Spec 874 §5 — an
+                        // ATN change reaches them first as an edge, at the same cycle.
+                        if !self.iec_devices.is_empty() {
+                            let atn = self.iec.iec_old_atn;
+                            if atn != old_atn {
+                                self.iec_devices.atn_edge(self.clk + 1, atn != 0);
+                            }
+                            crate::iec_device::iec_devices_sync(self.iec_devices, self.iec, self.clk + 1);
+                        }
+                    }
+                }
+            }
+            // $DE00-$DFFF — cart IO1/IO2 write (ts:572-581). A consumed write can
+            // change EXROM/GAME (the bank/disable register), so re-run the PLA
+            // reconfig. A non-consumed write (or no cart) falls to the io shadow
+            // (already stored at the top of io_write) — byte-identical to no-cart.
+            _ => {
+                if (0xde00..=0xdfff).contains(&addr) {
+                    if self.cart_write(addr, value) {
+                        self.pla_config_changed();
+                    }
+                    // Spec 850 D2 — in addition to the cartridge, never instead of it:
+                    // the device does not change whether the cartridge consumed it.
+                    self.port_write(addr, value);
+                    // Spec 855 — and a SID mapped here takes it too, for the same
+                    // reason and by the same rule. A write reaches everything that
+                    // decodes the address; only READS have to pick a winner, which
+                    // is what `ahead_of_expansion` is for.
+                    if let Some((chip, reg)) = crate::sid::resolve_sid(self.sid_map, addr) {
+                        self.sid_chip_write(chip, reg, value);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a> FullBus<'a> {
+    /// `check_ba_before_read` over `steal_cycles_g::<REC>` (Spec 859).
+    pub(crate) fn check_ba_g<const REC: bool>(&mut self) -> u32 {
+        let vbank = self.vic_bank_base();
+        let romh = vic_romh_window(self.config.ultimax, self.cartridge.as_deref());
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+            romh,
+        };
+        let stolen = self.vic.steal_cycles_g::<REC>(&view);
+        if stolen != 0 {
+            self.clk = self.clk.wrapping_add(stolen as u64);
+            self.cia1.clk = self.clk;
+            self.cia2.clk = self.clk;
+        }
+        stolen
+    }
+
+    // ── Spec 855 — one of several SIDs ──────────────────────────────────────────────
+
+    /// Read register `reg` of `chip`. Chip 0 is the machine's own SID; anything
+    /// else indexes `sid_extra`. An out-of-range chip reads the open bus rather
+    /// than panicking: the table comes from a host, and a machine must not die
+    /// because someone mapped a chip it does not have.
+    #[inline]
+    fn sid_chip_read(&mut self, chip: u8, reg: usize) -> u8 {
+        // Spec 855 D5 — the host answers first if it wants to. `Some` wins and
+        // `None` falls through, which is 850's precedence rather than a second
+        // idiom. This is how an emulated ARMSID answers `$1B`/`$1C` from its own
+        // protocol instead of from our fastsid.
+        if let Some(v) = self.sid_host.read(chip, reg) {
+            return v;
+        }
+        if chip == 0 {
+            // Spec 876 D4 — chip 0's POT registers are the latch of the control ports'
+            // POT lines, selected by CIA1 PA6/PA7.
+            if reg == 0x19 || reg == 0x1a {
+                let sel = crate::pot::select(self.cia1.pa_output());
+                return self.pot.read(self.clk, sel, reg - 0x19);
+            }
+            return self.sid.read(reg, self.sid_regs);
+        }
+        match self.sid_extra.get(chip as usize - 1) {
+            Some(c) => c.engine.read(reg, &c.regs),
+            None => 0xff,
+        }
+    }
+
+    /// Write register `reg` of `chip`, shadow first then the model, exactly as
+    /// chip 0 has always done it.
+    #[inline]
+    fn sid_chip_write(&mut self, chip: u8, reg: usize, value: u8) {
+        // Spec 855 D4 — every bus write to a SID register, in CPU order, with the
+        // chip that took it and the cycle it happened on. Before the dispatch, as
+        // the engine-level hook it replaces also fired before its voice write.
+        // Both address ranges land here, so this is the one place the bus needs.
+        self.sid_trace.fire(chip, reg, value, self.clk);
+        if chip == 0 {
+            self.sid_regs[reg] = value;
+            self.sid.write(reg, value, self.sid_regs);
+            return;
+        }
+        if let Some(c) = self.sid_extra.get_mut(chip as usize - 1) {
+            c.regs[reg] = value;
+            let regs = c.regs;
+            c.engine.write(reg, value, &regs);
+        }
+    }
+
+    // ── Spec 850 — the expansion port's devices ─────────────────────────────────────
+
+    #[inline]
+    fn port_access(&self, addr: u16, read: bool) -> crate::expansion::Access {
+        crate::expansion::Access {
+            addr,
+            clk: self.clk,
+            kind: self.access_kind,
+            stalled: if read { self.stalled } else { 0 },
+            stalled_on_bus: if read { self.stalled_on_bus } else { 0 },
+        }
+    }
+
+    /// A `$DE00-$DFFF` read with I/O banked in. Every device sees it; the profile's device
+    /// answers first, then the host's, then the cartridge, then the open bus.
+    #[inline]
+    fn port_read(&mut self, addr: u16) -> u8 {
+        let cart = self.cart_read(addr);
+        if self.port_profile.is_none() && self.port_host.is_none() {
+            return cart.unwrap_or(self.vic.last_read_phi1);
+        }
+        let a = self.port_access(addr, true);
+        let mut answer = None;
+        if let Some(d) = self.port_profile.as_mut() {
+            answer = d.read(a, cart);
+            self.device_stop |= d.take_stop();
+        }
+        if let Some(d) = self.port_host.as_mut() {
+            let v = d.read(a, cart);
+            self.device_stop |= d.take_stop();
+            answer = answer.or(v);
+        }
+        answer.or(cart).unwrap_or(self.vic.last_read_phi1)
+    }
+
+    #[inline]
+    fn port_write(&mut self, addr: u16, value: u8) {
+        if self.port_profile.is_none() && self.port_host.is_none() {
+            return;
+        }
+        let a = self.port_access(addr, false);
+        if let Some(d) = self.port_profile.as_mut() {
+            d.write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+        if let Some(d) = self.port_host.as_mut() {
+            d.write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+    }
+
+    /// Spec 850 D5 — a write to a snooped address, reported before banking decides where
+    /// it lands. Covers the real write, the RMW dummy write-back and host writes alike.
+    #[cold]
+    fn port_snoop(&mut self, addr: u16, value: u8) {
+        self.io_touched = true;
+        let a = self.port_access(addr, false);
+        if let Some(d) = self.port_profile.as_mut() {
+            d.snoop_write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+        if let Some(d) = self.port_host.as_mut() {
+            d.snoop_write(a, value);
+            self.device_stop |= d.take_stop();
+        }
+    }
+
+    /// Spec 850 D6 — the port's lines: the host's own, ORed with every device's.
+    #[inline]
+    pub fn port_lines(&self) -> crate::expansion::PortLines {
+        let mut lines = self.host_lines;
+        if let Some(d) = self.port_profile.as_ref() {
+            lines = lines.or(d.lines());
+        }
+        if let Some(d) = self.port_host.as_ref() {
+            lines = lines.or(d.lines());
+        }
+        lines
+    }
+
+    /// True when the attached cartridge holds ULTIMAX permanently but resolves the
+    /// windows itself (GMod4 and, later, GMod3). Such a cart declines the windows it does
+    /// not drive, and those must then read the NON-ultimax map rather than open bus.
+    #[inline]
+    fn cart_fake_ultimax(&self) -> bool {
+        self.cartridge.as_ref().map_or(false, |c| c.fake_ultimax())
+    }
+
+    /// Would the KERNAL be visible at $E000 if the cart were not forcing ultimax?
+    /// HIRAM (port bit 1) selects it, honouring the data-direction bits.
+    #[inline]
+    fn kernal_visible_without_ultimax(&self) -> bool {
+        ((!self.port_dir | self.port_data) & 0x02) != 0
+    }
+
+    /// ts:105 — openBusProvider default `() => 0xff`. The VIC float-bus value the
+    /// ultimax open windows read. (No phi1 source wired in this read-only tier.)
+    #[inline]
+    fn open_bus(&self) -> u8 {
+        0xff
+    }
+
+    /// Consult the attached cartridge mapper's read window (ts:
+    /// `this.cartridge?.read(normalized, this.getBankInfo())`). None ⇒ no cart or
+    /// the mapper does not handle this address (falls through to RAM / open-bus).
+    /// `&mut self` + `self.clk` for the writable flash tier (flash reads advance
+    /// the command FSM / latch DQ status / catch the erase alarm up); the
+    /// read-only mappers ignore both and do a pure array index.
+    #[inline]
+    fn cart_read(&mut self, addr: u16) -> Option<u8> {
+        self.io_touched = true;
+        let bi = self.get_bank_info();
+        let clk = self.clk;
+        let served = match self.cartridge.as_mut() {
+            Some(c) => c.read(addr, &bi, clk),
+            None => return None,
+        };
+        // Spec 785 C1 — the cart READ-SET. Armed-only: with `cart_reads` None this
+        // is one already-predicted branch and the read path is unchanged.
+        //
+        // Counted iff the mapper actually SERVED the byte (`Some`) — a declined
+        // window (GMod4 refusing a window it does not drive, a Base bank with no
+        // data) hands the byte to RAM/open bus and is not a cart read — and iff
+        // the address is a ROM window: $DE00-$DFFF also comes through here, but
+        // IO1/IO2 is register + scratch-RAM space, never cart ROM payload.
+        if served.is_some() && !self.cart_account_suspend {
+            if let Some(slot) = crate::cart::CartSlot::for_address(addr) {
+                if let (Some(rs), Some(c)) = (self.cart_reads.as_deref_mut(), self.cartridge.as_ref())
+                {
+                    rs.on_read(slot, c.active_bank(addr), addr & 0x1fff, clk);
+                }
+            }
+        }
+        served
+    }
+
+    /// Drive a write through the cartridge mapper (ts:
+    /// `this.cartridge?.write(normalized, byte, bankInfo)`). Returns whether the
+    /// cart CONSUMED the write (true ⇒ does not fall through to RAM). `bank_info`
+    /// is computed BEFORE the mutable borrow (it only needs the live lines); `clk`
+    /// drives the flash erase-alarm schedule.
+    #[inline]
+    fn cart_write(&mut self, addr: u16, value: u8) -> bool {
+        self.io_touched = true;
+        let bi = self.get_bank_info();
+        let clk = self.clk;
+        match self.cartridge.as_mut() {
+            Some(c) => c.write(addr, value, &bi, clk),
+            None => false,
+        }
+    }
+}
+
+impl<'a> Bus for FullBus<'a> {
+    #[inline]
+    fn read(&mut self, addr: u16) -> u8 {
+        match addr {
+            0x0000 => {
+                self.io_touched = true;
+                self.port_dir
+            }
+            0x0001 => {
+                self.io_touched = true;
+                self.cpu_port_data_read()
+            }
+            // $1000-$7FFF — ultimax open bus (board != MAX keeps $0000-$0FFF RAM).
+            // No-cart: ultimax=false ⇒ RAM (byte-identical to the prior path).
+            0x0002..=0x7fff => {
+                if self.config.ultimax && addr >= 0x1000 {
+                    self.open_bus()
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            // $8000-$9FFF — ROML when bank8==CartLo (8k/16k/ultimax); else RAM.
+            0x8000..=0x9fff => {
+                if matches!(self.config.bank8, Bank8::CartLo) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                }
+                self.ram[addr as usize]
+            }
+            // $A000-$BFFF — ts:374-388: cart_hi ⇒ ROMH; basic ⇒ BASIC; ultimax
+            // (non-cart-hi) ⇒ open bus; else RAM.
+            0xa000..=0xbfff => {
+                if matches!(self.config.bank_a, BankA::CartHi) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                    self.ram[addr as usize]
+                } else if self.config.basic {
+                    self.basic_rom[(addr as usize) - 0xa000]
+                } else if self.config.ultimax {
+                    self.open_bus()
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            // $C000-$CFFF — ts:390-401: ultimax ⇒ open bus; else RAM.
+            0xc000..=0xcfff => {
+                // Real ultimax leaves this window open. A fake-ultimax cartridge holds
+                // ULTIMAX only to get first refusal on the windows it DOES drive, and
+                // never drives this one — so it must read as if ultimax were not set
+                // (VICE: mem_read_without_ultimax).
+                if self.config.ultimax && !self.cart_fake_ultimax() {
+                    self.open_bus()
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            0xd000..=0xdfff => {
+                if self.config.io {
+                    self.io_read(addr)
+                } else if self.config.char_rom {
+                    self.char_rom[(addr as usize) - 0xd000]
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+            // $E000-$FFFF — ts:463-481: KERNAL; else cart_hi_ultimax ⇒ ROMH
+            // (open bus if the mapper returns None); else RAM.
+            0xe000..=0xffff => {
+                if self.config.kernal {
+                    self.kernal_rom[(addr as usize) - 0xe000]
+                } else if matches!(self.config.bank_e, BankE::CartHiUltimax) {
+                    if let Some(v) = self.cart_read(addr) {
+                        return v;
+                    }
+                    // Declined: a fake-ultimax cart wants the non-ultimax map here (the
+                    // KERNAL if the port says so, else RAM), not open bus.
+                    if self.cart_fake_ultimax() {
+                        if self.kernal_visible_without_ultimax() {
+                            self.kernal_rom[(addr as usize) - 0xe000]
+                        } else {
+                            self.ram[addr as usize]
+                        }
+                    } else {
+                        self.open_bus()
+                    }
+                } else {
+                    self.ram[addr as usize]
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn write(&mut self, addr: u16, value: u8) {
+        // Spec 850 D5 — VICE's `$FF00` REU hook (`mainc64cpu.c:288-305`, STORE and
+        // STORE_DUMMY), generalised: a registered address is reported whatever the
+        // banking, before the write goes wherever it goes.
+        if let Some(s) = self.snoop {
+            if s.contains(addr) {
+                self.port_snoop(addr, value);
+            }
+        }
+        match addr {
+            0x0000 => {
+                self.io_touched = true;
+                self.port_dir = value;
+                self.ram[0] = value;
+                self.pla_config_changed();
+            }
+            0x0001 => {
+                self.io_touched = true;
+                self.port_data = value;
+                self.ram[1] = value;
+                self.pla_config_changed();
+            }
+            0xd000..=0xdfff => {
+                if self.config.io {
+                    self.io_write(addr, value);
+                } else {
+                    // char-ROM / RAM config: write lands in RAM underneath.
+                    self.ram[addr as usize] = value;
+                }
+            }
+            // $8000-$9FFF — ts:597-606: bank8==CartLo ⇒ the cart may consume
+            // (flash); read-only mappers return false ⇒ fall to RAM. ROM is
+            // read-only so the RAM byte beneath stays writable (the trace `old`
+            // byte reads this RAM, not the cart ROM).
+            0x8000..=0x9fff => {
+                if matches!(self.config.bank8, Bank8::CartLo) && self.cart_write(addr, value) {
+                    return;
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $A000-$BFFF — ts:610-619: bank_a==CartHi ⇒ cart may consume; the
+            // non-cart-hi ultimax open window drops; otherwise RAM.
+            0xa000..=0xbfff => {
+                if matches!(self.config.bank_a, BankA::CartHi) && self.cart_write(addr, value) {
+                    return;
+                }
+                if !matches!(self.config.bank_a, BankA::CartHi) && self.config.ultimax {
+                    return; // open_bus drop
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $C000-$CFFF — ts:621-626: ultimax open window drops; else RAM.
+            0xc000..=0xcfff => {
+                if self.config.ultimax {
+                    return; // open_bus drop
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $E000-$FFFF — ts:628-635: bank_e==CartHiUltimax ⇒ cart may consume
+            // (flash); otherwise RAM.
+            0xe000..=0xffff => {
+                if matches!(self.config.bank_e, BankE::CartHiUltimax)
+                    && self.cart_write(addr, value)
+                {
+                    return;
+                }
+                self.ram[addr as usize] = value;
+            }
+            // $1000-$7FFF — ts:637-640: ultimax open window drops; else RAM.
+            // $0000-$0FFF + everything else → RAM.
+            _ => {
+                if self.config.ultimax && addr >= 0x1000 {
+                    return; // open_bus drop
+                }
+                self.ram[addr as usize] = value;
+            }
+        }
+    }
+
+    /// One VIC master cycle per CPU master cycle (= c64ViciiCycle hook); advance
+    /// the shared master clock + both CIAs' clk in lockstep. The VIC reads its
+    /// per-cycle fetches through a `VicMemView` over the bus's RAM / CHARGEN /
+    /// colour-RAM ($D800 IO shadow) / live VIC bank (built inline so the borrow
+    /// checker sees disjoint field borrows vs `&mut self.vic`).
+    #[inline]
+    fn tick(&mut self) {
+        let vbank = self.vic_bank_base();
+        let romh = vic_romh_window(self.config.ultimax, self.cartridge.as_deref());
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+            romh,
+        };
+        self.vic.tick(&view);
+        self.clk = self.clk.wrapping_add(1);
+        self.cia1.clk = self.clk;
+        self.cia2.clk = self.clk;
+        self.cia1.tick(self.cia_table);
+        self.cia2.tick(self.cia_table);
+    }
+
+    /// VICE check_ba(): stall the CPU read while VIC BA is low (badline / sprite
+    /// DMA), stealing cycles + advancing the VIC. Returns the stolen-cycle count.
+    /// The stolen cycles also advance the shared clk + CIAs (folded in here so the
+    /// CIA timers stay phase-aligned with the stretched CPU read).
+    #[inline]
+    fn check_ba_before_read(&mut self) -> u32 {
+        self.check_ba_g::<false>()
+    }
+
+    #[inline]
+    fn take_side_effect_writes(&mut self, out: &mut Vec<(u16, u8, u8)>) {
+        if !self.side_effects.is_empty() {
+            out.append(&mut self.side_effects);
+        }
+    }
+
+    #[inline]
+    fn take_side_effect_reads(&mut self, out: &mut Vec<(u16, u8)>) {
+        if !self.read_side_effects.is_empty() {
+            out.append(&mut self.read_side_effects);
+        }
+    }
+}
+
+#[cfg(test)]
+mod joystick_gate_tests {
+    //! T1.7 gate — a game/test that reads CIA1 PA ($DC00) / PB ($DC01) must see
+    //! the joystick bits (active-low). Mirrors c64re cia1.ts readPa/readPb.
+    use super::*;
+    use crate::keyboard::{JoystickState, KeyboardMatrix};
+
+    fn make_bus<'a>(
+        ram: &'a mut [u8; 0x10000],
+        basic: &'a [u8; 0x2000],
+        kernal: &'a [u8; 0x2000],
+        chargen: &'a [u8; 0x1000],
+        io: &'a mut [u8; 0x1000],
+        vic: &'a mut VicII,
+        cia1: &'a mut Cia,
+        cia2: &'a mut Cia,
+        tab: &'a [u16; CIAT_TABLEN],
+        sid_regs: &'a mut [u8; 32],
+        sid: &'a mut Sid6581,
+        sid_trace: &'a mut crate::sid::SidTrace,
+        sid_host: &'a mut crate::sid::SidHostAccess,
+        mct: &'a [MemConfig; 32],
+        drive: &'a mut crate::drive::Drive1541,
+        drive_b: &'a mut crate::drive::Drive1541,
+        iec: &'a mut crate::iec::IecCore,
+        kb: &'a KeyboardMatrix,
+        joy1: JoystickState,
+        joy2: JoystickState,
+    ) -> FullBus<'a> {
+        FullBus {
+            ram,
+            basic_rom: basic,
+            kernal_rom: kernal,
+            char_rom: chargen,
+            io,
+            vic,
+            cia1,
+            cia2,
+            cia_table: tab,
+            sid_regs,
+            sid,
+            // Spec 855 — this helper is a chip-0 bus and has no callers in the
+            // tree; empty slices keep it honest rather than growing it two
+            // parameters nobody would pass.
+            sid_extra: &mut [],
+            sid_map: &[],
+            sid_trace,
+            sid_host,
+            pot: Box::leak(Box::default()),
+            config: mct[0x1f],
+            memconfig_table: mct,
+            port_dir: 0x2f,
+            port_data: 0x37,
+            clk: 0,
+            cia2_pa_out: 0xff,
+            side_effects: Vec::new(),
+            read_side_effects: Vec::new(),
+            drive,
+            drive_b,
+            iec_devices: Box::leak(Box::default()),
+            iec,
+            keyboard: kb,
+            joystick1: joy1,
+            joystick2: joy2,
+            drive_c64_ref: 0,
+            cartridge: None,
+            cart_reads: None,
+            cart_account_suspend: false,
+            port_profile: None,
+            port_host: None,
+            snoop: None,
+            access_kind: crate::expansion::AccessKind::Cpu,
+            stalled: 0,
+            stalled_on_bus: 0,
+            device_stop: false,
+            host_lines: crate::expansion::PortLines::default(),
+            port_active: false,
+            io_touched: false,
+            cia_alarm_check: false,
+        }
+    }
+
+    #[test]
+    fn dc00_pa_read_sees_joystick2_active_low() {
+        // Port 2 → CIA1 PA ($DC00). DDRA=0 (power-on) ⇒ (PRA|~DDRA)=0xff, then
+        // ANDed with the joy2 active-low mask. c64re cia1.ts:86-92.
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = Cia::new();
+        let mut cia2 = Cia::new();
+        let tab = crate::cia::new_table();
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
+        let mut sid_host = crate::sid::SidHostAccess::default();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
+        let mut iec = crate::iec::IecCore::new();
+        let kb = KeyboardMatrix::new();
+
+        // Released: $DC00 reads 0xff (no bit pulled).
+        {
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &kb, JoystickState::default(), JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc00), 0xff, "released joy2 → all PA bits high");
+        }
+        // FIRE pressed: bit4 pulled low → 0xef.
+        {
+            let joy2 = JoystickState { fire: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &kb, JoystickState::default(), joy2,
+            );
+            assert_eq!(bus.io_read(0xdc00), 0xff & !(1 << 4), "joy2 fire → PA bit4 low");
+        }
+        // UP+LEFT pressed: bits 0+2 pulled low.
+        {
+            let joy2 = JoystickState { up: true, left: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &kb, JoystickState::default(), joy2,
+            );
+            assert_eq!(bus.io_read(0xdc00), 0xff & !0x05, "joy2 up+left → PA bits 0+2 low");
+        }
+    }
+
+    /// A real title's own IRQ scan, at the bus. The game drives the ROWS and reads
+    /// the COLUMNS, then the other way round, to build a full key code:
+    ///
+    /// ```text
+    /// $50be  STX $dc03    ; DDRB = $ff   port B output
+    /// $50c1  STY $dc01    ; PRB  = $00   drive every row
+    /// $50c4  STY $dc02    ; DDRA = $00   port A input
+    /// $50c7  LDA $dc00    ; read the columns
+    /// ```
+    ///
+    /// `$DC00` used to answer `$ff` here whatever was pressed, because the
+    /// back-scan was assumed away ("the KERNAL never drives PB columns"). The
+    /// scanner reads that, treats it as "no key", and returns — so SPACE, and
+    /// every other key, was invisible to the game.
+    #[test]
+    fn dc00_pa_read_sees_a_key_when_the_game_drives_the_rows() {
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = Cia::new();
+        let mut cia2 = Cia::new();
+        let tab = crate::cia::new_table();
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
+        let mut sid_host = crate::sid::SidHostAccess::default();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
+        let mut iec = crate::iec::IecCore::new();
+
+        let mut kb = KeyboardMatrix::new();
+        kb.key_down("SPACE"); // column 7, row 4
+
+        let mut bus = make_bus(
+            &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+            &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+            &kb, JoystickState::default(), JoystickState::default(),
+        );
+
+        // The game's sequence, verbatim.
+        bus.io_write(0xdc03, 0xff); // DDRB = $ff, port B drives
+        bus.io_write(0xdc01, 0x00); // PRB  = $00, every row low
+        bus.io_write(0xdc02, 0x00); // DDRA = $00, port A reads
+        assert_eq!(
+            bus.io_read(0xdc00),
+            0xff & !(1 << 7),
+            "SPACE sits on column 7 — it must pull PA7 low"
+        );
+
+        // And the ordinary direction still answers, unchanged.
+        bus.io_write(0xdc02, 0xff); // DDRA = $ff, port A drives
+        bus.io_write(0xdc00, 0x00); // PRA  = $00, every column low
+        bus.io_write(0xdc03, 0x00); // DDRB = $00, port B reads
+        assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 4), "SPACE is on row 4");
+
+        // Nothing pressed on the driven rows → nothing pulled. (Drive only row 0;
+        // SPACE is on row 4.)
+        bus.io_write(0xdc03, 0xff);
+        bus.io_write(0xdc01, 0xff & !(1 << 0));
+        bus.io_write(0xdc02, 0x00);
+        assert_eq!(bus.io_read(0xdc00), 0xff, "a row with no key pressed pulls nothing");
+    }
+
+    #[test]
+    fn dc01_pb_read_sees_joystick1_active_low() {
+        // Port 1 → CIA1 PB ($DC01). No keys held ⇒ val=0xff, DDRB=0 ⇒ result =
+        // 0xff & joy1 mask. c64re cia1.ts:101-112.
+        let mut ram = [0u8; 0x10000];
+        let basic = [0u8; 0x2000];
+        let kernal = [0u8; 0x2000];
+        let chargen = [0u8; 0x1000];
+        let mut io = [0u8; 0x1000];
+        let mut vic = VicII::new();
+        let mut cia1 = Cia::new();
+        let mut cia2 = Cia::new();
+        let tab = crate::cia::new_table();
+        let mut sid_regs = [0u8; 32];
+        let mut sid = Sid6581::new();
+        let mut sid_trace = crate::sid::SidTrace::default();
+        let mut sid_host = crate::sid::SidHostAccess::default();
+        let mct = build_memconfig_table();
+        let mut drive = crate::drive::Drive1541::new();
+        let mut drive_b = crate::drive::Drive1541::new_position_b();
+        let mut iec = crate::iec::IecCore::new();
+        let kb = KeyboardMatrix::new();
+
+        {
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &kb, JoystickState::default(), JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc01), 0xff, "released joy1 → all PB bits high");
+        }
+        {
+            // RIGHT pressed: bit3 low → 0xf7.
+            let joy1 = JoystickState { right: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &kb, joy1, JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc01), 0xff & !(1 << 3), "joy1 right → PB bit3 low");
+        }
+        {
+            // DOWN+FIRE: bits 1+4 low.
+            let joy1 = JoystickState { down: true, fire: true, ..Default::default() };
+            let mut bus = make_bus(
+                &mut ram, &basic, &kernal, &chargen, &mut io, &mut vic, &mut cia1,
+                &mut cia2, &tab, &mut sid_regs, &mut sid, &mut sid_trace, &mut sid_host, &mct, &mut drive, &mut drive_b, &mut iec,
+                &kb, joy1, JoystickState::default(),
+            );
+            assert_eq!(bus.io_read(0xdc01), 0xff & !0x12, "joy1 down+fire → PB bits 1+4 low");
+        }
+    }
+}
+
+// ── Spec 853 — the bus a DMA device drives ────────────────────────────────────────
+//
+// Spec 850 gave a device the hold and no bus. This is the bus: the SAME `FullBus` the
+// CPU executes through, so a transfer sees the machine's banking, its I/O and its
+// cartridge exactly as an instruction would.
+//
+// The three clock calls are VICE's `reu_ba` callbacks (`reu.c:590-599`) one for one:
+// `clk_inc` is `maincpu_clk++` with the per-cycle VIC tick CLK_INC does, `ba_low` is
+// `reu_ba.check()` reading the flag the last `vicii_cycle()` latched, and `steal` is
+// `reu_ba.steal()`.
+impl<'a> crate::reu::DmaBus for FullBus<'a> {
+    fn dma_read(&mut self, addr: u16) -> u8 {
+        crate::cpu::Bus::read(self, addr)
+    }
+
+    fn dma_write(&mut self, addr: u16, value: u8) {
+        crate::cpu::Bus::write(self, addr, value)
+    }
+
+    fn clk_inc(&mut self) {
+        self.clk = self.clk.wrapping_add(1);
+        let vbank = self.vic_bank_base();
+        let romh = vic_romh_window(self.config.ultimax, self.cartridge.as_deref());
+        let view = crate::vic::VicMemView {
+            ram: self.ram,
+            char_rom: Some(self.char_rom),
+            color_ram: &self.io[0x0800..0x0c00],
+            vbank,
+            romh,
+        };
+        self.vic.tick(&view);
+        self.cia1.clk = self.clk;
+        self.cia2.clk = self.clk;
+    }
+
+    fn ba_low(&mut self) -> bool {
+        self.vic.ba_low_flag
+    }
+
+    fn steal(&mut self) {
+        crate::cpu::Bus::check_ba_before_read(self);
+    }
+}

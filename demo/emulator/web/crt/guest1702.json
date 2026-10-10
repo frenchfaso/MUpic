@@ -1,0 +1,3535 @@
+{
+  "compiler": {
+    "librashader": "0.12.0",
+    "lowering": "same as runtime-wgpu",
+    "shaderFeatures": 0
+  },
+  "kind": "guest1702",
+  "luts": [
+    {
+      "asset": {
+        "bytes": 131072,
+        "file": "lut-0.rgba",
+        "sha256": "f707ae896d2f06a07089e361ad94e85a131a581b0b0e4bce87a39a07c542ed92"
+      },
+      "filter": "Linear",
+      "height": 32,
+      "index": 0,
+      "mipmap": false,
+      "name": "SamplerLUT1",
+      "width": 1024,
+      "wrap": "ClampToBorder"
+    },
+    {
+      "asset": {
+        "bytes": 131072,
+        "file": "lut-1.rgba",
+        "sha256": "86e071f183a8f19dee19558e8f354ef2ca27477a7069c373d2ef7852dda6febf"
+      },
+      "filter": "Linear",
+      "height": 32,
+      "index": 1,
+      "mipmap": false,
+      "name": "SamplerLUT2",
+      "width": 1024,
+      "wrap": "ClampToBorder"
+    },
+    {
+      "asset": {
+        "bytes": 131072,
+        "file": "lut-2.rgba",
+        "sha256": "d4eb920361daada96c670b7019be350c03a909284249aae4fa169aeac29a923a"
+      },
+      "filter": "Linear",
+      "height": 32,
+      "index": 2,
+      "mipmap": false,
+      "name": "SamplerLUT3",
+      "width": 1024,
+      "wrap": "ClampToBorder"
+    },
+    {
+      "asset": {
+        "bytes": 131072,
+        "file": "lut-3.rgba",
+        "sha256": "5cc5848e5d10f07b45be0c33f4817ef3ae070a24cf587ac583df186109ee7eb2"
+      },
+      "filter": "Linear",
+      "height": 32,
+      "index": 3,
+      "mipmap": false,
+      "name": "SamplerLUT4",
+      "width": 1024,
+      "wrap": "ClampToBorder"
+    }
+  ],
+  "nativeFrameTimeDelta": 20000,
+  "nativeFramesPerSecond": 50.0,
+  "parameters": {
+    "ARTIFACTING": 0.0,
+    "AS": 0.05999999865889549,
+    "BLOOM": 0.0,
+    "BP": 0.0,
+    "BRIGHTNESS": 1.0,
+    "CCONTR": 0.05000000074505806,
+    "CDETAILS": 1.0,
+    "CHROMAF": 2.0,
+    "CP": -1.0,
+    "CS": 0.0,
+    "CSHARPEN": 0.0,
+    "DEDGE": 0.8999999761581421,
+    "DESHARP": 0.0,
+    "DLINE": 2.0,
+    "FINE_BLOOM": 1.0,
+    "FINE_GLOW": 1.0,
+    "FRINGING": 0.0,
+    "GAMMA_INPUT": 2.4000000953674316,
+    "GCORR": 1.0,
+    "HARNG": 0.30000001192092896,
+    "HSHARP": 1.2000000476837158,
+    "HSHARPNESS": 1.600000023841858,
+    "IOS": 0.0,
+    "LS": 32.0,
+    "MAXS": 0.18000000715255737,
+    "NDEBLUR": 1.0,
+    "OS": 1.0,
+    "PAL_FILT": 3.0,
+    "PB": 0.3199999928474426,
+    "PG": 0.3199999928474426,
+    "PHMOD": 1.0,
+    "PR": 0.3199999928474426,
+    "RFNOISE": 0.30000001192092896,
+    "RFNOISE1": 0.0,
+    "RFNOISE2": 0.0,
+    "SATURATION": 1.0,
+    "SIGMA_H": 1.2000000476837158,
+    "SIGMA_HB": 0.75,
+    "SIGMA_HOR": 0.800000011920929,
+    "SIGMA_V": 1.2000000476837158,
+    "SIGMA_VB": 0.6000000238418579,
+    "SIZEH": 6.0,
+    "SIZEHB": 3.0,
+    "SIZEV": 6.0,
+    "SIZEVB": 3.0,
+    "S_SHARP": 1.100000023841858,
+    "TNTC": 0.0,
+    "VShift": 0.0,
+    "WP": 0.0,
+    "addnoised": 0.0,
+    "agsat": 0.25,
+    "auto_res": 0.0,
+    "bardir": 0.0,
+    "barintensity": 0.0,
+    "barspeed": 50.0,
+    "beam_max": 1.0,
+    "beam_min": 1.2999999523162842,
+    "beam_size": 0.6000000238418579,
+    "bloom": 0.07999999821186066,
+    "bloom_dist": 0.0,
+    "bmask": 0.0,
+    "bmask1": 0.0,
+    "bogus_afterglow": 0.0,
+    "bogus_bloom": 0.0,
+    "bogus_brightness": 0.0,
+    "bogus_color": 0.0,
+    "bogus_deconvergence11": 0.0,
+    "bogus_filtering": 0.0,
+    "bogus_gamma": 0.0,
+    "bogus_glow": 0.0,
+    "bogus_interlacing": 0.0,
+    "bogus_masks": 0.0,
+    "bogus_mglow": 0.0,
+    "bogus_rbloom": 0.0,
+    "bogus_scanline": 0.0,
+    "bogus_screen": 0.0,
+    "brightboost": 1.350000023841858,
+    "brightboost1": 1.149999976158142,
+    "bsize1": 0.0,
+    "bth": 4.0,
+    "c_shape": 0.25,
+    "clips": 0.0,
+    "contr": 0.0,
+    "csize": 0.0,
+    "dctypex": 0.0,
+    "dctypey": 0.0,
+    "deconrb": 0.0,
+    "deconrby": 0.0,
+    "deconrg": 0.0,
+    "deconrgy": 0.0,
+    "deconrr": 0.0,
+    "deconrry": 0.0,
+    "decons": 1.0,
+    "double_slot": 2.0,
+    "downsample_levelx": 0.0,
+    "downsample_levely": 0.0,
+    "edgemask": 0.0,
+    "esrc": 1.0,
+    "filter_res": 1.0,
+    "gamma_c": 1.0,
+    "gamma_c2": 1.0,
+    "gamma_out": 2.4000000953674316,
+    "glow": 0.05999999865889549,
+    "gsl": 0.0,
+    "halation": 0.029999999329447746,
+    "hiscan": 0.0,
+    "hmask1": 0.3499999940395355,
+    "info02": 0.0,
+    "inter": 375.0,
+    "interm": 0.0,
+    "intres": 0.0,
+    "iscan": 0.20000000298023224,
+    "iscans": 0.25,
+    "lsdev": 0.0,
+    "lsmooth": 0.699999988079071,
+    "m_glow": 0.0,
+    "m_glow_cutoff": 0.11999999731779099,
+    "m_glow_dist": 1.0,
+    "m_glow_high": 5.0,
+    "m_glow_low": 0.3499999940395355,
+    "m_glow_mask": 1.0,
+    "maskDark": 0.7799999713897705,
+    "maskLight": 1.350000023841858,
+    "mask_bloom": 0.0,
+    "mask_gamma": 2.4000000953674316,
+    "mask_layout": 0.0,
+    "mask_zoom": 0.0,
+    "maskboost": 1.0,
+    "masksize": 1.0,
+    "maskstr": 0.30000001192092896,
+    "mclip": 0.0,
+    "mcut": 1.100000023841858,
+    "mshift": 0.0,
+    "mzoom_sh": 0.0,
+    "no_scanlines": 0.0,
+    "noiseresd": 2.0,
+    "noisetype": 0.0,
+    "ntsc-row6": 0.0,
+    "oimage": 0.0,
+    "overscanX": 0.0,
+    "overscanY": 0.0,
+    "pal-row0": 0.0,
+    "pal-row1": 0.0,
+    "pal-row2": 0.0,
+    "pal-row3": 0.0,
+    "pal-row4": 0.0,
+    "pal-row5": 0.0,
+    "pal-row6": 0.0,
+    "pal_res": 1.0,
+    "pal_ring": 0.5,
+    "pal_scale": 1.0,
+    "post_br": 1.0,
+    "pr_scan": 0.10000000149011612,
+    "pre_bb": 1.0,
+    "pre_gc": 1.0,
+    "rolling_scan": 0.0,
+    "sborder": 0.75,
+    "scan_falloff": 1.0,
+    "scangamma": 2.4000000953674316,
+    "scanline1": 6.0,
+    "scanline2": 8.0,
+    "scans": 0.5,
+    "sega_fix": 0.0,
+    "shadowMask": 2.0,
+    "slotmask": 0.25,
+    "slotmask1": 0.3499999940395355,
+    "slotms": 1.0,
+    "slotwidth": 3.0,
+    "smask_mit": 0.0,
+    "smoothmask": 0.0,
+    "spike": 1.0,
+    "tds": 0.0,
+    "vigdef": 1.0,
+    "vigstr": 0.07999999821186066,
+    "warpX": 0.02500000037252903,
+    "warpY": 0.03500000014901161,
+    "wp_saturation": 1.0
+  },
+  "passes": [
+    {
+      "alias": null,
+      "borderBinding": 4,
+      "filter": "Nearest",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 2645,
+        "file": "pass-00.frag.wgsl",
+        "sha256": "02a6fdf7357eb082573d5abb00ef7f7b9247a2625bf7a81372791520ced23f39"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 0,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1313,
+        "file": "pass-00.vert.wgsl",
+        "sha256": "59b3e357a15ea700825880c0d599bedd9bb2ff0b4a7cf513d66816ac3cf48de7"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "StockPass",
+      "borderBinding": 4,
+      "filter": "Nearest",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 2645,
+        "file": "pass-01.frag.wgsl",
+        "sha256": "02a6fdf7357eb082573d5abb00ef7f7b9247a2625bf7a81372791520ced23f39"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 1,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1313,
+        "file": "pass-01.vert.wgsl",
+        "sha256": "59b3e357a15ea700825880c0d599bedd9bb2ff0b4a7cf513d66816ac3cf48de7"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "AfterglowPass",
+      "borderBinding": 6,
+      "filter": "Linear",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 5980,
+        "file": "pass-02.frag.wgsl",
+        "sha256": "a213ffc9bbe7f65d5b59e042affd76aa1e3ae7f51c83cdb4b3396b7e09dd9ff6"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 2,
+      "mipmapInput": false,
+      "push": {
+        "binding": 5,
+        "size": 80,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 0,
+            "semantic": "OriginalHistory"
+          }
+        },
+        {
+          "binding": 4,
+          "texture": {
+            "index": 2,
+            "semantic": "PassFeedback"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "PB",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "PG",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "PR",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bth",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "esrc",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1381,
+        "file": "pass-02.vert.wgsl",
+        "sha256": "4afea49291254206fe984e9f2891ecede07df51922efe0972f62ce2bcc6b0320"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "PrePass0",
+      "borderBinding": 9,
+      "filter": "Linear",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 19912,
+        "file": "pass-03.frag.wgsl",
+        "sha256": "fcc90702dcd967fd712bca782a325ed51c546d00667fd2f7d92b2a02ffd11f81"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 3,
+      "mipmapInput": false,
+      "push": {
+        "binding": 8,
+        "size": 128,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 1,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 2,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 4,
+          "texture": {
+            "index": 0,
+            "semantic": "User"
+          }
+        },
+        {
+          "binding": 5,
+          "texture": {
+            "index": 1,
+            "semantic": "User"
+          }
+        },
+        {
+          "binding": 6,
+          "texture": {
+            "index": 2,
+            "semantic": "User"
+          }
+        },
+        {
+          "binding": 7,
+          "texture": {
+            "index": 3,
+            "semantic": "User"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "AS",
+          "offset": {
+            "push": 84,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "BP",
+          "offset": {
+            "push": 92,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "CP",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "CS",
+          "offset": {
+            "push": 72,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "LS",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "TNTC",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "WP",
+          "offset": {
+            "push": 76,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "agsat",
+          "offset": {
+            "push": 88,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "contr",
+          "offset": {
+            "push": 112,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "pre_bb",
+          "offset": {
+            "push": 108,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "pre_gc",
+          "offset": {
+            "push": 116,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "sega_fix",
+          "offset": {
+            "push": 104,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "vigdef",
+          "offset": {
+            "push": 100,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "vigstr",
+          "offset": {
+            "push": 96,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "wp_saturation",
+          "offset": {
+            "push": 80,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1582,
+        "file": "pass-03.vert.wgsl",
+        "sha256": "fc806354265295267bc58c50f0f014c409a5be7f729559a57fbf48e372580829"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "InterlacePass",
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 9555,
+        "file": "pass-04.frag.wgsl",
+        "sha256": "4b6cdf0ef36795e520e8895fe3c4db8ad0e8e9e52f9825334a738869d6628dbb"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 4,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 80,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "hiscan",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "inter",
+          "offset": {
+            "push": 36,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "interm",
+          "offset": {
+            "push": 40,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "intres",
+          "offset": {
+            "push": 48,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "iscan",
+          "offset": {
+            "push": 44,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "iscans",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 0,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": 32,
+            "ubo": null
+          },
+          "semantic": "FrameCount",
+          "size": 1
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 16
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1428,
+        "file": "pass-04.vert.wgsl",
+        "sha256": "79dcbad94b9f00656c6e6d2933136442c2254570c3964fffb1494fd71f8e04a7"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "PalPass1",
+      "borderBinding": 5,
+      "filter": "Nearest",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 3405,
+        "file": "pass-05.frag.wgsl",
+        "sha256": "38140648495de420f5bfcc60c31a5739210e8ec848512280c37fd003e45a905d"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 5,
+      "mipmapInput": false,
+      "push": {
+        "binding": 4,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 5,
+            "semantic": "PassFeedback"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1315,
+        "file": "pass-05.vert.wgsl",
+        "sha256": "e1df33bb175b4e56f879544498a2d7fa7d4b19d5dc354a0f29c4265f3a2d2f47"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "PalPass2",
+      "borderBinding": 5,
+      "filter": "Nearest",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 8334,
+        "file": "pass-06.frag.wgsl",
+        "sha256": "f2a8273ccf9967fb1a098db1788ab63d7c7fde9afc1f0bc601a4e815db0caef3"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 6,
+      "mipmapInput": false,
+      "push": {
+        "binding": 4,
+        "size": 96,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 4.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 4,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "ARTIFACTING",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "BRIGHTNESS",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "DLINE",
+          "offset": {
+            "push": 84,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "FRINGING",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "GCORR",
+          "offset": {
+            "push": 88,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "PAL_FILT",
+          "offset": {
+            "push": 92,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "PHMOD",
+          "offset": {
+            "push": 80,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SATURATION",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": 48,
+            "ubo": null
+          },
+          "semantic": "FrameCount",
+          "size": 1
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1925,
+        "file": "pass-06.vert.wgsl",
+        "sha256": "85a2777aca6fa9186e419a73e6e279057d03c27765246e0514c56920629e7e27"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "PalPass3",
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 14755,
+        "file": "pass-07.frag.wgsl",
+        "sha256": "2816053181c248ef5d69f9bdfdea4dc8b2ca513126f44665ce9fd72711ccba40"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 7,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 96,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 0.5,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "CHROMAF",
+          "offset": {
+            "push": 84,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "GCORR",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "PAL_FILT",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "RFNOISE",
+          "offset": {
+            "push": 72,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "RFNOISE1",
+          "offset": {
+            "push": 76,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "RFNOISE2",
+          "offset": {
+            "push": 80,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "pal_res",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "pal_ring",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "pal_scale",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": 48,
+            "ubo": null
+          },
+          "semantic": "FrameCount",
+          "size": 1
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1689,
+        "file": "pass-07.vert.wgsl",
+        "sha256": "f6db46f18762d481f89fde008374782d2998721d7f15cc24919f2e81755784a4"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "NtscPass",
+      "borderBinding": 5,
+      "filter": "Linear",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 10302,
+        "file": "pass-08.frag.wgsl",
+        "sha256": "4470687d0e5a490cb54dbf5a916a5b7c68202b90221521adf308a0074dac33b1"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 8,
+      "mipmapInput": false,
+      "push": {
+        "binding": 4,
+        "size": 80,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 3,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "CCONTR",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "CDETAILS",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "CSHARPEN",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "DEDGE",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "DESHARP",
+          "offset": {
+            "push": 72,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "NDEBLUR",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1420,
+        "file": "pass-08.vert.wgsl",
+        "sha256": "5e756202a9d4c361fb923f2418dd9eb87cbe3cadd697cff008ec1844211431cd"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "PrePass",
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 2644,
+        "file": "pass-09.frag.wgsl",
+        "sha256": "b319dd78bb5912e14f2246ac7eb011a7405de201150d07289c715e1822a8655e"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 9,
+      "mipmapInput": true,
+      "push": {
+        "binding": 3,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1313,
+        "file": "pass-09.vert.wgsl",
+        "sha256": "59b3e357a15ea700825880c0d599bedd9bb2ff0b4a7cf513d66816ac3cf48de7"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "AvgLumPass",
+      "borderBinding": 5,
+      "filter": "Linear",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 6397,
+        "file": "pass-10.frag.wgsl",
+        "sha256": "9df8cc55c1df913fff24f7dbdd4ec54eb8f8a770bc1f4ee9222ef5ea82b314e6"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 10,
+      "mipmapInput": true,
+      "push": {
+        "binding": 4,
+        "size": 48,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 10,
+            "semantic": "PassFeedback"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "lsdev",
+          "offset": {
+            "push": 36,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "lsmooth",
+          "offset": {
+            "push": 32,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1306,
+        "file": "pass-10.vert.wgsl",
+        "sha256": "2076556628fd50ec6cfdbc988cd20603ca81034de67d8015efcd3a281d2d684a"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "LinearizePass",
+      "borderBinding": 5,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 5616,
+        "file": "pass-11.frag.wgsl",
+        "sha256": "8a1a4ac5e85e1b0043a8adcf2a45edc33325cd4e2b922dba889eb4cb1f99a4a2"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 11,
+      "mipmapInput": false,
+      "push": {
+        "binding": 4,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Input"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 8,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 4,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 80,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "GAMMA_INPUT",
+          "offset": {
+            "push": 36,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "downsample_levelx",
+          "offset": {
+            "push": 40,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "downsample_levely",
+          "offset": {
+            "push": 44,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 16
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1426,
+        "file": "pass-11.vert.wgsl",
+        "sha256": "b03893ff8a6b92356f7590dccdac55b68fbdae86d075989c9f289c9adbb110f3"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "Pass1",
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 8685,
+        "file": "pass-12.frag.wgsl",
+        "sha256": "c15c6965fe75364a1b432cd7888f394799ae671bef405c91fa1d21a5192d868b"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 12,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 96,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Viewport"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 11,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "HARNG",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "HSHARP",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "HSHARPNESS",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "MAXS",
+          "offset": {
+            "push": 80,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIGMA_HOR",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "S_SHARP",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "auto_res",
+          "offset": {
+            "push": 84,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "filter_res",
+          "offset": {
+            "push": 76,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "spike",
+          "offset": {
+            "push": 72,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1850,
+        "file": "pass-12.vert.wgsl",
+        "sha256": "da70513d957548fa1e03b5ea961c9cb54a8af5c6909cd99884ffdcc244c73972"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": null,
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 6676,
+        "file": "pass-13.frag.wgsl",
+        "sha256": "65d3648adcafb4fe922e0fb93022510ddf5b056cd62a8632183b51212447a8fe"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 13,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 96,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 800.0,
+          "type": "Absolute"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Input"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 11,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "FINE_GLOW",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIGMA_H",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIZEH",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "auto_res",
+          "offset": {
+            "push": 88,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow_cutoff",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 2194,
+        "file": "pass-13.vert.wgsl",
+        "sha256": "771885be19e8d358f90981936985912951c806be218ad526557c839069d0b636"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "GlowPass",
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 5114,
+        "file": "pass-14.frag.wgsl",
+        "sha256": "e09dcce30aeed451ee1c8b5cf336def8aab9c2b70ba74bdb84a6970f257f8350"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 14,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 800.0,
+          "type": "Absolute"
+        },
+        "y": {
+          "factor": 600.0,
+          "type": "Absolute"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "FINE_GLOW",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIGMA_V",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIZEV",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 0,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1677,
+        "file": "pass-14.vert.wgsl",
+        "sha256": "7ff383855a4098e1195779a5e9d493695f31ed951968e15d188664f10a2fbbe5"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": null,
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 5933,
+        "file": "pass-15.frag.wgsl",
+        "sha256": "2ee8bac1be5172ea457bb7e084f7646741f70aa74112592b44d81639f50b36c7"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 15,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 80,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 800.0,
+          "type": "Absolute"
+        },
+        "y": {
+          "factor": 600.0,
+          "type": "Absolute"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 11,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "FINE_BLOOM",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIGMA_HB",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIZEHB",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "auto_res",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 2093,
+        "file": "pass-15.vert.wgsl",
+        "sha256": "710ac6803ca238f9f72d06df708f33cc8df5f0940579e328572a688600855603"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": "BloomPass",
+      "borderBinding": 4,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 5360,
+        "file": "pass-16.frag.wgsl",
+        "sha256": "c3869b961733ad99f5dcc8e413c18dda869d18b232be0286056a1252fc5590bb"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 16,
+      "mipmapInput": false,
+      "push": {
+        "binding": 3,
+        "size": 64,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 800.0,
+          "type": "Absolute"
+        },
+        "y": {
+          "factor": 600.0,
+          "type": "Absolute"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 64,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "FINE_BLOOM",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIGMA_VB",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "SIZEVB",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 0,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        }
+      ],
+      "vertex": {
+        "bytes": 1685,
+        "file": "pass-16.vert.wgsl",
+        "sha256": "0d59fc727c3d41ede990cb62681e8f6390792c77b5ef0a0c1c476953e5f07064"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": null,
+      "borderBinding": 6,
+      "filter": "Linear",
+      "format": "rgba16float",
+      "fragment": {
+        "bytes": 28977,
+        "file": "pass-17.frag.wgsl",
+        "sha256": "c77c619c3571f9e9c4baeb49d59d714e735ca572f15b2121fb1e33abde7d6d0b"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 17,
+      "mipmapInput": false,
+      "push": {
+        "binding": 5,
+        "size": 96,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Viewport"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Viewport"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 11,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 10,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 4,
+          "texture": {
+            "index": 12,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 192,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "BLOOM",
+          "offset": {
+            "push": 8,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "IOS",
+          "offset": {
+            "push": 0,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "OS",
+          "offset": {
+            "push": 4,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "VShift",
+          "offset": {
+            "push": null,
+            "ubo": 148
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "beam_max",
+          "offset": {
+            "push": 36,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "beam_min",
+          "offset": {
+            "push": 32,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "beam_size",
+          "offset": {
+            "push": 40,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "c_shape",
+          "offset": {
+            "push": null,
+            "ubo": 160
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "clips",
+          "offset": {
+            "push": 84,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "gamma_c",
+          "offset": {
+            "push": null,
+            "ubo": 128
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "gsl",
+          "offset": {
+            "push": 20,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "hiscan",
+          "offset": {
+            "push": 88,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "interm",
+          "offset": {
+            "push": null,
+            "ubo": 188
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "intres",
+          "offset": {
+            "push": null,
+            "ubo": 152
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "no_scanlines",
+          "offset": {
+            "push": 76,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "overscanX",
+          "offset": {
+            "push": null,
+            "ubo": 140
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "overscanY",
+          "offset": {
+            "push": null,
+            "ubo": 144
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "rolling_scan",
+          "offset": {
+            "push": 92,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "scan_falloff",
+          "offset": {
+            "push": null,
+            "ubo": 172
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "scangamma",
+          "offset": {
+            "push": null,
+            "ubo": 164
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "scanline1",
+          "offset": {
+            "push": 24,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "scanline2",
+          "offset": {
+            "push": 28,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "scans",
+          "offset": {
+            "push": null,
+            "ubo": 124
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "tds",
+          "offset": {
+            "push": 80,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "warpX",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "warpY",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": null,
+            "ubo": 80
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 112
+          },
+          "semantic": "FrameCount",
+          "size": 1
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 96
+          },
+          "semantic": "Output",
+          "size": 4
+        }
+      ],
+      "vertex": {
+        "bytes": 2118,
+        "file": "pass-17.vert.wgsl",
+        "sha256": "2aef9f552f94c21807730ade175b4441fae9c68667f0a39111265234e10ad1ae"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    },
+    {
+      "alias": null,
+      "borderBinding": 10,
+      "filter": "Linear",
+      "format": "rgba8unorm",
+      "fragment": {
+        "bytes": 79120,
+        "file": "pass-18.frag.wgsl",
+        "sha256": "670fd11a125b39975e83fa93f2d8d4f429804cd5f5ca22f02d931d24722fc94d"
+      },
+      "fragmentEntry": "main",
+      "frameCountMod": 0,
+      "index": 18,
+      "mipmapInput": false,
+      "push": {
+        "binding": 9,
+        "size": 112,
+        "stages": 3
+      },
+      "scaling": {
+        "x": {
+          "factor": 1.0,
+          "type": "Viewport"
+        },
+        "y": {
+          "factor": 1.0,
+          "type": "Viewport"
+        }
+      },
+      "textures": [
+        {
+          "binding": 2,
+          "texture": {
+            "index": 11,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 3,
+          "texture": {
+            "index": 10,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 4,
+          "texture": {
+            "index": 14,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 5,
+          "texture": {
+            "index": 16,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 6,
+          "texture": {
+            "index": 3,
+            "semantic": "PassOutput"
+          }
+        },
+        {
+          "binding": 7,
+          "texture": {
+            "index": 0,
+            "semantic": "Source"
+          }
+        },
+        {
+          "binding": 8,
+          "texture": {
+            "index": 1,
+            "semantic": "PassOutput"
+          }
+        }
+      ],
+      "ubo": {
+        "binding": 0,
+        "size": 320,
+        "stages": 3
+      },
+      "uniforms": [
+        {
+          "kind": "Parameter",
+          "name": "BLOOM",
+          "offset": {
+            "push": 8,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "IOS",
+          "offset": {
+            "push": 0,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "OS",
+          "offset": {
+            "push": 4,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "VShift",
+          "offset": {
+            "push": null,
+            "ubo": 144
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "addnoised",
+          "offset": {
+            "push": null,
+            "ubo": 184
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bardir",
+          "offset": {
+            "push": null,
+            "ubo": 164
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "barintensity",
+          "offset": {
+            "push": null,
+            "ubo": 160
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "barspeed",
+          "offset": {
+            "push": null,
+            "ubo": 156
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bloom",
+          "offset": {
+            "push": null,
+            "ubo": 116
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bloom_dist",
+          "offset": {
+            "push": null,
+            "ubo": 172
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bmask",
+          "offset": {
+            "push": null,
+            "ubo": 280
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bmask1",
+          "offset": {
+            "push": null,
+            "ubo": 284
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "brightboost",
+          "offset": {
+            "push": 12,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "brightboost1",
+          "offset": {
+            "push": 16,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "bsize1",
+          "offset": {
+            "push": 24,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "c_shape",
+          "offset": {
+            "push": null,
+            "ubo": 152
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "csize",
+          "offset": {
+            "push": 20,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "dctypex",
+          "offset": {
+            "push": null,
+            "ubo": 220
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "dctypey",
+          "offset": {
+            "push": null,
+            "ubo": 224
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "deconrb",
+          "offset": {
+            "push": null,
+            "ubo": 204
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "deconrby",
+          "offset": {
+            "push": null,
+            "ubo": 216
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "deconrg",
+          "offset": {
+            "push": null,
+            "ubo": 200
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "deconrgy",
+          "offset": {
+            "push": null,
+            "ubo": 212
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "deconrr",
+          "offset": {
+            "push": null,
+            "ubo": 196
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "deconrry",
+          "offset": {
+            "push": null,
+            "ubo": 208
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "decons",
+          "offset": {
+            "push": null,
+            "ubo": 180
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "double_slot",
+          "offset": {
+            "push": 60,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "edgemask",
+          "offset": {
+            "push": null,
+            "ubo": 300
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "gamma_c",
+          "offset": {
+            "push": null,
+            "ubo": 240
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "gamma_c2",
+          "offset": {
+            "push": null,
+            "ubo": 244
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "gamma_out",
+          "offset": {
+            "push": null,
+            "ubo": 132
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "glow",
+          "offset": {
+            "push": 36,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "halation",
+          "offset": {
+            "push": null,
+            "ubo": 120
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "hiscan",
+          "offset": {
+            "push": 92,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "hmask1",
+          "offset": {
+            "push": null,
+            "ubo": 288
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "interm",
+          "offset": {
+            "push": null,
+            "ubo": 308
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow",
+          "offset": {
+            "push": null,
+            "ubo": 248
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow_dist",
+          "offset": {
+            "push": null,
+            "ubo": 260
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow_high",
+          "offset": {
+            "push": null,
+            "ubo": 256
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow_low",
+          "offset": {
+            "push": null,
+            "ubo": 252
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "m_glow_mask",
+          "offset": {
+            "push": null,
+            "ubo": 264
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "maskDark",
+          "offset": {
+            "push": 68,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "maskLight",
+          "offset": {
+            "push": 72,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mask_bloom",
+          "offset": {
+            "push": 88,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mask_gamma",
+          "offset": {
+            "push": null,
+            "ubo": 128
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mask_layout",
+          "offset": {
+            "push": 84,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mask_zoom",
+          "offset": {
+            "push": null,
+            "ubo": 272
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "maskboost",
+          "offset": {
+            "push": null,
+            "ubo": 232
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "masksize",
+          "offset": {
+            "push": 44,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "maskstr",
+          "offset": {
+            "push": 76,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mclip",
+          "offset": {
+            "push": null,
+            "ubo": 296
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mcut",
+          "offset": {
+            "push": 64,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mshift",
+          "offset": {
+            "push": 80,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "mzoom_sh",
+          "offset": {
+            "push": null,
+            "ubo": 292
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "no_scanlines",
+          "offset": {
+            "push": null,
+            "ubo": 276
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "noiseresd",
+          "offset": {
+            "push": null,
+            "ubo": 188
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "noisetype",
+          "offset": {
+            "push": null,
+            "ubo": 192
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "oimage",
+          "offset": {
+            "push": null,
+            "ubo": 304
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "overscanX",
+          "offset": {
+            "push": null,
+            "ubo": 136
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "overscanY",
+          "offset": {
+            "push": null,
+            "ubo": 140
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "post_br",
+          "offset": {
+            "push": null,
+            "ubo": 228
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "pr_scan",
+          "offset": {
+            "push": 96,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "sborder",
+          "offset": {
+            "push": null,
+            "ubo": 168
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "shadowMask",
+          "offset": {
+            "push": 40,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "slotmask",
+          "offset": {
+            "push": 48,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "slotmask1",
+          "offset": {
+            "push": 52,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "slotms",
+          "offset": {
+            "push": null,
+            "ubo": 124
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "slotwidth",
+          "offset": {
+            "push": 56,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "smask_mit",
+          "offset": {
+            "push": null,
+            "ubo": 268
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "smoothmask",
+          "offset": {
+            "push": null,
+            "ubo": 236
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "warpX",
+          "offset": {
+            "push": 28,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "Parameter",
+          "name": "warpY",
+          "offset": {
+            "push": 32,
+            "ubo": null
+          },
+          "size": 1
+        },
+        {
+          "kind": "TextureSize",
+          "offset": {
+            "push": null,
+            "ubo": 80
+          },
+          "size": 16,
+          "texture": {
+            "index": 0,
+            "semantic": "Original"
+          }
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 0
+          },
+          "semantic": "MVP",
+          "size": 16
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 112
+          },
+          "semantic": "FrameCount",
+          "size": 1
+        },
+        {
+          "kind": "Unique",
+          "offset": {
+            "push": null,
+            "ubo": 96
+          },
+          "semantic": "Output",
+          "size": 4
+        }
+      ],
+      "vertex": {
+        "bytes": 2715,
+        "file": "pass-18.vert.wgsl",
+        "sha256": "a7e5ffb2297dfb9c699bd08aba5d3f24d50a54f77537078ac25afe568cea602c"
+      },
+      "vertexEntry": "main",
+      "wrap": "ClampToBorder"
+    }
+  ],
+  "preset": "1702-pal.slangp",
+  "sourceFiles": {
+    "1702-pal.slangp": {
+      "bytes": 1041,
+      "sha256": "dbd83248ba066d2b6c80c0f39e05a1dd25a0e6390587062d4a7666142c4569a2"
+    },
+    "COPYING-GPL-2.0.txt": {
+      "bytes": 17984,
+      "sha256": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6"
+    },
+    "UPSTREAM.json": {
+      "bytes": 3984,
+      "sha256": "78e1524b05de8e9db50a0abb25844aef90153b011cf2c75a072d8cb39d372c02"
+    },
+    "UPSTREAM.md": {
+      "bytes": 1874,
+      "sha256": "20bccb3a58f1b5cff0113267a3715c4f97f315c84d4fb97052fe216260e025d3"
+    },
+    "crt/crt-guest-advanced-pal.slangp": {
+      "bytes": 3635,
+      "sha256": "4e98a84abcdd74dc39f6009934b15d77ff4ab11ca9dfe614d5ee3f3063d9781c"
+    },
+    "crt/shaders/guest/advanced/afterglow0.slang": {
+      "bytes": 3310,
+      "sha256": "7a53266418477402d00ae20848142fc5db795befc25e5870edcb03b28d0dbafd"
+    },
+    "crt/shaders/guest/advanced/avg-lum-ntsc.slang": {
+      "bytes": 3368,
+      "sha256": "30d27513e322a7c82654f7c70b2a7a34eaeff554761e40cba7756b8f4068cbb4"
+    },
+    "crt/shaders/guest/advanced/bloom_vertical.slang": {
+      "bytes": 2806,
+      "sha256": "e7992b156937ce826572ae72e7e379d4e548b1de8315d82c4de625ba5f9e8b6b"
+    },
+    "crt/shaders/guest/advanced/crt-guest-advanced-ntsc-pass1.slang": {
+      "bytes": 4976,
+      "sha256": "d499fad2c65b03c36a3057e1efc8e74d9d9aa67edf72ca23ac18c992453cee64"
+    },
+    "crt/shaders/guest/advanced/crt-guest-advanced-ntsc-pass2.slang": {
+      "bytes": 14490,
+      "sha256": "b094a856579913a5207dba2a4d449ba764d523bb58fd3c8c6e5be5a6fc35ccf8"
+    },
+    "crt/shaders/guest/advanced/custom-fast-sharpen-pal.slang": {
+      "bytes": 4595,
+      "sha256": "6828417a75557987ecf0829959797a92e2169269541ff66c9a4f6ceb44756326"
+    },
+    "crt/shaders/guest/advanced/deconvergence-ntsc.slang": {
+      "bytes": 31330,
+      "sha256": "93326a53f688c31f01d740f50bd5de0efabb96e952edb27631c7d86e826c9ef0"
+    },
+    "crt/shaders/guest/advanced/gaussian_vertical.slang": {
+      "bytes": 2809,
+      "sha256": "869e6d0eb1b630ab8e5b3ff9868df3cf9a7a6ba33d768dcc9ecc0ea93b36b359"
+    },
+    "crt/shaders/guest/advanced/interlace-ntsc.slang": {
+      "bytes": 4509,
+      "sha256": "313ad5f188ff39749f450a0a59ff850a4fc8d311b4cb3ea8197c81facf26ffa1"
+    },
+    "crt/shaders/guest/advanced/linearize-ntsc-new.slang": {
+      "bytes": 3471,
+      "sha256": "5100d2a252697a2fdc938f87aa9d92faf08586513fb381fd759f18568204cf00"
+    },
+    "crt/shaders/guest/advanced/lut/inv-trinitron-lut.png": {
+      "bytes": 15627,
+      "sha256": "2acb6633e4dede7f36e3e62b7aa9d0ed76ecfbc5cb7ed7f3f8813dddec0e9145"
+    },
+    "crt/shaders/guest/advanced/lut/nec-lut.png": {
+      "bytes": 15243,
+      "sha256": "86ec3d2e21138845cb73500e915425582b991e173a4149fa192a62d798382b59"
+    },
+    "crt/shaders/guest/advanced/lut/ntsc-lut.png": {
+      "bytes": 22140,
+      "sha256": "a23ae9d27d6d5f9073d4a84678187f54758b329387c47686294ea979dcde6d03"
+    },
+    "crt/shaders/guest/advanced/lut/trinitron-lut.png": {
+      "bytes": 9188,
+      "sha256": "bcc8c237eb39ed2a632554959cb4c5e0dd52b59a4922745b46b7525fc6b6b61a"
+    },
+    "crt/shaders/guest/advanced/pal/pal-pass1.slang": {
+      "bytes": 1059,
+      "sha256": "d191972b35c6387d944fa1c1607b1c462e092ac7eee1707cca43617ec742866a"
+    },
+    "crt/shaders/guest/advanced/pal/pal-pass2.slang": {
+      "bytes": 4601,
+      "sha256": "36ccf39ccbe25962e71460400946defa65c9f4d00d6c0b24ff2352d0def54ca9"
+    },
+    "crt/shaders/guest/advanced/pal/pal-pass3.slang": {
+      "bytes": 7197,
+      "sha256": "aab2062b84f9f3556352f6356200e81079a6db8f334018ddf80669a193e3b093"
+    },
+    "crt/shaders/guest/advanced/pre-shaders-afterglow.slang": {
+      "bytes": 10394,
+      "sha256": "1c4e57ff95acc881d761d95196fce8e3000701750868187907c4cffad5c6d4b7"
+    },
+    "crt/shaders/guest/advanced/stock.slang": {
+      "bytes": 665,
+      "sha256": "fa7d346e3706a351aa77dc8e77bd049b8bfde635baf4376fedcf81f38d9a4008"
+    },
+    "crt/shaders/guest/hd/bloom_horizontal.slang": {
+      "bytes": 3187,
+      "sha256": "417824f3056a57067ad57b6bb973aa321450fd3033f5c39b375d1e478e2bb074"
+    },
+    "crt/shaders/guest/hd/gaussian_horizontal.slang": {
+      "bytes": 4044,
+      "sha256": "a74c7251b0cd71092611b2b696fd737e9f635525dbce7d8b5da10a664af1f225"
+    }
+  },
+  "version": 1
+}

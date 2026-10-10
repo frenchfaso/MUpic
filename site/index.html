@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080b0d">
+  <meta name="description" content="MUpic video on the Commodore 64 Ultimate. Sixteen colors, one player, and a little movie magic.">
+  <title>16 Colors is all you need!</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="mupic.css">
+</head>
+<body data-preset="mupic">
+  <main>
+    <header class="page-title"><h1>16 colors is all you need!</h1>
+      <nav class="project-nav" aria-label="Project"><a href="index.html" aria-current="page">Demo</a><a href="convert.html">Convert a video</a><a href="https://github.com/frenchfaso/MUpic">GitHub</a></nav>
+    </header>
+    <section class="emulator" aria-label="MUpic Player on Commodore 64 Ultimate">
+      <div class="hardware-stage">
+        <section id="display" class="screen-window" aria-label="C64 display">
+          <canvas id="screen" width="384" height="272" tabindex="0" data-gamepads="0" title="Up and Down select a video; Return plays it. Space pauses or resumes; Escape returns to the list. Click or press a key here to enable audio." aria-label="MUpic Player screen" aria-describedby="player-keys"></canvas>
+          <div id="screen-hint" class="screen-hint" role="status" aria-live="polite">
+            <span class="screen-mark">MUpic</span>
+            <p>Starting MUpic Player…</p>
+          </div>
+          <progress id="download-progress" max="1" value="0" hidden aria-label="Player loading progress"></progress>
+          <button id="exit-fullscreen" type="button">EXIT FULLSCREEN</button>
+        </section>
+        <img class="hardware-art" src="assets/monitor.svg" width="936" height="867" alt="" aria-hidden="true" draggable="false" fetchpriority="high" decoding="async">
+      </div>
+      <nav class="main-controls" aria-label="Player controls">
+        <div class="quick-controls">
+          <button id="audio" class="audio-button" type="button" aria-pressed="false" aria-label="Toggle audio">AUDIO</button>
+          <button id="fullscreen" type="button">FULLSCREEN</button>
+          <button id="start-c64" type="button" title="Restart MUpic Player">PLAYER</button>
+        </div>
+        <p id="player-keys" class="player-keys"><span>↑ ↓ Select</span><span>Return Play</span><span>Space Pause</span><span>Esc Back</span></p>
+      </nav>
+    </section>
+    <p class="movie-credit">Big Buck Bunny © 2008 <a href="https://peach.blender.org/about/">Blender Foundation</a> · <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a> · Converted to 16 colors.</p>
+    <output id="runtime-status" class="sr-only" role="status" aria-live="polite">Starting MUpic Player…</output>
+  </main>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

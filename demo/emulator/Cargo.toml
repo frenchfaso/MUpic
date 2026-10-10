@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/rv32", "crates/ue2-host", "crates/ue2-core", "crates/c64-bridge", "crates/ue2-web"]
+exclude = ["vendor/trx64-core", "vendor/resid-rs"]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "GPL-3.0-or-later"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+debug = 0
+strip = "debuginfo"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.web-release]
+inherits = "release"

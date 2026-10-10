@@ -1,0 +1,3556 @@
+//! vic.rs — VERBATIM per-cycle (viciisc) VIC-II (6569 PAL) timing core.
+//!
+//! This is a 1:1 port of VICE's per-cycle "SC" VIC-II — the model that pairs
+//! with the verbatim x64sc 6510 SC core (`c64_6510core.rs`). It replaces the
+//! earlier hardcoded-window approximation (BA `(12..=54)`, sprite check at
+//! `cycle==55||56`, a prefetch-blind steal loop) with the actual cycle-table-
+//! driven BA/AEC/DMA model.
+//!
+//! SOURCE OF TRUTH (ported VERBATIM — every fn cites the line):
+//!   - vice/src/viciisc/vicii-cycle.c       — the per-cycle engine (`vicii_cycle`,
+//!     `check_badline`, the sprite-DMA lifecycle, the Phi1/Phi2 split, the BA
+//!     logic + `prefetch_cycles`, and `vicii_steal_cycles`).
+//!   - vice/src/viciisc/vicii-chip-model.c  — `cycle_tab_pal` + `vicii_chip_model_set`
+//!     (the BA/fetch grid compiled into `cycle_table[]`).
+//!   - vice/src/viciisc/vicii-chip-model.h  — the cycle-flag bit layout + accessors.
+//!   - vice/src/viciisc/vicii-mem.c         — `vicii_store` / `vicii_read` register
+//!     R/W side effects (`d011_store` → ysmooth/raster-irq-line, `d019_store` ACK,
+//!     `d01a_store` mask, `d017_store` sprite-crunch).
+//!   - vice/src/viciisc/vicii-irq.c         — `vicii_irq_set_line` / `_raster_set` /
+//!     `_raster_trigger` (the raster-IRQ edge-trigger, table-positioned so the
+//!     line-0 +1 and the $D011/$D012 RMW edge come out of the cycle grid for free).
+//!   - vice/src/c64/c64cpusc.c              — `CLK_INC()` (the per-CLK `vicii_cycle`
+//!     hook) + `FETCH_OPCODE`/`check_ba` ordering.
+//!   - vice/src/mainc64cpu.c                — `check_ba` (194-208) / `maincpu_steal_cycles`
+//!     (112-192) — the steal that produces the CPU stall.
+//!
+//! Cross-ref (the TS oracle the gates validate against — the Rust reproduces its
+//! per-cycle behavior 1:1): C64ReverseEngineeringMCP/src/runtime/headless/vic/
+//! literal/{vicii-cycle.ts, vicii-chip-model.ts, vicii-mem.ts, vicii-irq.ts}.
+//!
+//! KEY MODEL DIFFERENCE vs the old approximation (the $E4DD fix): BA-low is NOT a
+//! hardcoded window. It is `bad_line && cycle_is_fetch_ba(cycle_flags)` OR a sprite
+//! BA mask, read PER CYCLE from `cycle_table[raster_cycle]`. The steal is the exact
+//! VICE `vicii_steal_cycles` do-while (`clk++; ba = vicii_cycle()`) — the CPU is
+//! stalled only while BA stays low, and the WRITE cycle of a store is never
+//! check_ba'd (STORE has no check_ba in the SC core), so the badline-stalled
+//! `STA ($F3),Y` cursor store at $E4DD costs 48 cycles, matching VICE/TS.
+//!
+//! `raster_line` / `raster_cycle` are derived FROM the clk-driven engine (the
+//! `vicii_cycle` raster_cycle++ + the start-of-line/frame handling), exactly as
+//! VICE — NOT parallel counters.
+//!
+//! Pixel draw / framebuffer generation is intentionally NOT here (that is the
+//! separate per-cycle pixel-pipeline renderer step). This module exposes the
+//! per-cycle state (display/idle, c/g-access selection, sprite data, the register
+//! file) so `render.rs`'s existing static draw stays pixel-identical; render.rs
+//! reads `vic.regs` + the derived `raster_line`/`raster_cycle`, which this port
+//! keeps byte-for-byte compatible.
+//!
+//! Pure / sync / deterministic — no async, no rand, no time. Clone-able with the
+//! Machine for Phase-2 COW forks.
+
+#![allow(clippy::manual_range_contains)]
+// The register-store/read match arms mirror VICE's `vicii_store`/`vicii_read`
+// switch labels (one case per $D0xx offset) verbatim; clippy's range rewrite
+// would obscure the 1:1 correspondence. Kept as explicit OR patterns.
+#![allow(clippy::manual_range_patterns)]
+// `SprPtr(0)` / `SprDma0(0)` etc. in the cycle table carry an explicit sprite
+// number (`|0`) to mirror VICE's cycle_tab_pal row notation 1:1 for review; the
+// `|0` is an identity op clippy flags but it is load-bearing for readability.
+#![allow(clippy::identity_op)]
+// Several cycle-flag accessors + Phi1-fetch-grid helpers are part of the verbatim
+// 1:1 port surface (they classify the fetch type for the deferred pixel pipeline).
+// They are not yet read by the timing/BA model, so allow dead_code on this module
+// to preserve the full VICE accessor set for the later renderer step.
+#![allow(dead_code)]
+
+// ── Timing constants (viciitypes.h) ─────────────────────────────────────────────
+// The line length and the frame height are the model's (Spec 863): `cycles_per_line`
+// comes from the row's cycle-table family, `screen_height` from its raster lines.
+
+use crate::model::{CycleFamily, DisplayWindow, MAX_CYCLES_PER_LINE, MAX_RASTER_LINES};
+
+/// First line on which a badline can occur (viciitypes.h VICII_FIRST_DMA_LINE).
+pub const FIRST_DMA_LINE: u16 = 0x30;
+/// Last line on which a badline can occur (viciitypes.h VICII_LAST_DMA_LINE).
+pub const LAST_DMA_LINE: u16 = 0xf7;
+
+/// viciitypes.h `VICII_PAL_CYCLE(c) = c - 1`: a 1-based cycle number → the table index.
+/// PAL only by name — VICE uses it for every family (the end-of-line, start-of-frame and
+/// VSP cycles are the same numbers on all of them).
+#[inline]
+const fn cycle_index(c: u16) -> u16 {
+    c - 1
+}
+
+/// Number of hardware sprites (viciitypes.h VICII_NUM_SPRITES).
+pub const NUM_SPRITES: usize = 8;
+
+// ── Register offsets ($D000 + n), masked to 6 bits in the $D000-$D3FF window ───
+
+/// Spec 843 D1 — the register state that drew ONE raster line.
+///
+/// Recorded at the start of every line, so a frozen frame can be asked "what drew
+/// line 137" instead of "what do the registers say now". `captured` distinguishes a
+/// line the beam has actually passed this frame from one still holding last frame's
+/// record — an honest gap beats a plausible wrong answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProvenanceRegs {
+    pub d011: u8,
+    pub d016: u8,
+    pub d018: u8,
+    /// VIC bank BASE (0 / $4000 / $8000 / $C000), not the 0-3 index.
+    pub vbank: u16,
+    pub captured: bool,
+}
+
+pub const R_CTRL1: u8 = 0x11; // $D011 — YSCROLL(0..2) RSEL DEN BMM ECM RST8
+pub const R_RASTER: u8 = 0x12; // $D012 — raster compare low 8 bits
+pub const R_SP_ENABLE: u8 = 0x15; // $D015 — sprite enable
+pub const R_CTRL2: u8 = 0x16; // $D016 — XSCROLL CSEL MCM
+pub const R_SP_Y_EXP: u8 = 0x17; // $D017 — sprite Y expand
+pub const R_MEM_PTR: u8 = 0x18; // $D018 — screen / char base
+pub const R_IRQ_STATUS: u8 = 0x19; // $D019 — IRQ latch (write 1 to ack)
+pub const R_IRQ_MASK: u8 = 0x1a; // $D01A — IRQ enable mask
+
+// =============================================================================
+// SECTION — VIC memory view (the chip's per-cycle fetch ports).
+//
+// VICE's `vicii` struct holds `ram_base_phi1/phi2` pointers + the vbank/vaddr
+// masks; the per-cycle fetches (`fetch_phi1`/`fetch_phi2`, vicii-fetch.c) read
+// through them. In Rust the VIC does NOT own RAM (the Machine does), so the bus
+// supplies a borrowed `VicMemView` each cycle — built inline from the bus's
+// already-borrowed RAM / char-ROM / colour-RAM / VIC-bank, so the borrow checker
+// sees disjoint field borrows (`&self.ram/.char_rom/.io` vs `&mut self.vic`).
+//
+// Wiring constants are the C64 ones (vicii.ts vicii_bind_ram): vaddr_mask $FFFF,
+// vaddr_offset 0, chargen overlay mask $7000 / value $1000 (→ CHARGEN ROM visible
+// at absolute $1000-1FFF + $9000-9FFF, i.e. banks 0 + 2 only), vbank = bank<<14.
+// =============================================================================
+
+/// The VIC's per-cycle memory ports (= VICE fetch_phi1/fetch_phi2 +
+/// mem_color_ram_vicii). Borrows the bus's RAM / CHARGEN / colour-RAM.
+pub struct VicMemView<'a> {
+    /// Full 64 KiB RAM (= ram_base_phi1/phi2; the VIC reads RAM directly).
+    pub ram: &'a [u8; 0x10000],
+    /// CHARGEN ROM (4 KiB), or None on the chip-isolated bus (no ROM shadow).
+    pub char_rom: Option<&'a [u8; 0x1000]>,
+    /// Colour RAM low nibbles (1 KiB), indexed by VC. On the full machine this is
+    /// the IO-shadow slice $D800-$DBFF; on the iso bus the flat-RAM slice.
+    pub color_ram: &'a [u8],
+    /// VIC bank base (0 / $4000 / $8000 / $C000) = bank<<14.
+    pub vbank: u16,
+    /// The cartridge's ROMH, when a REAL ultimax board is in force and the cart drives
+    /// the window (= VICE's non-NULL `ultimax_romh_phi1_ptr`). `None` on every ordinary
+    /// machine, which is the condition the whole ultimax branch is gated on.
+    pub romh: Option<&'a [u8]>,
+}
+
+impl<'a> VicMemView<'a> {
+    /// PORT OF: vicii-fetch.c:50 fetch_phi1 (= fetch_phi2 — identical C64 wiring).
+    /// `addr = ((addr + vbank) & $FFFF) | 0`; CHARGEN overlay when
+    /// `(addr & $7000) == $1000` (banks 0 + 2). Else RAM.
+    ///
+    /// PORT OF: vicii.c:842-875 for the ULTIMAX branch. Under a real ultimax board the
+    /// VIC's fetches at $3000-$3FFF of EVERY bank come out of the cartridge's ROMH, at
+    /// `$1000 + (addr & $0FFF)` — so the chip sees only the UPPER half of the 8 KiB
+    /// window, which is the half a MAX cartridge puts its charset in. A13 is not driven
+    /// out to the cart; that asymmetry is the hardware, not a shortcut.
+    ///
+    /// And the CHARGEN overlay does not apply there at all: VICE jumps clean past the
+    /// `vaddr_chargen` test in the ultimax branch. That half matters as much as the
+    /// first — a MAX machine has no character ROM in the VIC's path, so leaving the
+    /// shadow in would paint a cart's charset window with C64 glyphs.
+    #[inline]
+    pub fn vic_phi1(&self, addr: u16) -> u8 {
+        let a = addr.wrapping_add(self.vbank); // & 0xffff (u16) | 0 offset.
+        if let Some(romh) = self.romh {
+            return if (a & 0x3fff) >= 0x3000 {
+                // The window is 8 KiB and the VIC reaches its top 4 KiB.
+                romh.get((0x1000 + (a & 0x0fff)) as usize).copied().unwrap_or(0xff)
+            } else {
+                self.ram[a as usize]
+            };
+        }
+        if (a & 0x7000) == 0x1000 {
+            if let Some(cr) = self.char_rom {
+                return cr[(a & 0x0fff) as usize];
+            }
+        }
+        self.ram[a as usize]
+    }
+    /// PORT OF: vicii-fetch.c:76 fetch_phi2 — same body as Φ1 on the C64.
+    #[inline]
+    pub fn vic_phi2(&self, addr: u16) -> u8 {
+        self.vic_phi1(addr)
+    }
+    /// PORT OF: vicii-fetch.c:214 `mem_color_ram_vicii[vc] & 0xf`.
+    #[inline]
+    pub fn color_ram(&self, vc: u16) -> u8 {
+        self.color_ram[(vc & 0x3ff) as usize] & 0x0f
+    }
+}
+
+/// All-zero RAM/colour backing for a `VicMemView::null()` (used by the vic.rs unit
+/// tests that tick the timing engine in isolation, with no memory content — the
+/// draw then renders an all-zero frame, harmless for the timing-only assertions).
+static ZERO_RAM: [u8; 0x10000] = [0u8; 0x10000];
+
+impl VicMemView<'static> {
+    /// A view returning 0 for every read (no char ROM, flat zero colour RAM).
+    #[inline]
+    pub fn null() -> Self {
+        VicMemView { ram: &ZERO_RAM, char_rom: None, color_ram: &ZERO_RAM[..0x400], vbank: 0, romh: None }
+    }
+}
+
+// IRQ source bits ($D019 / $D01A) — vicii-irq.c.
+pub const IRQ_RASTER: u8 = 0x01;
+pub const IRQ_SBCOLL: u8 = 0x02;
+pub const IRQ_SSCOLL: u8 = 0x04;
+pub const IRQ_LIGHTPEN: u8 = 0x08;
+pub const IRQ_SUMMARY: u8 = 0x80;
+
+// =============================================================================
+// SECTION — cycle-flag bit layout (vicii-chip-model.h).
+// The compiled `cycle_table[]` entry is a u32 with this layout; the
+// `cycle_is_*` accessors read it. PORT OF: vicii-chip-model.h:33-218.
+// =============================================================================
+
+// 31-29 Border.
+const CHECK_BRD_L: u32 = 0x8000_0000;
+const CHECK_BRD_R: u32 = 0x4000_0000;
+const CHECK_BRD_CSEL: u32 = 0x2000_0000;
+// 28-25 Sprites.
+const CHECK_SPR_EXP_M: u32 = 0x1000_0000;
+const CHECK_SPR_M: u32 = 0x0e00_0000;
+const CHECK_SPR_DMA: u32 = 0x0200_0000;
+const CHECK_SPR_DISP: u32 = 0x0400_0000;
+const UPDATE_MCBASE: u32 = 0x0600_0000;
+const CHECK_SPR_CRUNCH: u32 = 0x0800_0000;
+// 24-23 VcRc.
+const UPDATE_VC_M: u32 = 0x0100_0000;
+const UPDATE_RC_M: u32 = 0x0080_0000;
+// 22 Visible.
+const VISIBLE_M: u32 = 0x0040_0000;
+// 21-16 XPos/8.
+const XPOS_M: u32 = 0x003f_0000;
+const XPOS_B: u32 = 16;
+// 15 May FetchC.
+const PHI2_FETCH_C_M: u32 = 0x0000_8000;
+// 14-12 Phi1 Fetch sprite num.
+const PHI1_SPR_NUM_M: u32 = 0x0000_7000;
+const PHI1_SPR_NUM_B: u32 = 12;
+// 11-9 Phi1 Fetch.
+const PHI1_TYPE_M: u32 = 0x0000_0e00;
+const PHI1_IDLE: u32 = 0x0000_0000;
+const PHI1_REFRESH: u32 = 0x0000_0200;
+const PHI1_FETCH_G: u32 = 0x0000_0400;
+const PHI1_SPR_PTR: u32 = 0x0000_0600;
+const PHI1_SPR_DMA1: u32 = 0x0000_0800;
+// 8-0 Check BA flags.
+const FETCH_BA_M: u32 = 0x0000_0100;
+const SPRITE_BA_MASK_M: u32 = 0x0000_00ff;
+const SPRITE_BA_MASK_B: u32 = 0;
+
+// PORT OF: vicii-chip-model.h:119-218 (cycle_is_* accessors).
+#[inline]
+fn cycle_get_sprite_ba_mask(flags: u32) -> u8 {
+    ((flags & SPRITE_BA_MASK_M) >> SPRITE_BA_MASK_B) as u8
+}
+#[inline]
+fn cycle_is_fetch_ba(flags: u32) -> bool {
+    flags & FETCH_BA_M != 0
+}
+#[inline]
+pub(crate) fn cycle_is_sprite_ptr_dma0(flags: u32) -> bool {
+    flags & PHI1_TYPE_M == PHI1_SPR_PTR
+}
+#[inline]
+pub(crate) fn cycle_is_sprite_dma1_dma2(flags: u32) -> bool {
+    flags & PHI1_TYPE_M == PHI1_SPR_DMA1
+}
+#[inline]
+pub(crate) fn cycle_get_sprite_num(flags: u32) -> usize {
+    ((flags & PHI1_SPR_NUM_M) >> PHI1_SPR_NUM_B) as usize
+}
+#[inline]
+fn cycle_is_refresh(flags: u32) -> bool {
+    flags & PHI1_TYPE_M == PHI1_REFRESH
+}
+#[inline]
+fn cycle_is_fetch_g(flags: u32) -> bool {
+    flags & PHI1_TYPE_M == PHI1_FETCH_G
+}
+#[inline]
+fn cycle_may_fetch_c(flags: u32) -> bool {
+    flags & PHI2_FETCH_C_M != 0
+}
+/// PORT OF: vicii-chip-model.h cycle_is_visible / vicii-chip-model.ts:91.
+#[inline]
+pub(crate) fn cycle_is_visible(flags: u32) -> bool {
+    flags & VISIBLE_M != 0
+}
+/// PORT OF: vicii-chip-model.h cycle_get_xpos / vicii-chip-model.ts:94 —
+/// `((flags & XPOS_M) >> XPOS_B) << 3` (the stored xpos is xpos/8; the low 3
+/// bits are intentionally dropped, the sprite-trigger re-adds 0..7 per pixel).
+#[inline]
+pub(crate) fn cycle_get_xpos(flags: u32) -> u16 {
+    (((flags & XPOS_M) >> XPOS_B) << 3) as u16
+}
+#[inline]
+fn cycle_is_update_vc(flags: u32) -> bool {
+    flags & UPDATE_VC_M != 0
+}
+#[inline]
+fn cycle_is_update_rc(flags: u32) -> bool {
+    flags & UPDATE_RC_M != 0
+}
+#[inline]
+fn cycle_is_check_spr_crunch(flags: u32) -> bool {
+    flags & CHECK_SPR_M == CHECK_SPR_CRUNCH
+}
+#[inline]
+fn cycle_is_update_mcbase(flags: u32) -> bool {
+    flags & CHECK_SPR_M == UPDATE_MCBASE
+}
+#[inline]
+fn cycle_is_check_spr_exp(flags: u32) -> bool {
+    flags & CHECK_SPR_EXP_M != 0
+}
+#[inline]
+fn cycle_is_check_spr_dma(flags: u32) -> bool {
+    flags & CHECK_SPR_M == CHECK_SPR_DMA
+}
+#[inline]
+pub(crate) fn cycle_is_check_spr_disp(flags: u32) -> bool {
+    flags & CHECK_SPR_M == CHECK_SPR_DISP
+}
+#[inline]
+fn cycle_is_check_border_l(flags: u32, csel: bool) -> bool {
+    if flags & CHECK_BRD_L != 0 {
+        if flags & CHECK_BRD_CSEL != 0 {
+            csel
+        } else {
+            !csel
+        }
+    } else {
+        false
+    }
+}
+#[inline]
+fn cycle_is_check_border_r(flags: u32, csel: bool) -> bool {
+    if flags & CHECK_BRD_R != 0 {
+        if flags & CHECK_BRD_CSEL != 0 {
+            csel
+        } else {
+            !csel
+        }
+    } else {
+        false
+    }
+}
+
+// =============================================================================
+// SECTION — the cycle tables (vicii-chip-model.c cycle_tab_pal / _ntsc / _ntsc_old).
+//
+// PORT OF: vicii-chip-model.c:111-238 (cycle_tab_pal), :272-403 (cycle_tab_ntsc),
+// :437-566 (cycle_tab_ntsc_old) + :579-811 (vicii_chip_model_set, which folds the
+// Phi1+Phi2 rows of each cycle into one `cycle_table[cycle-1]` u32 entry). Spec 863: the
+// three families are the building blocks a `models.toml` row names; the VIC indexes
+// the one its row names, and `cycles_per_line` decides how many entries run.
+//
+// Each source row is { cycle, xpos, visible, fetch, ba, flags }, every column carried —
+// the xpos column is the table's, not a formula (NTSC repeats $184 three times). The
+// encoder (chip-model.c:730-808) merges the two phases:
+//   entry |= (ba_phi1 & BaSpr_M) << SPRITE_BA_MASK_B
+//   entry |= (ba_phi1 & BaFetch) ? FETCH_BA_M : 0
+//   Phi1 fetch type → PHI1_*; FetchC (Phi2) → PHI2_FETCH_C_M | VISIBLE_M
+//   xpos from Phi1; UpdateVc/Rc, ChkSpr*, ChkBrd* OR'd from both phases' flags.
+// =============================================================================
+
+/// Source-table row constants (vicii-chip-model.c #defines, lines 53-97).
+pub(crate) mod tab {
+    // Cycle column: Phi1(x) = x, Phi2(x) = x | 0x80.
+    pub const fn phi1(c: u8) -> u8 {
+        c
+    }
+    pub const fn phi2(c: u8) -> u8 {
+        c | 0x80
+    }
+    // Visible column: Vis(x) = x | 0x80, None = 0.
+    pub const fn vis(x: u16) -> u16 {
+        x | 0x80
+    }
+
+    // Fetch field (FetchType_M | FetchSprNum_M).
+    pub const NONE: u16 = 0;
+    pub const SPR_PTR: u16 = 0x100; // | sprite num
+    pub const SPR_DMA0: u16 = 0x200;
+    pub const SPR_DMA1: u16 = 0x300;
+    pub const SPR_DMA2: u16 = 0x400;
+    pub const REFRESH: u16 = 0x500;
+    pub const FETCH_G: u16 = 0x600;
+    pub const FETCH_C: u16 = 0x700;
+    pub const IDLE: u16 = 0x800;
+    pub const FETCH_TYPE_M: u16 = 0xf00;
+    pub const FETCH_SPR_NUM_M: u16 = 0x007;
+
+    // BA field.
+    pub const BA_FETCH: u16 = 0x100;
+    pub const BA_SPR_M: u16 = 0xff;
+
+    // Flags.
+    pub const UPDATE_MCBASE: u16 = 0x001;
+    pub const CHK_SPR_EXP: u16 = 0x002;
+    pub const CHK_SPR_DMA: u16 = 0x004;
+    pub const CHK_SPR_DISP: u16 = 0x008;
+    pub const CHK_SPR_CRUNCH: u16 = 0x010;
+    pub const CHK_BRD_L1: u16 = 0x020;
+    pub const CHK_BRD_L0: u16 = 0x040;
+    pub const CHK_BRD_R0: u16 = 0x080;
+    pub const CHK_BRD_R1: u16 = 0x100;
+    pub const UPDATE_VC: u16 = 0x200;
+    pub const UPDATE_RC: u16 = 0x400;
+
+    #[inline]
+    pub const fn spr1(x: u16) -> u16 {
+        1 << x
+    }
+    #[inline]
+    pub const fn spr2(x: u16, y: u16) -> u16 {
+        (1 << x) | (1 << y)
+    }
+    #[inline]
+    pub const fn spr3(x: u16, y: u16, z: u16) -> u16 {
+        (1 << x) | (1 << y) | (1 << z)
+    }
+}
+
+/// One row of a VICE cycle table (`struct ViciiCycle`, vicii-chip-model.c:44-51).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Row {
+    /// `Phi1(c)` = c, `Phi2(c)` = c | 0x80.
+    pub cycle: u8,
+    pub xpos: u16,
+    /// `Vis(x)` = x | 0x80 — the display column the cycle's pixels belong to. Log-only in
+    /// VICE (`vicii_chip_model_set` never reads it); carried so the table is VICE's.
+    pub visible: u16,
+    pub fetch: u16,
+    pub ba: u16,
+    pub flags: u16,
+}
+const fn r(cycle: u8, xpos: u16, visible: u16, fetch: u16, ba: u16, flags: u16) -> Row {
+    Row { cycle, xpos, visible, fetch, ba, flags }
+}
+
+/// PORT OF: `vicii-chip-model.c` `cycle_tab_pal` — 126 rows (63 cycles, Φ1 then Φ2), every column.
+#[rustfmt::skip]
+pub(crate) const CYCLE_TAB_PAL: [Row; 126] = {
+    use tab::*;
+    [
+        r(phi1(1), 0x194, NONE, SPR_PTR|3, spr2(3,4), NONE),
+        r(phi2(1), 0x198, NONE, SPR_DMA0|3, spr2(3,4), NONE),
+        r(phi1(2), 0x19c, NONE, SPR_DMA1|3, spr3(3,4,5), NONE),
+        r(phi2(2), 0x1a0, NONE, SPR_DMA2|3, spr3(3,4,5), NONE),
+        r(phi1(3), 0x1a4, NONE, SPR_PTR|4, spr2(4,5), NONE),
+        r(phi2(3), 0x1a8, NONE, SPR_DMA0|4, spr2(4,5), NONE),
+        r(phi1(4), 0x1ac, NONE, SPR_DMA1|4, spr3(4,5,6), NONE),
+        r(phi2(4), 0x1b0, NONE, SPR_DMA2|4, spr3(4,5,6), NONE),
+        r(phi1(5), 0x1b4, NONE, SPR_PTR|5, spr2(5,6), NONE),
+        r(phi2(5), 0x1b8, NONE, SPR_DMA0|5, spr2(5,6), NONE),
+        r(phi1(6), 0x1bc, NONE, SPR_DMA1|5, spr3(5,6,7), NONE),
+        r(phi2(6), 0x1c0, NONE, SPR_DMA2|5, spr3(5,6,7), NONE),
+        r(phi1(7), 0x1c4, NONE, SPR_PTR|6, spr2(6,7), NONE),
+        r(phi2(7), 0x1c8, NONE, SPR_DMA0|6, spr2(6,7), NONE),
+        r(phi1(8), 0x1cc, NONE, SPR_DMA1|6, spr2(6,7), NONE),
+        r(phi2(8), 0x1d0, NONE, SPR_DMA2|6, spr2(6,7), NONE),
+        r(phi1(9), 0x1d4, NONE, SPR_PTR|7, spr1(7), NONE),
+        r(phi2(9), 0x1d8, NONE, SPR_DMA0|7, spr1(7), NONE),
+        r(phi1(10), 0x1dc, NONE, SPR_DMA1|7, spr1(7), NONE),
+        r(phi2(10), 0x1e0, NONE, SPR_DMA2|7, spr1(7), NONE),
+        r(phi1(11), 0x1e4, NONE, REFRESH, NONE, NONE),
+        r(phi2(11), 0x1e8, NONE, NONE, NONE, NONE),
+        r(phi1(12), 0x1ec, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(12), 0x1f0, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(13), 0x1f4, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(13), 0x000, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(14), 0x004, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(14), 0x008, NONE, NONE, BA_FETCH, UPDATE_VC),
+        r(phi1(15), 0x00c, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(15), 0x010, NONE, FETCH_C, BA_FETCH, CHK_SPR_CRUNCH),
+        r(phi1(16), 0x014, NONE, FETCH_G, BA_FETCH, NONE),
+        r(phi2(16), 0x018, vis(0), FETCH_C, BA_FETCH, UPDATE_MCBASE),
+        r(phi1(17), 0x01c, vis(0), FETCH_G, BA_FETCH, NONE),
+        r(phi2(17), 0x020, vis(1), FETCH_C, BA_FETCH, CHK_BRD_L1),
+        r(phi1(18), 0x024, vis(1), FETCH_G, BA_FETCH, NONE),
+        r(phi2(18), 0x028, vis(2), FETCH_C, BA_FETCH, CHK_BRD_L0),
+        r(phi1(19), 0x02c, vis(2), FETCH_G, BA_FETCH, NONE),
+        r(phi2(19), 0x030, vis(3), FETCH_C, BA_FETCH, NONE),
+        r(phi1(20), 0x034, vis(3), FETCH_G, BA_FETCH, NONE),
+        r(phi2(20), 0x038, vis(4), FETCH_C, BA_FETCH, NONE),
+        r(phi1(21), 0x03c, vis(4), FETCH_G, BA_FETCH, NONE),
+        r(phi2(21), 0x040, vis(5), FETCH_C, BA_FETCH, NONE),
+        r(phi1(22), 0x044, vis(5), FETCH_G, BA_FETCH, NONE),
+        r(phi2(22), 0x048, vis(6), FETCH_C, BA_FETCH, NONE),
+        r(phi1(23), 0x04c, vis(6), FETCH_G, BA_FETCH, NONE),
+        r(phi2(23), 0x050, vis(7), FETCH_C, BA_FETCH, NONE),
+        r(phi1(24), 0x054, vis(7), FETCH_G, BA_FETCH, NONE),
+        r(phi2(24), 0x058, vis(8), FETCH_C, BA_FETCH, NONE),
+        r(phi1(25), 0x05c, vis(8), FETCH_G, BA_FETCH, NONE),
+        r(phi2(25), 0x060, vis(9), FETCH_C, BA_FETCH, NONE),
+        r(phi1(26), 0x064, vis(9), FETCH_G, BA_FETCH, NONE),
+        r(phi2(26), 0x068, vis(10), FETCH_C, BA_FETCH, NONE),
+        r(phi1(27), 0x06c, vis(10), FETCH_G, BA_FETCH, NONE),
+        r(phi2(27), 0x070, vis(11), FETCH_C, BA_FETCH, NONE),
+        r(phi1(28), 0x074, vis(11), FETCH_G, BA_FETCH, NONE),
+        r(phi2(28), 0x078, vis(12), FETCH_C, BA_FETCH, NONE),
+        r(phi1(29), 0x07c, vis(12), FETCH_G, BA_FETCH, NONE),
+        r(phi2(29), 0x080, vis(13), FETCH_C, BA_FETCH, NONE),
+        r(phi1(30), 0x084, vis(13), FETCH_G, BA_FETCH, NONE),
+        r(phi2(30), 0x088, vis(14), FETCH_C, BA_FETCH, NONE),
+        r(phi1(31), 0x08c, vis(14), FETCH_G, BA_FETCH, NONE),
+        r(phi2(31), 0x090, vis(15), FETCH_C, BA_FETCH, NONE),
+        r(phi1(32), 0x094, vis(15), FETCH_G, BA_FETCH, NONE),
+        r(phi2(32), 0x098, vis(16), FETCH_C, BA_FETCH, NONE),
+        r(phi1(33), 0x09c, vis(16), FETCH_G, BA_FETCH, NONE),
+        r(phi2(33), 0x0a0, vis(17), FETCH_C, BA_FETCH, NONE),
+        r(phi1(34), 0x0a4, vis(17), FETCH_G, BA_FETCH, NONE),
+        r(phi2(34), 0x0a8, vis(18), FETCH_C, BA_FETCH, NONE),
+        r(phi1(35), 0x0ac, vis(18), FETCH_G, BA_FETCH, NONE),
+        r(phi2(35), 0x0b0, vis(19), FETCH_C, BA_FETCH, NONE),
+        r(phi1(36), 0x0b4, vis(19), FETCH_G, BA_FETCH, NONE),
+        r(phi2(36), 0x0b8, vis(20), FETCH_C, BA_FETCH, NONE),
+        r(phi1(37), 0x0bc, vis(20), FETCH_G, BA_FETCH, NONE),
+        r(phi2(37), 0x0c0, vis(21), FETCH_C, BA_FETCH, NONE),
+        r(phi1(38), 0x0c4, vis(21), FETCH_G, BA_FETCH, NONE),
+        r(phi2(38), 0x0c8, vis(22), FETCH_C, BA_FETCH, NONE),
+        r(phi1(39), 0x0cc, vis(22), FETCH_G, BA_FETCH, NONE),
+        r(phi2(39), 0x0d0, vis(23), FETCH_C, BA_FETCH, NONE),
+        r(phi1(40), 0x0d4, vis(23), FETCH_G, BA_FETCH, NONE),
+        r(phi2(40), 0x0d8, vis(24), FETCH_C, BA_FETCH, NONE),
+        r(phi1(41), 0x0dc, vis(24), FETCH_G, BA_FETCH, NONE),
+        r(phi2(41), 0x0e0, vis(25), FETCH_C, BA_FETCH, NONE),
+        r(phi1(42), 0x0e4, vis(25), FETCH_G, BA_FETCH, NONE),
+        r(phi2(42), 0x0e8, vis(26), FETCH_C, BA_FETCH, NONE),
+        r(phi1(43), 0x0ec, vis(26), FETCH_G, BA_FETCH, NONE),
+        r(phi2(43), 0x0f0, vis(27), FETCH_C, BA_FETCH, NONE),
+        r(phi1(44), 0x0f4, vis(27), FETCH_G, BA_FETCH, NONE),
+        r(phi2(44), 0x0f8, vis(28), FETCH_C, BA_FETCH, NONE),
+        r(phi1(45), 0x0fc, vis(28), FETCH_G, BA_FETCH, NONE),
+        r(phi2(45), 0x100, vis(29), FETCH_C, BA_FETCH, NONE),
+        r(phi1(46), 0x104, vis(29), FETCH_G, BA_FETCH, NONE),
+        r(phi2(46), 0x108, vis(30), FETCH_C, BA_FETCH, NONE),
+        r(phi1(47), 0x10c, vis(30), FETCH_G, BA_FETCH, NONE),
+        r(phi2(47), 0x110, vis(31), FETCH_C, BA_FETCH, NONE),
+        r(phi1(48), 0x114, vis(31), FETCH_G, BA_FETCH, NONE),
+        r(phi2(48), 0x118, vis(32), FETCH_C, BA_FETCH, NONE),
+        r(phi1(49), 0x11c, vis(32), FETCH_G, BA_FETCH, NONE),
+        r(phi2(49), 0x120, vis(33), FETCH_C, BA_FETCH, NONE),
+        r(phi1(50), 0x124, vis(33), FETCH_G, BA_FETCH, NONE),
+        r(phi2(50), 0x128, vis(34), FETCH_C, BA_FETCH, NONE),
+        r(phi1(51), 0x12c, vis(34), FETCH_G, BA_FETCH, NONE),
+        r(phi2(51), 0x130, vis(35), FETCH_C, BA_FETCH, NONE),
+        r(phi1(52), 0x134, vis(35), FETCH_G, BA_FETCH, NONE),
+        r(phi2(52), 0x138, vis(36), FETCH_C, BA_FETCH, NONE),
+        r(phi1(53), 0x13c, vis(36), FETCH_G, BA_FETCH, NONE),
+        r(phi2(53), 0x140, vis(37), FETCH_C, BA_FETCH, NONE),
+        r(phi1(54), 0x144, vis(37), FETCH_G, BA_FETCH, NONE),
+        r(phi2(54), 0x148, vis(38), FETCH_C, BA_FETCH, NONE),
+        r(phi1(55), 0x14c, vis(38), FETCH_G, spr1(0), CHK_SPR_DMA),
+        r(phi2(55), 0x150, vis(39), NONE, spr1(0), NONE),
+        r(phi1(56), 0x154, vis(39), IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(56), 0x158, NONE, NONE, spr1(0), CHK_BRD_R0|CHK_SPR_EXP),
+        r(phi1(57), 0x15c, NONE, IDLE, spr2(0,1), NONE),
+        r(phi2(57), 0x160, NONE, NONE, spr2(0,1), CHK_BRD_R1),
+        r(phi1(58), 0x164, NONE, SPR_PTR|0, spr2(0,1), CHK_SPR_DISP),
+        r(phi2(58), 0x168, NONE, SPR_DMA0|0, spr2(0,1), UPDATE_RC),
+        r(phi1(59), 0x16c, NONE, SPR_DMA1|0, spr3(0,1,2), NONE),
+        r(phi2(59), 0x170, NONE, SPR_DMA2|0, spr3(0,1,2), NONE),
+        r(phi1(60), 0x174, NONE, SPR_PTR|1, spr2(1,2), NONE),
+        r(phi2(60), 0x178, NONE, SPR_DMA0|1, spr2(1,2), NONE),
+        r(phi1(61), 0x17c, NONE, SPR_DMA1|1, spr3(1,2,3), NONE),
+        r(phi2(61), 0x180, NONE, SPR_DMA2|1, spr3(1,2,3), NONE),
+        r(phi1(62), 0x184, NONE, SPR_PTR|2, spr2(2,3), NONE),
+        r(phi2(62), 0x188, NONE, SPR_DMA0|2, spr2(2,3), NONE),
+        r(phi1(63), 0x18c, NONE, SPR_DMA1|2, spr3(2,3,4), NONE),
+        r(phi2(63), 0x190, NONE, SPR_DMA2|2, spr3(2,3,4), NONE),
+    ]
+};
+
+/// PORT OF: `vicii-chip-model.c` `cycle_tab_ntsc` — 130 rows (65 cycles, Φ1 then Φ2), every column.
+#[rustfmt::skip]
+pub(crate) const CYCLE_TAB_NTSC: [Row; 130] = {
+    use tab::*;
+    [
+        r(phi1(1), 0x19c, NONE, SPR_DMA1|3, spr3(3,4,5), NONE),
+        r(phi2(1), 0x1a0, NONE, SPR_DMA2|3, spr3(3,4,5), NONE),
+        r(phi1(2), 0x1a4, NONE, SPR_PTR|4, spr2(4,5), NONE),
+        r(phi2(2), 0x1a8, NONE, SPR_DMA0|4, spr2(4,5), NONE),
+        r(phi1(3), 0x1ac, NONE, SPR_DMA1|4, spr3(4,5,6), NONE),
+        r(phi2(3), 0x1b0, NONE, SPR_DMA2|4, spr3(4,5,6), NONE),
+        r(phi1(4), 0x1b4, NONE, SPR_PTR|5, spr2(5,6), NONE),
+        r(phi2(4), 0x1b8, NONE, SPR_DMA0|5, spr2(5,6), NONE),
+        r(phi1(5), 0x1bc, NONE, SPR_DMA1|5, spr3(5,6,7), NONE),
+        r(phi2(5), 0x1c0, NONE, SPR_DMA2|5, spr3(5,6,7), NONE),
+        r(phi1(6), 0x1c4, NONE, SPR_PTR|6, spr2(6,7), NONE),
+        r(phi2(6), 0x1c8, NONE, SPR_DMA0|6, spr2(6,7), NONE),
+        r(phi1(7), 0x1cc, NONE, SPR_DMA1|6, spr2(6,7), NONE),
+        r(phi2(7), 0x1d0, NONE, SPR_DMA2|6, spr2(6,7), NONE),
+        r(phi1(8), 0x1d4, NONE, SPR_PTR|7, spr1(7), NONE),
+        r(phi2(8), 0x1d8, NONE, SPR_DMA0|7, spr1(7), NONE),
+        r(phi1(9), 0x1dc, NONE, SPR_DMA1|7, spr1(7), NONE),
+        r(phi2(9), 0x1e0, NONE, SPR_DMA2|7, spr1(7), NONE),
+        r(phi1(10), 0x1e4, NONE, IDLE, NONE, NONE),
+        r(phi2(10), 0x1e8, NONE, NONE, NONE, NONE),
+        r(phi1(11), 0x1ec, NONE, REFRESH, NONE, NONE),
+        r(phi2(11), 0x1f0, NONE, NONE, NONE, NONE),
+        r(phi1(12), 0x1f4, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(12), 0x1f8, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(13), 0x1fc, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(13), 0x000, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(14), 0x004, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(14), 0x008, NONE, NONE, BA_FETCH, UPDATE_VC),
+        r(phi1(15), 0x00c, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(15), 0x010, NONE, FETCH_C, BA_FETCH, CHK_SPR_CRUNCH),
+        r(phi1(16), 0x014, NONE, FETCH_G, BA_FETCH, NONE),
+        r(phi2(16), 0x018, vis(0), FETCH_C, BA_FETCH, UPDATE_MCBASE),
+        r(phi1(17), 0x01c, vis(0), FETCH_G, BA_FETCH, NONE),
+        r(phi2(17), 0x020, vis(1), FETCH_C, BA_FETCH, CHK_BRD_L1),
+        r(phi1(18), 0x024, vis(1), FETCH_G, BA_FETCH, NONE),
+        r(phi2(18), 0x028, vis(2), FETCH_C, BA_FETCH, CHK_BRD_L0),
+        r(phi1(19), 0x02c, vis(2), FETCH_G, BA_FETCH, NONE),
+        r(phi2(19), 0x030, vis(3), FETCH_C, BA_FETCH, NONE),
+        r(phi1(20), 0x034, vis(3), FETCH_G, BA_FETCH, NONE),
+        r(phi2(20), 0x038, vis(4), FETCH_C, BA_FETCH, NONE),
+        r(phi1(21), 0x03c, vis(4), FETCH_G, BA_FETCH, NONE),
+        r(phi2(21), 0x040, vis(5), FETCH_C, BA_FETCH, NONE),
+        r(phi1(22), 0x044, vis(5), FETCH_G, BA_FETCH, NONE),
+        r(phi2(22), 0x048, vis(6), FETCH_C, BA_FETCH, NONE),
+        r(phi1(23), 0x04c, vis(6), FETCH_G, BA_FETCH, NONE),
+        r(phi2(23), 0x050, vis(7), FETCH_C, BA_FETCH, NONE),
+        r(phi1(24), 0x054, vis(7), FETCH_G, BA_FETCH, NONE),
+        r(phi2(24), 0x058, vis(8), FETCH_C, BA_FETCH, NONE),
+        r(phi1(25), 0x05c, vis(8), FETCH_G, BA_FETCH, NONE),
+        r(phi2(25), 0x060, vis(9), FETCH_C, BA_FETCH, NONE),
+        r(phi1(26), 0x064, vis(9), FETCH_G, BA_FETCH, NONE),
+        r(phi2(26), 0x068, vis(10), FETCH_C, BA_FETCH, NONE),
+        r(phi1(27), 0x06c, vis(10), FETCH_G, BA_FETCH, NONE),
+        r(phi2(27), 0x070, vis(11), FETCH_C, BA_FETCH, NONE),
+        r(phi1(28), 0x074, vis(11), FETCH_G, BA_FETCH, NONE),
+        r(phi2(28), 0x078, vis(12), FETCH_C, BA_FETCH, NONE),
+        r(phi1(29), 0x07c, vis(12), FETCH_G, BA_FETCH, NONE),
+        r(phi2(29), 0x080, vis(13), FETCH_C, BA_FETCH, NONE),
+        r(phi1(30), 0x084, vis(13), FETCH_G, BA_FETCH, NONE),
+        r(phi2(30), 0x088, vis(14), FETCH_C, BA_FETCH, NONE),
+        r(phi1(31), 0x08c, vis(14), FETCH_G, BA_FETCH, NONE),
+        r(phi2(31), 0x090, vis(15), FETCH_C, BA_FETCH, NONE),
+        r(phi1(32), 0x094, vis(15), FETCH_G, BA_FETCH, NONE),
+        r(phi2(32), 0x098, vis(16), FETCH_C, BA_FETCH, NONE),
+        r(phi1(33), 0x09c, vis(16), FETCH_G, BA_FETCH, NONE),
+        r(phi2(33), 0x0a0, vis(17), FETCH_C, BA_FETCH, NONE),
+        r(phi1(34), 0x0a4, vis(17), FETCH_G, BA_FETCH, NONE),
+        r(phi2(34), 0x0a8, vis(18), FETCH_C, BA_FETCH, NONE),
+        r(phi1(35), 0x0ac, vis(18), FETCH_G, BA_FETCH, NONE),
+        r(phi2(35), 0x0b0, vis(19), FETCH_C, BA_FETCH, NONE),
+        r(phi1(36), 0x0b4, vis(19), FETCH_G, BA_FETCH, NONE),
+        r(phi2(36), 0x0b8, vis(20), FETCH_C, BA_FETCH, NONE),
+        r(phi1(37), 0x0bc, vis(20), FETCH_G, BA_FETCH, NONE),
+        r(phi2(37), 0x0c0, vis(21), FETCH_C, BA_FETCH, NONE),
+        r(phi1(38), 0x0c4, vis(21), FETCH_G, BA_FETCH, NONE),
+        r(phi2(38), 0x0c8, vis(22), FETCH_C, BA_FETCH, NONE),
+        r(phi1(39), 0x0cc, vis(22), FETCH_G, BA_FETCH, NONE),
+        r(phi2(39), 0x0d0, vis(23), FETCH_C, BA_FETCH, NONE),
+        r(phi1(40), 0x0d4, vis(23), FETCH_G, BA_FETCH, NONE),
+        r(phi2(40), 0x0d8, vis(24), FETCH_C, BA_FETCH, NONE),
+        r(phi1(41), 0x0dc, vis(24), FETCH_G, BA_FETCH, NONE),
+        r(phi2(41), 0x0e0, vis(25), FETCH_C, BA_FETCH, NONE),
+        r(phi1(42), 0x0e4, vis(25), FETCH_G, BA_FETCH, NONE),
+        r(phi2(42), 0x0e8, vis(26), FETCH_C, BA_FETCH, NONE),
+        r(phi1(43), 0x0ec, vis(26), FETCH_G, BA_FETCH, NONE),
+        r(phi2(43), 0x0f0, vis(27), FETCH_C, BA_FETCH, NONE),
+        r(phi1(44), 0x0f4, vis(27), FETCH_G, BA_FETCH, NONE),
+        r(phi2(44), 0x0f8, vis(28), FETCH_C, BA_FETCH, NONE),
+        r(phi1(45), 0x0fc, vis(28), FETCH_G, BA_FETCH, NONE),
+        r(phi2(45), 0x100, vis(29), FETCH_C, BA_FETCH, NONE),
+        r(phi1(46), 0x104, vis(29), FETCH_G, BA_FETCH, NONE),
+        r(phi2(46), 0x108, vis(30), FETCH_C, BA_FETCH, NONE),
+        r(phi1(47), 0x10c, vis(30), FETCH_G, BA_FETCH, NONE),
+        r(phi2(47), 0x110, vis(31), FETCH_C, BA_FETCH, NONE),
+        r(phi1(48), 0x114, vis(31), FETCH_G, BA_FETCH, NONE),
+        r(phi2(48), 0x118, vis(32), FETCH_C, BA_FETCH, NONE),
+        r(phi1(49), 0x11c, vis(32), FETCH_G, BA_FETCH, NONE),
+        r(phi2(49), 0x120, vis(33), FETCH_C, BA_FETCH, NONE),
+        r(phi1(50), 0x124, vis(33), FETCH_G, BA_FETCH, NONE),
+        r(phi2(50), 0x128, vis(34), FETCH_C, BA_FETCH, NONE),
+        r(phi1(51), 0x12c, vis(34), FETCH_G, BA_FETCH, NONE),
+        r(phi2(51), 0x130, vis(35), FETCH_C, BA_FETCH, NONE),
+        r(phi1(52), 0x134, vis(35), FETCH_G, BA_FETCH, NONE),
+        r(phi2(52), 0x138, vis(36), FETCH_C, BA_FETCH, NONE),
+        r(phi1(53), 0x13c, vis(36), FETCH_G, BA_FETCH, NONE),
+        r(phi2(53), 0x140, vis(37), FETCH_C, BA_FETCH, NONE),
+        r(phi1(54), 0x144, vis(37), FETCH_G, BA_FETCH, NONE),
+        r(phi2(54), 0x148, vis(38), FETCH_C, BA_FETCH, NONE),
+        r(phi1(55), 0x14c, vis(38), FETCH_G, NONE, NONE),
+        r(phi2(55), 0x150, vis(39), NONE, NONE, NONE),
+        r(phi1(56), 0x154, vis(39), IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(56), 0x158, NONE, NONE, spr1(0), CHK_BRD_R0|CHK_SPR_EXP),
+        r(phi1(57), 0x15c, NONE, IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(57), 0x160, NONE, NONE, spr1(0), CHK_BRD_R1),
+        r(phi1(58), 0x164, NONE, IDLE, spr2(0,1), NONE),
+        r(phi2(58), 0x168, NONE, NONE, spr2(0,1), UPDATE_RC),
+        r(phi1(59), 0x16c, NONE, SPR_PTR|0, spr2(0,1), CHK_SPR_DISP),
+        r(phi2(59), 0x170, NONE, SPR_DMA0|0, spr2(0,1), NONE),
+        r(phi1(60), 0x174, NONE, SPR_DMA1|0, spr3(0,1,2), NONE),
+        r(phi2(60), 0x178, NONE, SPR_DMA2|0, spr3(0,1,2), NONE),
+        r(phi1(61), 0x17c, NONE, SPR_PTR|1, spr2(1,2), NONE),
+        r(phi2(61), 0x180, NONE, SPR_DMA0|1, spr2(1,2), NONE),
+        r(phi1(62), 0x184, NONE, SPR_DMA1|1, spr3(1,2,3), NONE),
+        r(phi2(62), 0x184, NONE, SPR_DMA2|1, spr3(1,2,3), NONE),
+        r(phi1(63), 0x184, NONE, SPR_PTR|2, spr2(2,3), NONE),
+        r(phi2(63), 0x188, NONE, SPR_DMA0|2, spr2(2,3), NONE),
+        r(phi1(64), 0x18c, NONE, SPR_DMA1|2, spr3(2,3,4), NONE),
+        r(phi2(64), 0x190, NONE, SPR_DMA2|2, spr3(2,3,4), NONE),
+        r(phi1(65), 0x194, NONE, SPR_PTR|3, spr2(3,4), NONE),
+        r(phi2(65), 0x198, NONE, SPR_DMA0|3, spr2(3,4), NONE),
+    ]
+};
+
+/// PORT OF: `vicii-chip-model.c` `cycle_tab_ntsc_old` — 128 rows (64 cycles, Φ1 then Φ2), every column.
+#[rustfmt::skip]
+pub(crate) const CYCLE_TAB_NTSC_OLD: [Row; 128] = {
+    use tab::*;
+    [
+        r(phi1(1), 0x19c, NONE, SPR_PTR|3, spr2(3,4), NONE),
+        r(phi2(1), 0x1a0, NONE, SPR_DMA0|3, spr2(3,4), NONE),
+        r(phi1(2), 0x1a4, NONE, SPR_DMA1|3, spr3(3,4,5), NONE),
+        r(phi2(2), 0x1a8, NONE, SPR_DMA2|3, spr3(3,4,5), NONE),
+        r(phi1(3), 0x1ac, NONE, SPR_PTR|4, spr2(4,5), NONE),
+        r(phi2(3), 0x1b0, NONE, SPR_DMA0|4, spr2(4,5), NONE),
+        r(phi1(4), 0x1b4, NONE, SPR_DMA1|4, spr3(4,5,6), NONE),
+        r(phi2(4), 0x1b8, NONE, SPR_DMA2|4, spr3(4,5,6), NONE),
+        r(phi1(5), 0x1bc, NONE, SPR_PTR|5, spr2(5,6), NONE),
+        r(phi2(5), 0x1c0, NONE, SPR_DMA0|5, spr2(5,6), NONE),
+        r(phi1(6), 0x1c4, NONE, SPR_DMA1|5, spr3(5,6,7), NONE),
+        r(phi2(6), 0x1c8, NONE, SPR_DMA2|5, spr3(5,6,7), NONE),
+        r(phi1(7), 0x1cc, NONE, SPR_PTR|6, spr2(6,7), NONE),
+        r(phi2(7), 0x1d0, NONE, SPR_DMA0|6, spr2(6,7), NONE),
+        r(phi1(8), 0x1d4, NONE, SPR_DMA1|6, spr2(6,7), NONE),
+        r(phi2(8), 0x1d8, NONE, SPR_DMA2|6, spr2(6,7), NONE),
+        r(phi1(9), 0x1dc, NONE, SPR_PTR|7, spr1(7), NONE),
+        r(phi2(9), 0x1e0, NONE, SPR_DMA0|7, spr1(7), NONE),
+        r(phi1(10), 0x1e4, NONE, SPR_DMA1|7, spr1(7), NONE),
+        r(phi2(10), 0x1e8, NONE, SPR_DMA2|7, spr1(7), NONE),
+        r(phi1(11), 0x1ec, NONE, REFRESH, NONE, NONE),
+        r(phi2(11), 0x1f0, NONE, NONE, NONE, NONE),
+        r(phi1(12), 0x1f4, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(12), 0x1f8, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(13), 0x1fc, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(13), 0x000, NONE, NONE, BA_FETCH, NONE),
+        r(phi1(14), 0x004, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(14), 0x008, NONE, NONE, BA_FETCH, UPDATE_VC),
+        r(phi1(15), 0x00c, NONE, REFRESH, BA_FETCH, NONE),
+        r(phi2(15), 0x010, NONE, FETCH_C, BA_FETCH, CHK_SPR_CRUNCH),
+        r(phi1(16), 0x014, NONE, FETCH_G, BA_FETCH, NONE),
+        r(phi2(16), 0x018, vis(0), FETCH_C, BA_FETCH, UPDATE_MCBASE),
+        r(phi1(17), 0x01c, vis(0), FETCH_G, BA_FETCH, NONE),
+        r(phi2(17), 0x020, vis(1), FETCH_C, BA_FETCH, CHK_BRD_L1),
+        r(phi1(18), 0x024, vis(1), FETCH_G, BA_FETCH, NONE),
+        r(phi2(18), 0x028, vis(2), FETCH_C, BA_FETCH, CHK_BRD_L0),
+        r(phi1(19), 0x02c, vis(2), FETCH_G, BA_FETCH, NONE),
+        r(phi2(19), 0x030, vis(3), FETCH_C, BA_FETCH, NONE),
+        r(phi1(20), 0x034, vis(3), FETCH_G, BA_FETCH, NONE),
+        r(phi2(20), 0x038, vis(4), FETCH_C, BA_FETCH, NONE),
+        r(phi1(21), 0x03c, vis(4), FETCH_G, BA_FETCH, NONE),
+        r(phi2(21), 0x040, vis(5), FETCH_C, BA_FETCH, NONE),
+        r(phi1(22), 0x044, vis(5), FETCH_G, BA_FETCH, NONE),
+        r(phi2(22), 0x048, vis(6), FETCH_C, BA_FETCH, NONE),
+        r(phi1(23), 0x04c, vis(6), FETCH_G, BA_FETCH, NONE),
+        r(phi2(23), 0x050, vis(7), FETCH_C, BA_FETCH, NONE),
+        r(phi1(24), 0x054, vis(7), FETCH_G, BA_FETCH, NONE),
+        r(phi2(24), 0x058, vis(8), FETCH_C, BA_FETCH, NONE),
+        r(phi1(25), 0x05c, vis(8), FETCH_G, BA_FETCH, NONE),
+        r(phi2(25), 0x060, vis(9), FETCH_C, BA_FETCH, NONE),
+        r(phi1(26), 0x064, vis(9), FETCH_G, BA_FETCH, NONE),
+        r(phi2(26), 0x068, vis(10), FETCH_C, BA_FETCH, NONE),
+        r(phi1(27), 0x06c, vis(10), FETCH_G, BA_FETCH, NONE),
+        r(phi2(27), 0x070, vis(11), FETCH_C, BA_FETCH, NONE),
+        r(phi1(28), 0x074, vis(11), FETCH_G, BA_FETCH, NONE),
+        r(phi2(28), 0x078, vis(12), FETCH_C, BA_FETCH, NONE),
+        r(phi1(29), 0x07c, vis(12), FETCH_G, BA_FETCH, NONE),
+        r(phi2(29), 0x080, vis(13), FETCH_C, BA_FETCH, NONE),
+        r(phi1(30), 0x084, vis(13), FETCH_G, BA_FETCH, NONE),
+        r(phi2(30), 0x088, vis(14), FETCH_C, BA_FETCH, NONE),
+        r(phi1(31), 0x08c, vis(14), FETCH_G, BA_FETCH, NONE),
+        r(phi2(31), 0x090, vis(15), FETCH_C, BA_FETCH, NONE),
+        r(phi1(32), 0x094, vis(15), FETCH_G, BA_FETCH, NONE),
+        r(phi2(32), 0x098, vis(16), FETCH_C, BA_FETCH, NONE),
+        r(phi1(33), 0x09c, vis(16), FETCH_G, BA_FETCH, NONE),
+        r(phi2(33), 0x0a0, vis(17), FETCH_C, BA_FETCH, NONE),
+        r(phi1(34), 0x0a4, vis(17), FETCH_G, BA_FETCH, NONE),
+        r(phi2(34), 0x0a8, vis(18), FETCH_C, BA_FETCH, NONE),
+        r(phi1(35), 0x0ac, vis(18), FETCH_G, BA_FETCH, NONE),
+        r(phi2(35), 0x0b0, vis(19), FETCH_C, BA_FETCH, NONE),
+        r(phi1(36), 0x0b4, vis(19), FETCH_G, BA_FETCH, NONE),
+        r(phi2(36), 0x0b8, vis(20), FETCH_C, BA_FETCH, NONE),
+        r(phi1(37), 0x0bc, vis(20), FETCH_G, BA_FETCH, NONE),
+        r(phi2(37), 0x0c0, vis(21), FETCH_C, BA_FETCH, NONE),
+        r(phi1(38), 0x0c4, vis(21), FETCH_G, BA_FETCH, NONE),
+        r(phi2(38), 0x0c8, vis(22), FETCH_C, BA_FETCH, NONE),
+        r(phi1(39), 0x0cc, vis(22), FETCH_G, BA_FETCH, NONE),
+        r(phi2(39), 0x0d0, vis(23), FETCH_C, BA_FETCH, NONE),
+        r(phi1(40), 0x0d4, vis(23), FETCH_G, BA_FETCH, NONE),
+        r(phi2(40), 0x0d8, vis(24), FETCH_C, BA_FETCH, NONE),
+        r(phi1(41), 0x0dc, vis(24), FETCH_G, BA_FETCH, NONE),
+        r(phi2(41), 0x0e0, vis(25), FETCH_C, BA_FETCH, NONE),
+        r(phi1(42), 0x0e4, vis(25), FETCH_G, BA_FETCH, NONE),
+        r(phi2(42), 0x0e8, vis(26), FETCH_C, BA_FETCH, NONE),
+        r(phi1(43), 0x0ec, vis(26), FETCH_G, BA_FETCH, NONE),
+        r(phi2(43), 0x0f0, vis(27), FETCH_C, BA_FETCH, NONE),
+        r(phi1(44), 0x0f4, vis(27), FETCH_G, BA_FETCH, NONE),
+        r(phi2(44), 0x0f8, vis(28), FETCH_C, BA_FETCH, NONE),
+        r(phi1(45), 0x0fc, vis(28), FETCH_G, BA_FETCH, NONE),
+        r(phi2(45), 0x100, vis(29), FETCH_C, BA_FETCH, NONE),
+        r(phi1(46), 0x104, vis(29), FETCH_G, BA_FETCH, NONE),
+        r(phi2(46), 0x108, vis(30), FETCH_C, BA_FETCH, NONE),
+        r(phi1(47), 0x10c, vis(30), FETCH_G, BA_FETCH, NONE),
+        r(phi2(47), 0x110, vis(31), FETCH_C, BA_FETCH, NONE),
+        r(phi1(48), 0x114, vis(31), FETCH_G, BA_FETCH, NONE),
+        r(phi2(48), 0x118, vis(32), FETCH_C, BA_FETCH, NONE),
+        r(phi1(49), 0x11c, vis(32), FETCH_G, BA_FETCH, NONE),
+        r(phi2(49), 0x120, vis(33), FETCH_C, BA_FETCH, NONE),
+        r(phi1(50), 0x124, vis(33), FETCH_G, BA_FETCH, NONE),
+        r(phi2(50), 0x128, vis(34), FETCH_C, BA_FETCH, NONE),
+        r(phi1(51), 0x12c, vis(34), FETCH_G, BA_FETCH, NONE),
+        r(phi2(51), 0x130, vis(35), FETCH_C, BA_FETCH, NONE),
+        r(phi1(52), 0x134, vis(35), FETCH_G, BA_FETCH, NONE),
+        r(phi2(52), 0x138, vis(36), FETCH_C, BA_FETCH, NONE),
+        r(phi1(53), 0x13c, vis(36), FETCH_G, BA_FETCH, NONE),
+        r(phi2(53), 0x140, vis(37), FETCH_C, BA_FETCH, NONE),
+        r(phi1(54), 0x144, vis(37), FETCH_G, BA_FETCH, NONE),
+        r(phi2(54), 0x148, vis(38), FETCH_C, BA_FETCH, NONE),
+        r(phi1(55), 0x14c, vis(38), FETCH_G, NONE, NONE),
+        r(phi2(55), 0x150, vis(39), NONE, NONE, NONE),
+        r(phi1(56), 0x154, vis(39), IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(56), 0x158, NONE, NONE, spr1(0), CHK_BRD_R0|CHK_SPR_EXP),
+        r(phi1(57), 0x15c, NONE, IDLE, spr1(0), CHK_SPR_DMA),
+        r(phi2(57), 0x160, NONE, NONE, spr1(0), CHK_BRD_R1),
+        r(phi1(58), 0x164, NONE, IDLE, spr2(0,1), CHK_SPR_DISP),
+        r(phi2(58), 0x168, NONE, NONE, spr2(0,1), UPDATE_RC),
+        r(phi1(59), 0x16c, NONE, SPR_PTR|0, spr2(0,1), NONE),
+        r(phi2(59), 0x170, NONE, SPR_DMA0|0, spr2(0,1), NONE),
+        r(phi1(60), 0x174, NONE, SPR_DMA1|0, spr3(0,1,2), NONE),
+        r(phi2(60), 0x178, NONE, SPR_DMA2|0, spr3(0,1,2), NONE),
+        r(phi1(61), 0x17c, NONE, SPR_PTR|1, spr2(1,2), NONE),
+        r(phi2(61), 0x180, NONE, SPR_DMA0|1, spr2(1,2), NONE),
+        r(phi1(62), 0x184, NONE, SPR_DMA1|1, spr3(1,2,3), NONE),
+        r(phi2(62), 0x188, NONE, SPR_DMA2|1, spr3(1,2,3), NONE),
+        r(phi1(63), 0x18c, NONE, SPR_PTR|2, spr2(2,3), NONE),
+        r(phi2(63), 0x190, NONE, SPR_DMA0|2, spr2(2,3), NONE),
+        r(phi1(64), 0x194, NONE, SPR_DMA1|2, spr3(2,3,4), NONE),
+        r(phi2(64), 0x198, NONE, SPR_DMA2|2, spr3(2,3,4), NONE),
+    ]
+};
+
+/// The source rows of a family.
+pub fn cycle_tab(family: CycleFamily) -> &'static [Row] {
+    match family {
+        CycleFamily::Pal => &CYCLE_TAB_PAL,
+        CycleFamily::Ntsc => &CYCLE_TAB_NTSC,
+        CycleFamily::NtscOld => &CYCLE_TAB_NTSC_OLD,
+    }
+}
+
+/// Build the compiled `cycle_table[]` of a family (entries past its `cycles_per_line`
+/// stay 0 and never run).
+/// PORT OF: vicii-chip-model.c:579-811 `vicii_chip_model_set` (the per-cycle Phi1+Phi2
+/// fold): walk the rows, collect each phase's columns by the row's own phase bit, and on
+/// the Phi2 row write `cycle_table[cycle - 1]`.
+pub fn build_cycle_table(family: CycleFamily) -> [u32; MAX_CYCLES_PER_LINE] {
+    let mut table = [0u32; MAX_CYCLES_PER_LINE];
+    let mut xpos_phi = [0u16; 2];
+    let mut fetch_phi = [0u16; 2];
+    let mut ba_phi = [0u16; 2];
+    let mut flags_phi = [0u16; 2];
+    for row in cycle_tab(family) {
+        let phi = if row.cycle & 0x80 != 0 { 1 } else { 0 };
+        let cycle = (row.cycle & 0x7f) as usize;
+        xpos_phi[phi] = row.xpos;
+        fetch_phi[phi] = row.fetch;
+        ba_phi[phi] = row.ba;
+        flags_phi[phi] = row.flags;
+        if phi == 0 {
+            continue;
+        }
+        let f = (flags_phi[0] | flags_phi[1]) as u32;
+        let mut entry: u32 = 0;
+
+        // chip-model.c:735-736 — BA from Phi1.
+        entry |= ((ba_phi[0] & tab::BA_SPR_M) as u32) << SPRITE_BA_MASK_B;
+        entry |= if ba_phi[0] & tab::BA_FETCH != 0 { FETCH_BA_M } else { 0 };
+
+        // chip-model.c:738-760 — Phi1 fetch type → PHI1_* + sprite num.
+        match fetch_phi[0] & tab::FETCH_TYPE_M {
+            tab::SPR_PTR => {
+                entry |= PHI1_SPR_PTR;
+                entry |= ((fetch_phi[0] & tab::FETCH_SPR_NUM_M) as u32) << PHI1_SPR_NUM_B;
+            }
+            tab::SPR_DMA1 => {
+                entry |= PHI1_SPR_DMA1;
+                entry |= ((fetch_phi[0] & tab::FETCH_SPR_NUM_M) as u32) << PHI1_SPR_NUM_B;
+            }
+            tab::REFRESH => entry |= PHI1_REFRESH,
+            tab::FETCH_G => entry |= PHI1_FETCH_G,
+            _ => entry |= PHI1_IDLE,
+        }
+
+        // chip-model.c:761-765 — FetchC (Phi2) → PHI2_FETCH_C_M | VISIBLE_M. (VICE sets
+        // VISIBLE_M only from FetchC; the `visible` column is log-only.)
+        if fetch_phi[1] & tab::FETCH_TYPE_M == tab::FETCH_C {
+            entry |= PHI2_FETCH_C_M;
+            entry |= VISIBLE_M;
+        }
+
+        // chip-model.c:767 — xpos (Phi1): `entry |= ((xpos>>3) << XPOS_B) & XPOS_M`. The
+        // per-cycle pixel pipeline (vic_draw) reads it back via cycle_get_xpos for the
+        // sprite trigger.
+        entry |= (((xpos_phi[0] as u32) >> 3) << XPOS_B) & XPOS_M;
+
+        // chip-model.c:769-792 — VC/RC + sprite flags.
+        if f & tab::UPDATE_VC as u32 != 0 {
+            entry |= UPDATE_VC_M;
+        }
+        if f & tab::UPDATE_RC as u32 != 0 {
+            entry |= UPDATE_RC_M;
+        }
+        if f & tab::CHK_SPR_EXP as u32 != 0 {
+            entry |= CHECK_SPR_EXP_M;
+        }
+        if f & tab::CHK_SPR_DISP as u32 != 0 {
+            entry |= CHECK_SPR_DISP;
+        }
+        if f & tab::CHK_SPR_DMA as u32 != 0 {
+            entry |= CHECK_SPR_DMA;
+        }
+        if f & tab::UPDATE_MCBASE as u32 != 0 {
+            entry |= UPDATE_MCBASE;
+        }
+        if f & tab::CHK_SPR_CRUNCH as u32 != 0 {
+            entry |= CHECK_SPR_CRUNCH;
+        }
+
+        // chip-model.c:794-806 — border flags.
+        if f & tab::CHK_BRD_L0 as u32 != 0 {
+            entry |= CHECK_BRD_L;
+        }
+        if f & tab::CHK_BRD_L1 as u32 != 0 {
+            entry |= CHECK_BRD_L | CHECK_BRD_CSEL;
+        }
+        if f & tab::CHK_BRD_R0 as u32 != 0 {
+            entry |= CHECK_BRD_R;
+        }
+        if f & tab::CHK_BRD_R1 as u32 != 0 {
+            entry |= CHECK_BRD_R | CHECK_BRD_CSEL;
+        }
+
+        if (1..=MAX_CYCLES_PER_LINE).contains(&cycle) {
+            table[cycle - 1] = entry;
+        }
+    }
+    table
+}
+
+/// Where, in a family's line, the things a reader of the record looks for happen — read
+/// from the compiled flags, never from literal PAL cycle numbers. 1-based cycles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineGeometry {
+    pub cycles_per_line: u16,
+    /// First c-access (Φ2 FetchC): 15 on every family.
+    pub first_c: u16,
+    /// First g-access (Φ1 FetchG): 16 on every family.
+    pub first_g: u16,
+    /// Sprite 0's pointer fetch — from here on, a line's sprite fetches serve the NEXT
+    /// line (PAL 58, NTSC 59).
+    pub spr0_ptr: u16,
+    /// The last right-border check (ChkBrdR1, CSEL=1): 57 on every family.
+    pub brd_r1: u16,
+}
+
+impl LineGeometry {
+    pub fn of(family: CycleFamily) -> Self {
+        let t = build_cycle_table(family);
+        let cpl = family.cycles_per_line();
+        let find = |p: &dyn Fn(u32) -> bool| -> u16 {
+            (0..cpl as usize).find(|&i| p(t[i])).map(|i| i as u16 + 1).unwrap_or(0)
+        };
+        LineGeometry {
+            cycles_per_line: cpl,
+            first_c: find(&|f| cycle_may_fetch_c(f)),
+            first_g: find(&|f| cycle_is_fetch_g(f)),
+            spr0_ptr: find(&|f| cycle_is_sprite_ptr_dma0(f) && cycle_get_sprite_num(f) == 0),
+            brd_r1: find(&|f| f & CHECK_BRD_R != 0 && f & CHECK_BRD_CSEL != 0),
+        }
+    }
+    /// The cycle a line's per-line register state is sampled at: the fifth g-access,
+    /// inside the display fetches and after every pointer fetch that serves the line
+    /// (cycle 20 on every family — the recorder's `LineSprites`).
+    pub fn sample_cycle(&self) -> u16 {
+        self.first_g + 4
+    }
+}
+
+/// The Φ1 rows of a family, in line order: (1-based cycle, xpos, visible column).
+fn phi1_rows(family: CycleFamily) -> impl Iterator<Item = (u16, u16, u16)> {
+    cycle_tab(family)
+        .iter()
+        .filter(|r| r.cycle & 0x80 == 0)
+        .map(|r| (r.cycle as u16, r.xpos, r.visible))
+}
+
+/// Spec 863 — the draw-buffer X of display column 0, from the table: the cycle whose Φ1
+/// row is `Vis(0)` (cycle 17 on every family) × 8 px. The draw buffer's column 0 is the
+/// line's cycle 2 and the draw lags two cycles through the pipeline, so cycle c's pixels
+/// land at 8·c — VICE's `DBUF_OFFSET + screen_leftborderwidth` = 17 · 8 = 136.
+pub fn display_dbuf_x0(family: CycleFamily) -> usize {
+    phi1_rows(family).find(|&(_, _, vis)| vis == tab::vis(0)).map(|(c, _, _)| 8 * c as usize).unwrap_or(0)
+}
+
+/// Spec 863 — the draw-buffer X of sprite X coordinate 0: display column 0 is where the
+/// sprite coordinate is the xpos of that same Φ1 row ($1C → 24), so X 0 lies 24 px left
+/// of it (112 on every family).
+pub fn sprite_dbuf_x0(family: CycleFamily) -> usize {
+    let (_, xpos, _) = phi1_rows(family).find(|&(_, _, vis)| vis == tab::vis(0)).unwrap_or((0, 0, 0));
+    display_dbuf_x0(family) - (xpos & 0x1f8) as usize
+}
+
+/// Spec 863 — the draw-buffer X a sprite with X coordinate `x` starts at, from the family's
+/// xpos column. The coordinate runs 8 px per cycle from X 0; where the table repeats an
+/// xpos (NTSC: $184 on Φ1 62 and Φ1 63), every coordinate past it lands one cycle — 8 px —
+/// further right. PAL has no repeat, so this is `112 + x`, the calibrated line it always
+/// was (including its straight continuation past the line end).
+pub fn sprite_dbuf_x(family: CycleFamily, x: u16) -> usize {
+    let bucket = x & 0x1f8;
+    let rows: Vec<(u16, u16, u16)> = phi1_rows(family).collect();
+    let start = rows.iter().position(|&(_, xpos, _)| xpos & 0x1f8 == 0).unwrap_or(0);
+    let mut repeats = 0usize;
+    let mut prev: Option<u16> = None;
+    for k in 0..rows.len() {
+        let b = rows[(start + k) % rows.len()].1 & 0x1f8;
+        if let Some(p) = prev {
+            if b == p {
+                repeats += 1;
+                continue;
+            }
+            if b < p {
+                break; // xpos wrapped: `x` lies past the line, continue straight
+            }
+        }
+        if b >= bucket {
+            break;
+        }
+        prev = Some(b);
+    }
+    sprite_dbuf_x0(family) + x as usize + 8 * repeats
+}
+
+// =============================================================================
+// SECTION — per-sprite state (viciitypes.h vicii_sprite_s).
+// =============================================================================
+
+/// PORT OF: viciitypes.h:77-92 vicii_sprite_s — the per-sprite DMA state.
+#[derive(Clone, Copy, Default)]
+pub struct Sprite {
+    /// 24-bit shift data (uint32_t). Pixel renderer reads it; timing only stores.
+    pub data: u32,
+    /// 6-bit MC counter.
+    pub mc: u8,
+    /// 6-bit MCBASE counter.
+    pub mcbase: u8,
+    /// 8-bit sprite pointer.
+    pub pointer: u8,
+    /// Y-expansion flip-flop.
+    pub exp_flop: u8,
+    /// X coordinate (9-bit; renderer).
+    pub x: u16,
+}
+
+/// A register write the VIC observed this cycle, surfaced to the Observer so a
+/// trace sink can (in principle) emit a VIC_REG_WRITE frame. Mirrors the TS
+/// VIC_KIND_CODE { raster:1, mode:2, irq:3, badline:4 }. NOTE: the TS oracle's
+/// vic channel has no live producer, so these are not emitted into the gate
+/// trace — the hook exists for format completeness + future integration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VicRegKind {
+    Raster = 1,
+    Mode = 2,
+    Irq = 3,
+    Badline = 4,
+}
+
+// =============================================================================
+// SECTION — the VIC-II state (viciitypes.h struct vicii_s subset).
+// =============================================================================
+/// Spec 815 §4 — which machine this session claims to be, for the handful of
+/// probes a C64 release makes before it takes a turbo code path. Default `C64`,
+/// where $D02F-$D03F are open bus and every existing gate is unchanged.
+///
+/// This is NOT a C128 or an Ultimate: no VDC, no MMU, no faster clock. It answers
+/// the probe, so the other half of a release's code becomes reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpeedProfile {
+    #[default]
+    C64,
+    /// VIC-IIe: $D02F/$D030 exist with VICE's read-back masks.
+    C128,
+    /// An extended speed register at $D031; $D030 stays open bus.
+    U64,
+}
+
+impl SpeedProfile {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "c64" | "64" | "off" | "none" => Some(Self::C64),
+            "c128" | "128" | "c128-c64mode" => Some(Self::C128),
+            // Spec 851 — U64, Elite II and C64 Ultimate are one machine here; UE2 is that
+            // machine with a firmware behind it, not another one.
+            "u64" | "c64u" | "ultimate" | "turbo" | "ue2" | "u64ii" | "u64-ii" | "c64-ultimate" => {
+                Some(Self::U64)
+            }
+            _ => None,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::C64 => "c64",
+            Self::C128 => "128",
+            Self::U64 => "u64",
+        }
+    }
+}
+
+/// Spec 851 — the Ultimates differ in their CPU speed table only (`u64_config.cc:321-322`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum U64SpeedTable {
+    /// The first Ultimate 64: 1 2 3 4 5 6 8 10 12 14 16 20 24 32 40 48 MHz.
+    U64,
+    /// U64 Elite II and C64 Ultimate: 1 2 3 4 6 8 10 12 14 16 20 24 32 40 48 64 MHz.
+    #[default]
+    U64II,
+    /// Emulator-only preparation profile: the U64II table plus index 16 = 77× PHI2.
+    /// The Commodore77 firmware/register specification is not public; this index is
+    /// not an official hardware register value. Indices 0–15 keep their old timing.
+    Experimental77,
+}
+
+impl U64SpeedTable {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "u64" | "u64e" | "elite" => Some(Self::U64),
+            "u64ii" | "u64-ii" | "elite2" | "c64u" | "ultimate" => Some(Self::U64II),
+            "experimental77" | "experimental-77" => Some(Self::Experimental77),
+            _ => None,
+        }
+    }
+
+    /// Nominal speed label for an index, as shown by the firmware. The top two
+    /// hardware entries deliver one fewer CPU cycle per PHI2; see `delivered_slots`.
+    /// The experimental extension does not change the PAL/NTSC base clock.
+    pub fn mhz(self, index: u8) -> u32 {
+        const U64: [u32; 16] = [1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48];
+        const U64II: [u32; 16] = [1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 32, 40, 48, 64];
+        let i = usize::from(index.min(15));
+        match self {
+            Self::U64 => U64[i],
+            Self::U64II => U64II[i],
+            Self::Experimental77 => {
+                if index >= 16 {
+                    77
+                } else {
+                    U64II[i]
+                }
+            }
+        }
+    }
+
+    /// Delivered internal CPU cycles per PHI2 cycle, distinct from the nominal label.
+    ///
+    /// Gideon's confirmation and independent instruction-mix measurements in
+    /// https://github.com/GideonZ/1541ultimate/issues/874 establish one reserved
+    /// VIC slot even with DEN and sprites disabled. It reduces only the top TWO
+    /// speed indices: 40/48 -> 39/47 on U64, 48/64 -> 47/63 on U64II/C64U.
+    /// Lower settings already leave that slot available; subtracting one from
+    /// every turbo setting would contradict the hardware measurements.
+    ///
+    /// This is a uniform delivered-throughput model, not a claim to reproduce
+    /// the undisclosed gateware's precise reserved-slot phase. In particular,
+    /// the emulator-only 77x extension has no hardware evidence and stays 77.
+    pub fn delivered_slots(self, index: u8) -> u32 {
+        let nominal = self.mhz(index);
+        if self == Self::Experimental77 && index >= 16 {
+            return nominal;
+        }
+        if index.min(15) >= 14 {
+            nominal - 1
+        } else {
+            nominal
+        }
+    }
+}
+
+
+/// VERBATIM per-cycle VIC-II state. Field names follow VICE's `vicii` struct
+/// (viciitypes.h). The public fields used by render.rs / vsf.rs / the daemon
+/// (`regs`, `raster_line`, `raster_cycle`, `raster_irq_line`, `allow_bad_lines`,
+/// `bad_line`, `irq_line`, `frame`) keep the exact names + types the old
+/// approximation exposed, so callers are unchanged.
+#[derive(Clone)]
+pub struct VicII {
+    /// $D000-$D03F register file (vicii.regs[0x40]).
+    pub regs: [u8; 0x40],
+
+    /// Spec 843 D1 — what actually drove each raster line of the frame being drawn.
+    ///
+    /// `$D011`, `$D016`, `$D018` and the VIC bank are NOT frame constants: a raster
+    /// split changes them mid-frame, and a screen with a bitmap above a text box has
+    /// one. Resolving a pixel against the eight registers as they stand at capture
+    /// time answers for whichever split happened to be last — which is why
+    /// `vic_inspect` had a `ProvenanceLine` type and a per-line override that could
+    /// never fire: nothing ever wrote the record.
+    ///
+    /// One entry per raster line (sized for the tallest frame a model has), rewritten
+    /// in place each frame — no allocation per frame (Spec 765's rule), and the array is
+    /// exactly the shape the inspect resolver already parses.
+    pub provenance: [ProvenanceRegs; MAX_RASTER_LINES],
+
+    /// Spec 859 — the per-cycle recorder, armed only inside a scratch replay
+    /// (`vic_line_trace::record_frame`). `None` on the live path: the two hooks in `tick`
+    /// are then one untaken branch each.
+    pub line_rec: Option<Box<crate::vic_line_trace::VicCycleRecorder>>,
+
+    /// Spec 815 — which machine this claims to be. Default C64: $D02F-$D03F are
+    /// open bus and nothing below this line does anything.
+    pub speed_profile: SpeedProfile,
+    /// Spec 868 — the sub-PHI2 position of the CPU cycle currently storing, mirrored
+    /// here by the turbo CPU (`C64Core6510Bus::set_turbo_phase`). `div == 1` means a
+    /// CPU that cannot see finer than PHI2, which is every machine but the U64 in turbo.
+    pub turbo_phase: u32,
+    /// Spec 868 §9 — set by a `$D031` write, cleared when the CPU reads it at the next
+    /// instruction boundary. The write reloads the divider's counter, so the sub-PHI2
+    /// phase restarts there; that is what UPic's resync buys, and it is the only thing
+    /// that realigns the phase now that a speed change is adopted at the PHI2 edge.
+    pub u64_d031_written_this_instruction: bool,
+    pub turbo_div: u32,
+    /// Spec 868 — the border colour in force at each of the eight pixels this PHI2 cycle
+    /// draws. Armed only while a 64 MHz CPU is writing `$D020` more than once per cycle
+    /// (UPic paints a border picture that way); `None` everywhere else, and then the
+    /// colour resolve is exactly what it always was.
+    pub subcycle_colour: Option<SubCycleColour>,
+    /// PORT OF: `vicii-mem.c:976` — `vicii.fastmode = value & 1`. STORED AND
+    /// REPORTED ONLY. What a set speed bit does to the picture is Spec 815 §3 and
+    /// is deliberately unbuilt: the one open question about it changes the
+    /// implementation, and guessing would put behaviour here that exists nowhere
+    /// else.
+    pub fastmode: u8,
+    /// Spec 851 — the firmware's enable word `C64_TURBOREGS_EN` (`u64_config.cc:1631`): bit 0
+    /// the U64 turbo register `$D031`, bit 1 SuperCPU detection at `$D0BC`, bit 2 the
+    /// TurboEnable bit `$D030`. A firmware setting, so a C64 reset keeps it.
+    pub u64_regs_en: u8,
+    /// Spec 851 — `C64_SPEED_PREFER` (`u64_config.cc:1630`): bits 0-6 speed index, bit 7
+    /// badline timing. `$80` is the menu's "Off".
+    pub u64_speed_prefer: u8,
+    /// BUG-061 — PHI2 cycles left in the Ultimate's post-reset hold, during which the C64
+    /// runs at 1 MHz whatever speed is set. 0 = no hold.
+    ///
+    /// Measured on the owner's C64 Ultimate: after `machine:reset` the machine stays at
+    /// 1 MHz for 2.06 s — at 16 MHz and at 64 MHz alike, stable across runs — although
+    /// the firmware strobes the speed only 445 cycles after reset release. A strobe inside
+    /// the hold has no effect; when the hold ends, the last strobed speed applies. A speed
+    /// change WITHOUT a reset takes effect at once.
+    ///
+    /// It matters because the KERNAL decides PAL or NTSC by racing the CPU against the
+    /// raster at `$FF5E`, about 1.5 s after reset — inside the hold. Without it a turbo C64
+    /// wins that race from 16 MHz up and programs its jiffy clock for NTSC.
+    ///
+    /// Armed by the machine's reset paths (the hold is counted in time, so its length
+    /// comes from the model's clock), counted down once per VIC cycle = once per PHI2.
+    /// Unmeasured: whether a program's own `$D031` write inside the hold is honoured.
+    /// Modelled as not — the hold is on the CPU, not on who asked.
+    pub u64_reset_hold: u32,
+    /// Spec 851 — `$D031` has been written since the last reset; until then it reads, and
+    /// runs at, the preferred speed.
+    pub u64_d031_written: bool,
+    pub u64_speed_table: U64SpeedTable,
+
+    /// Cycle # within the current line (vicii.raster_cycle), 0..62 PAL.
+    pub raster_cycle: u16,
+    /// Compiled cycle-flags for the current cycle (vicii.cycle_flags).
+    pub cycle_flags: u32,
+    /// Current line (vicii.raster_line), 0..311 PAL.
+    pub raster_line: u16,
+    /// Start-of-frame latch (vicii.start_of_frame).
+    pub start_of_frame: bool,
+
+    /// IRQ latch register (vicii.irq_status) — bits 0..3 + bit7 summary.
+    pub irq_status: u8,
+    /// Raster compare line (vicii.raster_irq_line) — 9-bit.
+    pub raster_irq_line: u16,
+    /// Raster-compare edge-detect latch (vicii.raster_irq_triggered).
+    pub raster_irq_triggered: bool,
+
+    /// Parsed YSCROLL (vicii.ysmooth) — D011 low 3 bits.
+    pub ysmooth: u8,
+    /// Sticky allow-bad-lines (vicii.allow_bad_lines).
+    pub allow_bad_lines: bool,
+    /// Current line is a badline (vicii.bad_line).
+    pub bad_line: bool,
+
+    /// Idle state (vicii.idle_state).
+    pub idle_state: bool,
+    /// VCBASE (vicii.vcbase).
+    pub vcbase: u16,
+    /// VC (vicii.vc).
+    pub vc: u16,
+    /// RC (vicii.rc).
+    pub rc: u8,
+    /// VMLI (vicii.vmli).
+    pub vmli: u16,
+
+    /// reg11 delayed-by-one-cycle copy (vicii.reg11_delay).
+    pub reg11_delay: u8,
+    /// Prefetch-cycle countdown (vicii.prefetch_cycles).
+    pub prefetch_cycles: u8,
+
+    /// Sprite-display mask (vicii.sprite_display_bits).
+    pub sprite_display_bits: u8,
+    /// Sprite-DMA mask (vicii.sprite_dma).
+    pub sprite_dma: u8,
+    /// Per-sprite DMA state (vicii.sprite[8]).
+    pub sprite: [Sprite; NUM_SPRITES],
+
+    /// Collision registers (vicii.sprite_*_collisions) + clear flag.
+    pub sprite_sprite_collisions: u8,
+    pub sprite_background_collisions: u8,
+    pub clear_collisions: u8,
+
+    /// Border flags (vicii.vborder / set_vborder / main_border).
+    pub vborder: bool,
+    pub set_vborder: bool,
+    pub main_border: bool,
+
+    /// DRAM refresh counter (vicii.refresh_counter).
+    pub refresh_counter: u8,
+
+    /// Last value read by VIC during Phi1 (vicii.last_read_phi1).
+    pub last_read_phi1: u8,
+    /// Last value on the internal VIC bus during Phi2 (vicii.last_bus_phi2).
+    pub last_bus_phi2: u8,
+
+    /// Frame counter (diagnostic; advances at start_of_frame). Not a VICE field.
+    pub frame: u64,
+
+    /// Latched IRQ output line level (vicii.irq_status & regs[0x1a] != 0). The
+    /// full-machine run loop samples this into the CPU IRQ source each boundary.
+    pub irq_line: bool,
+
+    /// VICE `maincpu_ba_low_flags` (VICII bit): the BA-low state the LAST
+    /// `vicii_cycle()` returned, consumed by the next `check_ba` / `steal_cycles`.
+    pub ba_low_flag: bool,
+
+    /// Spec 850 — of the cycles the last `steal_cycles` took, those in which AEC was
+    /// still high (`prefetch_cycles` not yet run down), so the CPU's address stayed on
+    /// the bus. The rest the VIC owned.
+    pub last_steal_on_bus: u32,
+
+    // ── Per-cycle fetch results (vicii-types.h vbuf/cbuf/gbuf) ─────────────────
+    // Populated by the Φ1/Φ2 fetches inside tick(); consumed by the draw pipeline.
+    /// Graphics shift-register source byte (vicii.gbuf) from the last g-fetch.
+    pub gbuf: u8,
+    /// Video-matrix line buffer (vicii.vbuf[VICII_SCREEN_TEXTCOLS=40]).
+    pub vbuf: [u8; 40],
+    /// Colour line buffer (vicii.cbuf[40]) — low nibble per cell.
+    pub cbuf: [u8; 40],
+    /// Chip color latency (vicii.color_latency): true = the 6569 family (6569, 6567R8,
+    /// 6572), false = the 8565/8562 path. The model's (Spec 863).
+    pub color_latency: bool,
+
+    // ── Per-cycle pixel pipeline state (vicii-draw-cycle.c module statics) ─────
+    // VICE keeps these as file-static; we hold them on VicII so the chip stays
+    // Clone-able for COW forks. Names + types mirror vicii-draw-cycle.ts:35-88.
+    pub(crate) gbuf_pipe0_reg: u8,
+    pub(crate) cbuf_pipe0_reg: u8,
+    pub(crate) vbuf_pipe0_reg: u8,
+    pub(crate) gbuf_pipe1_reg: u8,
+    pub(crate) cbuf_pipe1_reg: u8,
+    pub(crate) vbuf_pipe1_reg: u8,
+    pub(crate) xscroll_pipe: u8,
+    pub(crate) vmode11_pipe: u8,
+    pub(crate) vmode16_pipe: u8,
+    pub(crate) vmode16_pipe2: u8,
+    pub(crate) gbuf_reg: u8,
+    pub(crate) gbuf_mc_flop: u8,
+    pub(crate) gbuf_pixel_reg: u8,
+    pub(crate) cbuf_reg: u8,
+    pub(crate) vbuf_reg: u8,
+    pub(crate) dmli: usize,
+    pub(crate) sprite_x_pipe: [u16; NUM_SPRITES],
+    pub(crate) sprite_pri_bits: u8,
+    pub(crate) sprite_mc_bits: u8,
+    pub(crate) sprite_expx_bits: u8,
+    pub(crate) sprite_pending_bits: u8,
+    pub(crate) sprite_active_bits: u8,
+    pub(crate) sprite_halt_bits: u8,
+    pub(crate) sbuf_reg: [u32; NUM_SPRITES],
+    pub(crate) sbuf_pixel_reg: [u8; NUM_SPRITES],
+    pub(crate) sbuf_expx_flops: u8,
+    pub(crate) sbuf_mc_flops: u8,
+    pub(crate) border_state: u8,
+    pub(crate) render_buffer: [u8; 8],
+    pub(crate) pri_buffer: [u8; 8],
+    pub(crate) pixel_buffer: [u8; 8],
+    pub(crate) cregs: [u8; 0x2f],
+    pub(crate) draw_last_color_reg: u8,
+    pub(crate) draw_last_color_value: u8,
+    /// The draw runs one cycle behind: it consumes the PREVIOUS cycle's flags
+    /// (vicii-draw-cycle.ts `cycle_flags_pipe`, set at the tail of vicii_draw_cycle).
+    pub(crate) cycle_flags_pipe: u32,
+    /// Colour-register write the bus last observed (= vicii.last_color_reg /
+    /// _value); consumed by draw_colors8/update_cregs. 0xff = none this cycle.
+    pub last_color_reg: u8,
+    pub last_color_value: u8,
+
+    // ── Framebuffer (the accumulated 520×312 colour-index frame + display copy) ─
+    /// Per-cycle draw accumulator (= vicii.dbuf, but a full 520×312 frame rather
+    /// than VICE's single 520-px line; the draw writes `dbuf[line*FB_W + offset+i]`).
+    pub dbuf: Box<[u8; crate::render::FB_W * crate::render::FB_H]>,
+    /// Last COMPLETED frame, swapped from `dbuf` at start-of-frame — the stable
+    /// image a mid-frame `&self` screenshot reads.
+    pub displayed: Box<[u8; crate::render::FB_W * crate::render::FB_H]>,
+    /// Current X offset within the line being drawn (vicii.dbuf_offset), reset to
+    /// 0 at raster_cycle==1, +8 per drawn cycle.
+    pub(crate) dbuf_offset: usize,
+    /// Raster line whose pixels the current draw is writing (captured at the
+    /// dbuf_offset reset so the lagged draw lands on the right line).
+    pub(crate) dbuf_line: usize,
+
+    /// Compiled cycle table (vicii.cycle_table) of the model's family. Spec 863: data the
+    /// VIC indexes, not part of the type — `cycles_per_line` decides how many entries run.
+    cycle_table: [u32; MAX_CYCLES_PER_LINE],
+    /// cycles_per_line (vicii.cycles_per_line) — 63 PAL, 65 NTSC.
+    cycles_per_line: u16,
+    /// screen_height (vicii.screen_height) — 312 PAL, 263 NTSC.
+    screen_height: u16,
+    /// The family `cycle_table` was built from.
+    family: CycleFamily,
+    /// The displayed window (the model's). A wrapped window (NTSC) draws the frame's
+    /// first lines below its last, and the displayed buffer swaps at its vsync line
+    /// instead of at the frame wrap (VICE `vicii.c:440-452`).
+    window: DisplayWindow,
+    /// Where the recorder's per-line reads happen, from the table's flags.
+    pub(crate) geom: LineGeometry,
+    /// The row all of the above came from.
+    model: &'static crate::model::C64Model,
+}
+
+impl Default for VicII {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Spec 868 — eight colour values, one per pixel of a PHI2 cycle.
+///
+/// A 1 MHz 6510 cannot write a register twice in a cycle, so VICE keeps one latch and so
+/// did we. A 64 MHz U64 CPU can write it eight times, once per pixel the cycle draws, and
+/// the FPGA VIC samples the border colour at the pixel clock — which is what turns
+/// Aleksi Eeben's UPic into a 384-pixel-wide picture.
+///
+/// A store at pixel `k` fills `slots[k..8]`: the register holds its value until something
+/// replaces it, so an unwritten slot is not "no colour", it is the previous one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubCycleColour {
+    /// The register these slots stand for — `0x20` ($D020) today.
+    pub reg: u8,
+    pub slots: [u8; 8],
+}
+
+impl SubCycleColour {
+    /// Which of the cycle's eight pixels a store at this phase belongs to.
+    ///
+    /// `div` is the delivered CPU-cycle budget, not the firmware's nominal MHz
+    /// label: hardware U64II/C64U at the 64x setting has 63 cycles per PHI2. The
+    /// interpolation preserves the measured pitch; exact gateware slot phase
+    /// within the PHI2 cycle is not public and is not simulated here.
+    #[inline]
+    pub fn pixel_for(phase: u32, div: u32) -> usize {
+        if div <= 1 {
+            return 0;
+        }
+        ((phase * 8 / div) as usize).min(7)
+    }
+
+    /// The value in force from `pixel` to the end of the cycle.
+    #[inline]
+    pub fn set_from(&mut self, pixel: usize, value: u8) {
+        for slot in self.slots.iter_mut().skip(pixel) {
+            *slot = value;
+        }
+    }
+}
+
+impl VicII {
+    /// A power-on VIC-II of the default model (`c64-pal`).
+    pub fn new() -> Self {
+        Self::new_for(crate::model::default_model())
+    }
+
+    /// PORT OF: vicii_init (vicii.c) + vicii_reset (viciisc/vicii.c:77-133) +
+    /// vicii.c:240 sprite exp_flop=1 + the chip-model build (`vicii_chip_model_set`,
+    /// Spec 863: the model's row). Power-on defaults.
+    pub fn new_for(model: &'static crate::model::C64Model) -> Self {
+        let mut v = VicII {
+            regs: [0u8; 0x40],
+            provenance: [ProvenanceRegs::default(); MAX_RASTER_LINES],
+            line_rec: None,
+            speed_profile: SpeedProfile::C64,
+            turbo_phase: 0,
+            u64_d031_written_this_instruction: false,
+            turbo_div: 1,
+            subcycle_colour: None,
+            fastmode: 0,
+            u64_regs_en: 0x01,
+            u64_speed_prefer: 0x80,
+            u64_reset_hold: 0,
+            u64_d031_written: false,
+            u64_speed_table: U64SpeedTable::U64II,
+            raster_cycle: 0,
+            cycle_flags: 0,
+            raster_line: 0,
+            start_of_frame: false,
+            irq_status: 0,
+            raster_irq_line: 0,
+            raster_irq_triggered: false,
+            ysmooth: 0,
+            allow_bad_lines: false,
+            bad_line: false,
+            idle_state: false,
+            vcbase: 0,
+            vc: 0,
+            rc: 0,
+            vmli: 0,
+            reg11_delay: 0,
+            prefetch_cycles: 0,
+            sprite_display_bits: 0,
+            sprite_dma: 0,
+            sprite: [Sprite::default(); NUM_SPRITES],
+            sprite_sprite_collisions: 0,
+            sprite_background_collisions: 0,
+            clear_collisions: 0,
+            vborder: true,
+            set_vborder: true,
+            main_border: true,
+            refresh_counter: 0xff,
+            last_read_phi1: 0,
+            last_bus_phi2: 0xff,
+            frame: 0,
+            irq_line: false,
+            ba_low_flag: false,
+            last_steal_on_bus: 0,
+            // Per-cycle fetch results.
+            gbuf: 0,
+            vbuf: [0u8; 40],
+            cbuf: [0u8; 40],
+            color_latency: model.color_latency,
+            // Draw-pipeline state (vicii_draw_cycle_init, vicii-draw-cycle.ts:736-755).
+            gbuf_pipe0_reg: 0,
+            cbuf_pipe0_reg: 0,
+            vbuf_pipe0_reg: 0,
+            gbuf_pipe1_reg: 0,
+            cbuf_pipe1_reg: 0,
+            vbuf_pipe1_reg: 0,
+            xscroll_pipe: 0,
+            vmode11_pipe: 0,
+            vmode16_pipe: 0,
+            vmode16_pipe2: 0,
+            gbuf_reg: 0,
+            gbuf_mc_flop: 0,
+            gbuf_pixel_reg: 0,
+            cbuf_reg: 0,
+            vbuf_reg: 0,
+            dmli: 0,
+            sprite_x_pipe: [0u16; NUM_SPRITES],
+            sprite_pri_bits: 0,
+            sprite_mc_bits: 0,
+            sprite_expx_bits: 0,
+            sprite_pending_bits: 0,
+            sprite_active_bits: 0,
+            sprite_halt_bits: 0,
+            sbuf_reg: [0u32; NUM_SPRITES],
+            sbuf_pixel_reg: [0u8; NUM_SPRITES],
+            sbuf_expx_flops: 0,
+            sbuf_mc_flops: 0,
+            border_state: 0,
+            render_buffer: [0u8; 8],
+            pri_buffer: [0u8; 8],
+            pixel_buffer: [0u8; 8],
+            cregs: [0u8; 0x2f],
+            draw_last_color_reg: 0xff,
+            draw_last_color_value: 0,
+            cycle_flags_pipe: 0,
+            last_color_reg: 0xff,
+            last_color_value: 0,
+            dbuf: Box::new([0u8; crate::render::FB_W * crate::render::FB_H]),
+            displayed: Box::new([0u8; crate::render::FB_W * crate::render::FB_H]),
+            dbuf_offset: 0,
+            dbuf_line: 0,
+            cycle_table: build_cycle_table(model.cycle_family),
+            cycles_per_line: model.timing.cycles_per_line,
+            screen_height: model.timing.lines_per_frame,
+            family: model.cycle_family,
+            window: model.window,
+            geom: LineGeometry::of(model.cycle_family),
+            model,
+        };
+        // vicii.c:240 — Y-expansion flip-flops init to 1.
+        for s in v.sprite.iter_mut() {
+            s.exp_flop = 1;
+        }
+        // vicii_draw_cycle_init (vicii-draw-cycle.ts:746-749): clear cregs and fill
+        // 0x00-0x0f with the 1:1 identity mapping (so a COL token 0x00-0x0f resolves
+        // to itself; 0x10-0x2e resolve to live register values).
+        for i in 0..0x10 {
+            v.cregs[i] = i as u8;
+        }
+        v
+    }
+
+    /// Spec 863 — put a RUNNING chip on another model's geometry, keeping every value it
+    /// holds (registers, counters, sprite and draw state, both framebuffers). The table,
+    /// the line length, the frame height, the colour-latency path and the window are the
+    /// row's from here on; the flags of the cycle in hand are re-read from the new table,
+    /// since the old table's entry for this cycle means something else in the new one.
+    ///
+    /// The caller stands the chip where both geometries agree it can be — the frame
+    /// boundary — and [`fits`](Self::fits) says whether it does.
+    pub fn set_model(&mut self, model: &'static crate::model::C64Model) {
+        let changed = self.family != model.cycle_family;
+        self.cycle_table = build_cycle_table(model.cycle_family);
+        self.cycles_per_line = model.timing.cycles_per_line;
+        self.screen_height = model.timing.lines_per_frame;
+        self.family = model.cycle_family;
+        self.window = model.window;
+        self.geom = LineGeometry::of(model.cycle_family);
+        self.color_latency = model.color_latency;
+        self.model = model;
+        if changed {
+            let cpl = self.cycles_per_line as usize;
+            let rc = self.raster_cycle as usize % cpl;
+            self.cycle_flags = self.cycle_table[rc];
+            self.cycle_flags_pipe = self.cycle_table[(rc + cpl - 1) % cpl];
+        }
+    }
+
+    /// Does a raster position exist on this chip's geometry? A restored position that
+    /// does not would index past the cycle table.
+    pub fn fits(&self, raster_line: u16, raster_cycle: u16) -> bool {
+        raster_cycle < self.cycles_per_line && raster_line < self.screen_height
+    }
+
+    /// The row this chip is built on.
+    pub fn model(&self) -> &'static crate::model::C64Model {
+        self.model
+    }
+    pub fn cycles_per_line(&self) -> u16 {
+        self.cycles_per_line
+    }
+    pub fn screen_height(&self) -> u16 {
+        self.screen_height
+    }
+    pub fn cycle_family(&self) -> CycleFamily {
+        self.family
+    }
+    pub fn window(&self) -> &DisplayWindow {
+        &self.window
+    }
+    pub fn line_geometry(&self) -> LineGeometry {
+        self.geom
+    }
+    /// The framebuffer row the line starting now is drawn into (cycle 2, where the draw
+    /// resets its offset).
+    ///
+    /// A wrapped window (NTSC) draws the lines before its first displayed line below the
+    /// frame, as VICE's `raster_draw_buffer_ptr_update` does, so the picture is one
+    /// contiguous run of rows. There the first line of a frame must be counted as line 0:
+    /// the raster counter still reads the last line in this cycle (it resets in the Φ2
+    /// half of it) and line 0 is on screen. A window that ends inside the frame (PAL)
+    /// keeps the historical row — the counter's value — because rows 0 and 311 are
+    /// outside it and the framebuffer bytes stay what they always were.
+    #[inline]
+    pub(crate) fn draw_row(&self) -> usize {
+        if self.window.wraps() {
+            let line = if self.start_of_frame { 0 } else { self.raster_line };
+            self.window.row_of_line(line) as usize
+        } else {
+            self.raster_line as usize
+        }
+    }
+
+    /// The compiled table entry of a 0-based cycle (0 past the line's end).
+    pub fn cycle_table_entry(&self, index: usize) -> u32 {
+        if index < self.cycles_per_line as usize {
+            self.cycle_table[index]
+        } else {
+            0
+        }
+    }
+
+    /// Classify a $D000-$D02E register offset into a VIC trace kind, matching the
+    /// TS producer's `kind` tagging. $D012/$D011 → raster, $D016/$D018 → mode,
+    /// $D019/$D01A → irq. Returns None otherwise.
+    pub fn reg_kind(offset: u8) -> Option<VicRegKind> {
+        match offset {
+            R_RASTER | R_CTRL1 => Some(VicRegKind::Raster),
+            R_CTRL2 | R_MEM_PTR => Some(VicRegKind::Mode),
+            R_IRQ_STATUS | R_IRQ_MASK => Some(VicRegKind::Irq),
+            _ => None,
+        }
+    }
+
+    // =========================================================================
+    // SECTION — IRQ (PORT OF: viciisc/vicii-irq.c).
+    // =========================================================================
+
+    /// PORT OF: vicii-irq.c:36 vicii_irq_set_line. Recompute irq_status bit7 +
+    /// the output line level (irq_line) from irq_status & regs[0x1a]. The
+    /// `maincpu_set_irq` host call is replaced by latching `irq_line`, which the
+    /// full-machine run loop samples into the CPU's INT_SRC_VIC each boundary.
+    fn vicii_irq_set_line(&mut self) {
+        if self.irq_status & self.regs[R_IRQ_MASK as usize] != 0 {
+            self.irq_status |= 0x80;
+            self.irq_line = true;
+        } else {
+            self.irq_status &= 0x7f;
+            self.irq_line = false;
+        }
+    }
+
+    /// PORT OF: vicii-irq.c:58 vicii_irq_raster_set (clk arg dropped — the line
+    /// level is sampled at the boundary, not stamped at a sub-cycle clk).
+    fn vicii_irq_raster_set(&mut self) {
+        self.irq_status |= IRQ_RASTER;
+        self.vicii_irq_set_line();
+    }
+
+    /// PORT OF: vicii-irq.c:70 vicii_irq_sbcoll_set.
+    fn vicii_irq_sbcoll_set(&mut self) {
+        self.irq_status |= IRQ_SBCOLL;
+        self.vicii_irq_set_line();
+    }
+    /// PORT OF: vicii-irq.c:82 vicii_irq_sscoll_set.
+    fn vicii_irq_sscoll_set(&mut self) {
+        self.irq_status |= IRQ_SSCOLL;
+        self.vicii_irq_set_line();
+    }
+
+    /// PORT OF: vicii-irq.c:116 vicii_irq_raster_trigger — fire on the
+    /// non-match→match edge if the raster latch is not already set.
+    fn vicii_irq_raster_trigger(&mut self) {
+        if self.irq_status & IRQ_RASTER == 0 {
+            self.vicii_irq_raster_set();
+        }
+    }
+
+    // =========================================================================
+    // SECTION — the per-cycle helpers (PORT OF: viciisc/vicii-cycle.c).
+    // =========================================================================
+
+    /// PORT OF: vicii-cycle.c:51 check_badline.
+    #[inline]
+    fn check_badline(&mut self) {
+        if (self.raster_line & 7) == self.ysmooth as u16 {
+            self.bad_line = true;
+            self.idle_state = false;
+        } else {
+            self.bad_line = false;
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:62 check_sprite_display.
+    #[inline]
+    fn check_sprite_display(&mut self) {
+        let enable = self.regs[R_SP_ENABLE as usize];
+        let mut b = 1u8;
+        for i in 0..NUM_SPRITES {
+            let y = self.regs[i * 2 + 1];
+            self.sprite[i].mc = self.sprite[i].mcbase;
+            if self.sprite_dma & b != 0 {
+                if (enable & b != 0) && (y as u16 == (self.raster_line & 0xff)) {
+                    self.sprite_display_bits |= b;
+                }
+            } else {
+                self.sprite_display_bits &= !b;
+            }
+            b <<= 1;
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:81 sprite_mcbase_update — memptr==63 turn-off.
+    #[inline]
+    fn sprite_mcbase_update(&mut self) {
+        for i in 0..NUM_SPRITES {
+            if self.sprite[i].exp_flop != 0 {
+                self.sprite[i].mcbase = self.sprite[i].mc;
+                if self.sprite[i].mcbase == 63 {
+                    self.sprite_dma &= !(1u8 << i);
+                }
+            }
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:95 check_exp — toggle the Y-expansion flip-flop.
+    #[inline]
+    fn check_exp(&mut self) {
+        let y_exp = self.regs[R_SP_Y_EXP as usize];
+        let mut b = 1u8;
+        for i in 0..NUM_SPRITES {
+            if (self.sprite_dma & b != 0) && (y_exp & b != 0) {
+                self.sprite[i].exp_flop ^= 1;
+            }
+            b <<= 1;
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:108 turn_sprite_dma_on.
+    #[inline]
+    fn turn_sprite_dma_on(&mut self, i: usize) {
+        self.sprite_dma |= 1u8 << i;
+        self.sprite[i].mcbase = 0;
+        self.sprite[i].exp_flop = 1;
+    }
+
+    /// PORT OF: vicii-cycle.c:115 check_sprite_dma.
+    #[inline]
+    fn check_sprite_dma(&mut self) {
+        let enable = self.regs[R_SP_ENABLE as usize];
+        let mut b = 1u8;
+        for i in 0..NUM_SPRITES {
+            let y = self.regs[i * 2 + 1];
+            if (enable & b != 0)
+                && (y as u16 == (self.raster_line & 0xff))
+                && (self.sprite_dma & b == 0)
+            {
+                self.turn_sprite_dma_on(i);
+            }
+            b <<= 1;
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:202 vicii_cycle_start_of_frame.
+    #[inline]
+    fn vicii_cycle_start_of_frame(&mut self) {
+        self.start_of_frame = false;
+        self.raster_line = 0;
+        self.refresh_counter = 0xff;
+        self.allow_bad_lines = false;
+        self.vcbase = 0;
+        self.vc = 0;
+        self.frame = self.frame.wrapping_add(1);
+        // Publish the just-completed frame: swap the accumulator into `displayed`
+        // (O(1) pointer swap). A mid-frame `&self` screenshot reads `displayed`,
+        // the last COMPLETE frame — never a half-drawn `dbuf`. (VICE flushes each
+        // line via vicii_raster_draw_handler; the per-frame swap is the equivalent
+        // publish point for our full-frame accumulator.) The now-stale `dbuf` is
+        // overwritten line-by-line over the next frame.
+        //
+        // Spec 863 — only where the window ends inside the frame. A wrapped window (NTSC)
+        // shows this frame's first lines at the bottom of the picture, so the picture is
+        // complete at its vsync line, not here (see `vicii_cycle_end_of_line`).
+        if !self.window.wraps() {
+            std::mem::swap(&mut self.dbuf, &mut self.displayed);
+        }
+        // light_pen.triggered = 0 / retrigger — deferred (light pen not modeled).
+    }
+
+    /// PORT OF: vicii-cycle.c:220 vicii_cycle_end_of_line.
+    #[inline]
+    fn vicii_cycle_end_of_line(&mut self) {
+        // vicii_raster_draw_handler() — the line just drawn is `raster_line`. On a wrapped
+        // window (NTSC) VICE's vsync comes after the last displayed line, not at line 0
+        // (`vicii.c:448-452`: `current_line == last_displayed_line - screen_height + 1`),
+        // and that is where the picture is complete: publish it here.
+        if let Some(vsync) = self.window.vsync_line() {
+            if self.raster_line + 1 == vsync {
+                std::mem::swap(&mut self.dbuf, &mut self.displayed);
+            }
+        }
+        if self.raster_line == self.screen_height - 1 {
+            self.start_of_frame = true;
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:228 vicii_cycle_start_of_line.
+    #[inline]
+    fn vicii_cycle_start_of_line(&mut self) {
+        if (self.raster_line == FIRST_DMA_LINE)
+            && !self.allow_bad_lines
+            && (self.regs[R_CTRL1 as usize] & 0x10 != 0)
+        {
+            self.allow_bad_lines = true;
+        }
+        if self.raster_line == LAST_DMA_LINE {
+            self.allow_bad_lines = false;
+        }
+        self.bad_line = false;
+    }
+
+    /// PORT OF: vicii-cycle.c:244 next_vicii_cycle — raster_cycle++ with wrap.
+    #[inline]
+    fn next_vicii_cycle(&mut self) {
+        self.raster_cycle += 1;
+        if self.raster_cycle == self.cycles_per_line {
+            self.raster_cycle = 0;
+        }
+    }
+
+    // =========================================================================
+    // SECTION — the cycle engine (PORT OF: vicii-cycle.c:374 vicii_cycle).
+    // =========================================================================
+
+    /// PORT OF: vicii-cycle.c:374 `int vicii_cycle(void)`. Advance the VIC by
+    /// exactly one master cycle; return BA-low for this cycle (true = VIC owns
+    /// the bus). This is `tick()` — the per-CLK hook the SC CPU calls from
+    /// CLK_INC (c64cpusc.c:47-51). Control flow + ordering mirror the C 1:1.
+    ///
+    /// (The Phi1/Phi2 graphics+sprite FETCHES that VICE performs here — the
+    /// vicii_fetch_* calls and the pixel `vicii_draw_cycle` — are the separate
+    /// renderer step and are intentionally omitted; their internal-counter side
+    /// effects that the TIMING depends on (vc/rc/vmli/idle, sprite mc) ARE
+    /// reproduced inline below. Memory-content fetches feed only the pixel
+    /// pipeline, which render.rs handles statically.)
+    #[inline]
+    pub fn tick(&mut self, mem: &VicMemView) -> bool {
+        self.tick_g::<false>(mem)
+    }
+
+    /// `tick`, with the Spec 859 recorder hooks compiled in when `REC`. The live path is
+    /// `tick` = `tick_g::<false>`, which contains no recorder code at all; only a run whose
+    /// observer records (`Observer::RECORDS_VIC`) instantiates the other one.
+    pub fn tick_g<const REC: bool>(&mut self, mem: &VicMemView) -> bool {
+        let mut ba_low = false;
+        // BUG-061 — the Ultimate's post-reset hold counts PHI2, and this is one.
+        if self.u64_reset_hold > 0 {
+            self.u64_reset_hold -= 1;
+        }
+
+        // Spec 843 D1 — record what drives THIS line, at its first cycle, before any
+        // of it is used. `mem.vbank` is only in scope here (it lives on the borrowed
+        // view, not on the VIC), which is why the record is taken in `tick` and not
+        // in `vicii_draw_cycle` where the line number is reset.
+        if self.raster_cycle == 0 {
+            let line = self.raster_line as usize;
+            if line < self.provenance.len() {
+                self.provenance[line] = ProvenanceRegs {
+                    d011: self.regs[R_CTRL1 as usize],
+                    d016: self.regs[R_CTRL2 as usize],
+                    d018: self.regs[R_MEM_PTR as usize],
+                    vbank: mem.vbank,
+                    captured: true,
+                };
+            }
+        }
+
+        // vicii-cycle.c:383 vicii_fetch_sprites — Phi2 sprite data fetch for the
+        // PREVIOUS cycle's flags. Reads sprite data via mem.vic_phi2 into
+        // sprite[i].data (consumed by the draw pipeline) AND advances the `mc`
+        // counter (TIMING-RELEVANT: `mc` drives mcbase==63 → sprite DMA turn-off →
+        // ends the sprite BA-low window). PORT OF: vicii-fetch.c:309
+        // vicii_fetch_sprites (sprite_dma_cycle_0 / sprite_dma_cycle_2).
+        self.vicii_fetch_sprites(self.cycle_flags, mem);
+
+        // ── End of Phi2 ──
+
+        // vicii-cycle.c:392 — Next cycle + load cycle_flags.
+        self.next_vicii_cycle();
+        self.cycle_flags = self.cycle_table[self.raster_cycle as usize];
+
+        // Spec 859 — the Φ1 access is taken before the fetch advances VC/VMLI/MC.
+        if REC && self.line_rec.is_some() {
+            self.line_rec_phi1();
+        }
+
+        // ── Start of Phi1 ──
+        // vicii-cycle.c:402 cycle_phi1_fetch — the Phi1 fetch: graphics/idle-gfx
+        // (→ gbuf), sprite pointer/data (→ sprite[].pointer/data), refresh, or idle.
+        // Stores last_read_phi1 + advances the vc/vmli/mc counters.
+        self.cycle_phi1_fetch(self.cycle_flags, mem);
+
+        // vicii-cycle.c:405 check_hborder.
+        self.check_hborder();
+
+        // vicii-cycle.c:407-408 — capture "collisions were zero" BEFORE the draw
+        // cycle accumulates new collision bits (the 0→nonzero edge detect).
+        let can_sprite_sprite = self.sprite_sprite_collisions == 0;
+        let can_sprite_background = self.sprite_background_collisions == 0;
+
+        // vicii-cycle.c:411 vicii_draw_cycle — the per-cycle pixel + sprite draw.
+        // Writes 8 pixels into `dbuf` and accumulates sprite collisions. Uses
+        // `cycle_flags_pipe` (the PREVIOUS cycle's flags) — the draw lags one cycle.
+        crate::vic_draw::vicii_draw_cycle(self);
+
+        // vicii-cycle.c:414-425 — collision-register clear initiated by $d01e/$d01f.
+        match self.clear_collisions {
+            0x1e => {
+                self.sprite_sprite_collisions = 0;
+                self.clear_collisions = 0;
+            }
+            0x1f => {
+                self.sprite_background_collisions = 0;
+                self.clear_collisions = 0;
+            }
+            _ => {}
+        }
+        // vicii-cycle.c:427-433 — collision IRQs fire on the 0→nonzero edge the
+        // draw cycle just produced (was dead in the static port; now LIVE because
+        // draw_sprites accumulates the collision bits above).
+        if can_sprite_sprite && self.sprite_sprite_collisions != 0 {
+            self.vicii_irq_sscoll_set();
+        }
+        if can_sprite_background && self.sprite_background_collisions != 0 {
+            self.vicii_irq_sbcoll_set();
+        }
+
+        // ── End of Phi1 / Start of Phi2 ──
+
+        // vicii-cycle.c:448-451 — end-of-line / start-of-line at PAL cycle 1.
+        if self.raster_cycle == cycle_index(1) {
+            self.vicii_cycle_end_of_line();
+            self.vicii_cycle_start_of_line();
+        }
+
+        // vicii-cycle.c:453-461 — start-of-frame (cycle 2) or raster_line++ (cycle 1).
+        if self.start_of_frame {
+            if self.raster_cycle == cycle_index(2) {
+                self.vicii_cycle_start_of_frame();
+            }
+        } else if self.raster_cycle == cycle_index(1) {
+            self.raster_line += 1;
+        }
+
+        // vicii-cycle.c:467-474 — raster-compare IRQ edge.
+        if self.raster_line == self.raster_irq_line {
+            if !self.raster_irq_triggered {
+                self.vicii_irq_raster_trigger();
+                self.raster_irq_triggered = true;
+            }
+        } else {
+            self.raster_irq_triggered = false;
+        }
+
+        // vicii-cycle.c:477-482 — vertical border flags.
+        self.check_vborder_top(self.raster_line);
+        self.check_vborder_bottom(self.raster_line);
+        if self.raster_cycle == cycle_index(1) {
+            self.vborder = self.set_vborder;
+        }
+
+        // ── Sprite logic ──
+        // vicii-cycle.c:492 sprite_mcbase_update (cycle 16).
+        if cycle_is_update_mcbase(self.cycle_flags) {
+            self.sprite_mcbase_update();
+        }
+        // vicii-cycle.c:499 check_sprite_dma (cycles 55 & 56).
+        if cycle_is_check_spr_dma(self.cycle_flags) {
+            self.check_sprite_dma();
+        }
+        // vicii-cycle.c:505 check_exp (cycle 56).
+        if cycle_is_check_spr_exp(self.cycle_flags) {
+            self.check_exp();
+        }
+        // vicii-cycle.c:511 check_sprite_display (cycle 58).
+        if cycle_is_check_spr_disp(self.cycle_flags) {
+            self.check_sprite_display();
+        }
+
+        // ── Graphics logic ──
+        // vicii-cycle.c:524-526 — DEN on first DMA line.
+        if (self.raster_line == FIRST_DMA_LINE) && !self.allow_bad_lines {
+            self.allow_bad_lines = self.regs[R_CTRL1 as usize] & 0x10 != 0;
+        }
+        // vicii-cycle.c:529-531 — badline check.
+        if self.allow_bad_lines {
+            self.check_badline();
+        }
+        // vicii-cycle.c:534-538 VSP bug — disabled (vsp_bug_enabled=0), no effect.
+
+        // vicii-cycle.c:543-549 — Update VC (cycle 14).
+        if cycle_is_update_vc(self.cycle_flags) {
+            self.vc = self.vcbase;
+            self.vmli = 0;
+            if self.bad_line {
+                self.rc = 0;
+            }
+        }
+        // vicii-cycle.c:553-564 — Update RC (cycle 58).
+        if cycle_is_update_rc(self.cycle_flags) {
+            if self.rc == 7 {
+                self.idle_state = true;
+                self.vcbase = self.vc;
+            }
+            if !self.idle_state || self.bad_line {
+                self.rc = (self.rc + 1) & 0x7;
+                self.idle_state = false;
+            }
+        }
+
+        // ── BA logic ── (vicii-cycle.c:572-591)
+        // Matrix fetch BA.
+        if self.bad_line && cycle_is_fetch_ba(self.cycle_flags) {
+            ba_low = true;
+        }
+        // Sprite Phi2 fetch BA.
+        if self.sprite_dma & cycle_get_sprite_ba_mask(self.cycle_flags) != 0 {
+            ba_low = true;
+        }
+        // Prefetch-cycle countdown (gates Phi2 accesses; does NOT gate ba_low).
+        if ba_low {
+            if self.prefetch_cycles != 0 {
+                self.prefetch_cycles -= 1;
+            }
+        } else {
+            self.prefetch_cycles = 3 + 1;
+        }
+
+        // vicii-cycle.c:595-602 — Matrix fetch (Phi2 c-access → vbuf[vmli]/cbuf[vmli]).
+        // Gated by bad_line && cycle_may_fetch_c. Reads screen RAM via mem.vic_phi2
+        // and colour RAM via mem.color_ram.
+        if self.bad_line && cycle_may_fetch_c(self.cycle_flags) {
+            self.vicii_fetch_matrix(mem);
+        }
+
+        // vicii-cycle.c:605 — clear internal Phi2 bus.
+        self.last_bus_phi2 = 0xff;
+        // vicii-cycle.c:608 — delay video mode by one cycle.
+        self.reg11_delay = self.regs[R_CTRL1 as usize];
+
+        // Latch BA-low for the next check_ba (= CLK_INC: maincpu_ba_low_flags
+        // |= vicii_cycle()). Set-only on true (CLK_INC clears the VICII bit
+        // first via `&= ~MAINCPU_BA_LOW_VICII`, then OR's this).
+        self.ba_low_flag = ba_low;
+        if REC && self.line_rec.is_some() {
+            self.line_rec_cycle(ba_low, mem.vbank);
+        }
+        ba_low
+    }
+
+    // =========================================================================
+    // SECTION — Spec 859 recorder hooks. Cold: reached only while a scratch replay
+    // records. They read the chip; they change nothing it computes.
+    // =========================================================================
+
+    /// Before the Φ1 fetch: what it is about to read, and — for the cycle before — whether
+    /// the Φ2 sprite fetch at the top of this tick took the bus.
+    #[cold]
+    #[inline(never)]
+    fn line_rec_phi1(&mut self) {
+        let flags = self.cycle_flags;
+        let access = self.phi1_access(flags);
+        let sprite_dma = self.sprite_dma;
+        let blocked = self.prefetch_cycles != 0;
+        let Some(rec) = self.line_rec.as_deref_mut() else { return };
+        // vicii_fetch_sprites ran on the PREVIOUS cycle's flags: that was its Φ2.
+        let prev = rec.prev_flags;
+        if cycle_is_sprite_ptr_dma0(prev) || cycle_is_sprite_dma1_dma2(prev) {
+            let i = cycle_get_sprite_num(prev);
+            if sprite_dma & (1 << i) != 0 {
+                if let Some(last) = rec.cycles.last_mut() {
+                    last.phi2 = crate::vic_line_trace::Phi2Kind::SpriteData;
+                    last.phi2_sprite = i as u8;
+                    last.phi2_blocked = blocked;
+                }
+            }
+        }
+        rec.prev_flags = flags;
+        rec.pending_phi1 = access;
+    }
+
+    /// The Φ1 access `cycle_phi1_fetch` makes for `flags`, with the address formed the way
+    /// the fetch forms it (the same helpers).
+    fn phi1_access(&self, flags: u32) -> crate::vic_line_trace::Phi1Access {
+        use crate::vic_line_trace::{Phi1Access, Phi1Kind};
+        if cycle_is_fetch_g(flags) {
+            return if !self.idle_state {
+                let m = (self.vmli as usize).min(39);
+                Phi1Access {
+                    kind: Phi1Kind::Graphics,
+                    sprite: 0,
+                    addr: self.graphics_fetch_addr(),
+                    g_vc: self.vc,
+                    g_char: self.vbuf[m],
+                    g_color: self.cbuf[m],
+                }
+            } else {
+                Phi1Access { kind: Phi1Kind::IdleGraphics, sprite: 0, addr: self.idle_gfx_addr(), ..Default::default() }
+            };
+        }
+        if cycle_is_sprite_ptr_dma0(flags) {
+            let s = cycle_get_sprite_num(flags);
+            return Phi1Access { kind: Phi1Kind::SpritePointer, sprite: s as u8, addr: self.v_fetch_addr(0x3f8 + s as u16), ..Default::default() };
+        }
+        if cycle_is_sprite_dma1_dma2(flags) {
+            let s = cycle_get_sprite_num(flags);
+            return if self.sprite_dma & (1 << s) != 0 {
+                let addr = ((self.sprite[s].pointer as u16) << 6).wrapping_add(self.sprite[s].mc as u16);
+                Phi1Access { kind: Phi1Kind::SpriteData, sprite: s as u8, addr, ..Default::default() }
+            } else {
+                Phi1Access { kind: Phi1Kind::Idle, sprite: s as u8, addr: 0x3fff, ..Default::default() }
+            };
+        }
+        if cycle_is_refresh(flags) {
+            return Phi1Access { kind: Phi1Kind::Refresh, sprite: 0, addr: 0x3f00u16.wrapping_add(self.refresh_counter as u16), ..Default::default() };
+        }
+        Phi1Access { kind: Phi1Kind::Idle, sprite: 0, addr: 0x3fff, ..Default::default() }
+    }
+
+    /// End of the tick: the whole cycle.
+    #[cold]
+    #[inline(never)]
+    fn line_rec_cycle(&mut self, ba_low: bool, vbank: u16) {
+        use crate::vic_line_trace::{Phi2Kind, VicCycle};
+        let Some(p1) = self.line_rec.as_deref().map(|r| r.pending_phi1) else { return };
+        let abs = |a: u16| a.wrapping_add(vbank);
+        let c_access = self.bad_line && cycle_may_fetch_c(self.cycle_flags);
+        let line = if self.raster_cycle == 0 && self.start_of_frame { 0 } else { self.raster_line };
+        let mut mc = [0u8; NUM_SPRITES];
+        let mut mcbase = [0u8; NUM_SPRITES];
+        for i in 0..NUM_SPRITES {
+            mc[i] = self.sprite[i].mc;
+            mcbase[i] = self.sprite[i].mcbase;
+        }
+        let rec = VicCycle {
+            clk: 0,
+            line,
+            raster: self.raster_line,
+            cycle: self.raster_cycle as u8 + 1,
+            phi1: p1.kind,
+            phi1_sprite: p1.sprite,
+            phi1_addr: abs(p1.addr),
+            phi1_rom: (abs(p1.addr) & 0x7000) == 0x1000,
+            phi1_data: self.last_read_phi1,
+            phi2: if c_access { Phi2Kind::Matrix } else { Phi2Kind::Cpu },
+            phi2_sprite: 0,
+            phi2_addr: if c_access { abs(self.v_fetch_addr(self.vc)) } else { 0 },
+            phi2_data: if c_access { self.vbuf[self.vmli as usize % 40] } else { 0 },
+            phi2_blocked: c_access && self.prefetch_cycles != 0,
+            ba: ba_low,
+            aec: ba_low && self.prefetch_cycles == 0,
+            bad_line: self.bad_line,
+            idle: self.idle_state,
+            vc: self.vc,
+            vcbase: self.vcbase,
+            rc: self.rc,
+            vmli: self.vmli,
+            sprite_dma: self.sprite_dma,
+            sprite_display: self.sprite_display_bits,
+            mc,
+            mcbase,
+            main_border: self.main_border,
+            vertical_border: self.vborder,
+            fb_x: self.dbuf_offset.saturating_sub(8) as u16,
+            fb_line: self.dbuf_line as u16,
+            d011: self.regs[R_CTRL1 as usize],
+            d016: self.regs[R_CTRL2 as usize],
+            d018: self.regs[R_MEM_PTR as usize],
+            vbank,
+            g_vc: p1.g_vc,
+            g_char: p1.g_char,
+            g_color: p1.g_color,
+        };
+        // Spec 860 — the line's sprite registers, once per line (cycle 20: inside the
+        // display fetches, after every pointer fetch that serves the line — Spec 863 reads
+        // it from the table's flags).
+        let sprites = (self.raster_cycle + 1 == self.geom.sample_cycle()).then(|| {
+            let mut x = [0u16; NUM_SPRITES];
+            let mut pointer = [0u8; NUM_SPRITES];
+            let mut color = [0u8; NUM_SPRITES];
+            for i in 0..NUM_SPRITES {
+                x[i] = self.regs[2 * i] as u16 | (((self.regs[0x10] >> i) & 1) as u16) << 8;
+                pointer[i] = self.sprite[i].pointer;
+                color[i] = self.regs[0x27 + i] & 0x0f;
+            }
+            crate::vic_line_trace::LineSprites {
+                clk: 0,
+                line,
+                x,
+                pointer,
+                color,
+                mc: self.regs[0x1c],
+                x_expand: self.regs[0x1d],
+                y_expand: self.regs[0x17],
+            }
+        });
+        if let Some(r) = self.line_rec.as_deref_mut() {
+            r.push(rec);
+            if let Some(mut ls) = sprites {
+                ls.clk = r.clk;
+                r.lines.push(ls);
+            }
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:165 check_vborder_top.
+    #[inline]
+    fn check_vborder_top(&mut self, line: u16) {
+        let rsel = self.regs[R_CTRL1 as usize] & 0x08;
+        let start = if rsel != 0 { 0x33 } else { 0x37 };
+        if (line == start) && (self.regs[R_CTRL1 as usize] & 0x10 != 0) {
+            self.vborder = false;
+            self.set_vborder = false;
+        }
+    }
+    /// PORT OF: vicii-cycle.c:175 check_vborder_bottom.
+    #[inline]
+    fn check_vborder_bottom(&mut self, line: u16) {
+        let rsel = self.regs[R_CTRL1 as usize] & 0x08;
+        let stop = if rsel != 0 { 0xfb } else { 0xf7 };
+        if line == stop {
+            self.set_vborder = true;
+        }
+    }
+    // =========================================================================
+    // SECTION — VIC memory fetches (PORT OF: viciisc/vicii-fetch.c).
+    // Each fetch reads through the `VicMemView` and stores into the chip's pixel-
+    // pipeline buffers (gbuf/vbuf/cbuf/sprite[].data), exactly as VICE. The `mc` /
+    // `vc` / `vmli` counter advances (which the timing also depends on) are folded
+    // in verbatim.
+    // =========================================================================
+
+    /// PORT OF: vicii-fetch.c:158 v_fetch_addr — `((regs[0x18] & 0xf0) << 6) + offset`.
+    #[inline]
+    fn v_fetch_addr(&self, offset: u16) -> u16 {
+        ((self.regs[R_MEM_PTR as usize] as u16 & 0xf0) << 6).wrapping_add(offset)
+    }
+
+    /// PORT OF: vicii-fetch.c:163 g_fetch_addr — the g-access graphics address for
+    /// the given (delayed) video mode. BMM uses vc<<3|rc + $D018 bit3; text uses
+    /// vbuf[vmli]<<3|rc + $D018 bits1-3; ECM masks `& 0x39ff`.
+    #[inline]
+    fn g_fetch_addr(&self, mode: u8) -> u16 {
+        let mut a: u16;
+        if mode & 0x20 != 0 {
+            // BMM.
+            a = (self.vc << 3) | self.rc as u16;
+            a |= (self.regs[R_MEM_PTR as usize] as u16 & 0x8) << 10;
+        } else {
+            a = ((self.vbuf[self.vmli as usize] as u16) << 3) | self.rc as u16;
+            a |= (self.regs[R_MEM_PTR as usize] as u16 & 0xe) << 10;
+        }
+        if mode & 0x40 != 0 {
+            // ECM.
+            a &= 0x39ff;
+        }
+        a
+    }
+
+    /// PORT OF: vicii-fetch.c:184 is_char_rom — whether the (bank-relative) g-fetch
+    /// address hits the CHARGEN overlay (mask $7000 / value $1000), per the C64
+    /// wiring. Used only by the 6569 fetch-magic in vicii_fetch_graphics.
+    #[inline]
+    fn is_char_rom(addr: u16) -> bool {
+        (addr & 0x7000) == 0x1000
+    }
+
+    /// PORT OF: vicii-fetch.c:309 vicii_fetch_sprites — the Phi2 sprite-DMA fetch.
+    /// sprite_dma_cycle_0 shifts a byte into bits 16-23 of sprite[i].data;
+    /// sprite_dma_cycle_2 into bits 0-7. Reads `(pointer<<6)+mc` via mem.vic_phi2
+    /// unless prefetching, and advances `mc` (drives mcbase==63 → DMA turn-off).
+    #[inline]
+    fn vicii_fetch_sprites(&mut self, cycle_flags: u32, mem: &VicMemView) {
+        if cycle_is_sprite_ptr_dma0(cycle_flags) {
+            let i = cycle_get_sprite_num(cycle_flags);
+            self.sprite_dma_cycle_0(i, mem);
+        }
+        if cycle_is_sprite_dma1_dma2(cycle_flags) {
+            let i = cycle_get_sprite_num(cycle_flags);
+            self.sprite_dma_cycle_2(i, mem);
+        }
+    }
+
+    /// PORT OF: vicii-fetch.c:110 sprite_dma_cycle_0.
+    #[inline]
+    fn sprite_dma_cycle_0(&mut self, i: usize, mem: &VicMemView) {
+        let mut sprdata = self.last_bus_phi2 as u32;
+        if self.sprite_dma & (1 << i) != 0 {
+            if self.prefetch_cycles == 0 {
+                let addr =
+                    ((self.sprite[i].pointer as u16) << 6).wrapping_add(self.sprite[i].mc as u16);
+                sprdata = mem.vic_phi2(addr) as u32;
+            }
+            self.sprite[i].mc = (self.sprite[i].mc + 1) & 0x3f;
+        }
+        self.sprite[i].data &= 0x00ffff;
+        self.sprite[i].data |= sprdata << 16;
+    }
+
+    /// PORT OF: vicii-fetch.c:133 sprite_dma_cycle_2.
+    #[inline]
+    fn sprite_dma_cycle_2(&mut self, i: usize, mem: &VicMemView) {
+        let mut sprdata = self.last_bus_phi2 as u32;
+        if self.sprite_dma & (1 << i) != 0 {
+            if self.prefetch_cycles == 0 {
+                let addr =
+                    ((self.sprite[i].pointer as u16) << 6).wrapping_add(self.sprite[i].mc as u16);
+                sprdata = mem.vic_phi2(addr) as u32;
+            }
+            self.sprite[i].mc = (self.sprite[i].mc + 1) & 0x3f;
+        }
+        self.sprite[i].data &= 0xffff00;
+        self.sprite[i].data |= sprdata;
+    }
+
+    /// PORT OF: vicii-cycle.c:130 cycle_phi1_fetch — dispatch the Phi1 fetch by
+    /// cycle type. Stores last_read_phi1.
+    #[inline]
+    fn cycle_phi1_fetch(&mut self, cycle_flags: u32, mem: &VicMemView) {
+        if cycle_is_fetch_g(cycle_flags) {
+            self.last_read_phi1 = if !self.idle_state {
+                self.vicii_fetch_graphics(mem)
+            } else {
+                self.vicii_fetch_idle_gfx(mem)
+            };
+            return;
+        }
+        if cycle_is_sprite_ptr_dma0(cycle_flags) {
+            let s = cycle_get_sprite_num(cycle_flags);
+            self.last_read_phi1 = self.vicii_fetch_sprite_pointer(s, mem);
+            return;
+        }
+        if cycle_is_sprite_dma1_dma2(cycle_flags) {
+            let s = cycle_get_sprite_num(cycle_flags);
+            self.last_read_phi1 = self.vicii_fetch_sprite_dma_1(s, mem);
+            return;
+        }
+        if cycle_is_refresh(cycle_flags) {
+            self.last_read_phi1 = self.vicii_fetch_refresh(mem);
+            return;
+        }
+        self.last_read_phi1 = mem.vic_phi1(0x3fff); // vicii_fetch_idle.
+    }
+
+    /// PORT OF: vicii-fetch.c:203 vicii_fetch_refresh.
+    #[inline]
+    fn vicii_fetch_refresh(&mut self, mem: &VicMemView) -> u8 {
+        let addr = 0x3f00u16.wrapping_add(self.refresh_counter as u16);
+        self.refresh_counter = self.refresh_counter.wrapping_sub(1);
+        mem.vic_phi1(addr)
+    }
+
+    /// PORT OF: vicii-fetch.c:213 vicii_fetch_idle_gfx — idle-state g-fetch: $39FF
+    /// when ECM (reg11 bit6) else $3FFF. Stores gbuf.
+    #[inline]
+    fn vicii_fetch_idle_gfx(&mut self, mem: &VicMemView) -> u8 {
+        let data = mem.vic_phi1(self.idle_gfx_addr());
+        self.gbuf = data;
+        data
+    }
+
+    /// The idle-state g-access address: `$39FF` with ECM, else `$3FFF`. Shared by the fetch
+    /// and the Spec 859 recorder.
+    #[inline]
+    fn idle_gfx_addr(&self) -> u16 {
+        let reg11 = if self.color_latency {
+            self.regs[R_CTRL1 as usize]
+        } else {
+            self.reg11_delay
+        };
+        if reg11 & 0x40 != 0 {
+            0x39ff
+        } else {
+            0x3fff
+        }
+    }
+
+    /// PORT OF: vicii-fetch.c:234 vicii_fetch_graphics — the display-state g-access
+    /// incl. the 6569 fetch-magic (RAM→ROM address latch). Stores gbuf, advances
+    /// vmli + vc.
+    #[inline]
+    fn vicii_fetch_graphics(&mut self, mem: &VicMemView) -> u8 {
+        let data = mem.vic_phi1(self.graphics_fetch_addr());
+        self.gbuf = data;
+        self.vmli += 1;
+        self.vc = (self.vc + 1) & 0x3ff;
+        data
+    }
+
+    /// The display-state g-access address, 6569 fetch magic included. Shared by the fetch
+    /// and the Spec 859 recorder.
+    #[inline]
+    fn graphics_fetch_addr(&self) -> u16 {
+        let mut addr: u16;
+        if self.color_latency {
+            let mode = self.regs[R_CTRL1 as usize] | (self.reg11_delay & 0x20);
+            addr = self.g_fetch_addr(mode);
+            if (self.regs[R_CTRL1 as usize] ^ self.reg11_delay) & 0x20 != 0 {
+                // 6569 fetch magic: on a RAM→(char)ROM transition the LSB latches
+                // from the previous mode + the upper bits from the current mode.
+                let addr_from = self.g_fetch_addr(self.reg11_delay);
+                let addr_to = self.g_fetch_addr(self.regs[R_CTRL1 as usize]);
+                if !Self::is_char_rom(addr_from) && Self::is_char_rom(addr_to) {
+                    addr = (addr_from & 0xff) | (addr_to & 0x3f00);
+                }
+            }
+        } else {
+            addr = self.g_fetch_addr(self.reg11_delay);
+        }
+        addr
+    }
+
+    /// PORT OF: vicii-fetch.c:275 vicii_fetch_sprite_pointer.
+    #[inline]
+    fn vicii_fetch_sprite_pointer(&mut self, i: usize, mem: &VicMemView) -> u8 {
+        let addr = self.v_fetch_addr(0x3f8 + i as u16);
+        self.sprite[i].pointer = mem.vic_phi1(addr);
+        self.sprite[i].pointer
+    }
+
+    /// PORT OF: vicii-fetch.c:282 vicii_fetch_sprite_dma_1 — Phi1 sprite data fetch
+    /// into bits 8-15 of sprite[i].data (+ mc advance); idle fetch when DMA off.
+    #[inline]
+    fn vicii_fetch_sprite_dma_1(&mut self, i: usize, mem: &VicMemView) -> u8 {
+        let sprdata: u32;
+        if self.sprite_dma & (1 << i) != 0 {
+            let addr =
+                ((self.sprite[i].pointer as u16) << 6).wrapping_add(self.sprite[i].mc as u16);
+            sprdata = mem.vic_phi1(addr) as u32;
+            self.sprite[i].mc = (self.sprite[i].mc + 1) & 0x3f;
+        } else {
+            sprdata = mem.vic_phi1(0x3fff) as u32; // vicii_fetch_idle.
+        }
+        self.sprite[i].data &= 0xff00ff;
+        self.sprite[i].data |= sprdata << 8;
+        sprdata as u8
+    }
+
+    /// PORT OF: vicii-fetch.c:192 vicii_fetch_matrix — the Phi2 c-access. Stores
+    /// vbuf[vmli] (screen RAM via vic_phi2) + cbuf[vmli] (colour RAM via color_ram).
+    /// Prefetch path writes vbuf=0xff (the reg_pc host index used by VICE for the
+    /// prefetch cbuf is not available to the chip; the prefetch pixels never reach
+    /// the visible window, so cbuf is read from color_ram(vc) here — unobservable).
+    #[inline]
+    fn vicii_fetch_matrix(&mut self, mem: &VicMemView) {
+        let vmli = self.vmli as usize;
+        if self.prefetch_cycles != 0 {
+            self.vbuf[vmli] = 0xff;
+            self.cbuf[vmli] = mem.color_ram(self.vc);
+        } else {
+            self.vbuf[vmli] = mem.vic_phi2(self.v_fetch_addr(self.vc));
+            self.cbuf[vmli] = mem.color_ram(self.vc);
+        }
+    }
+
+    /// PORT OF: vicii-cycle.c:184 check_hborder.
+    #[inline]
+    fn check_hborder(&mut self) {
+        let csel = self.regs[R_CTRL2 as usize] & 0x08 != 0;
+        if cycle_is_check_border_l(self.cycle_flags, csel) {
+            self.check_vborder_bottom(self.raster_line);
+            self.vborder = self.set_vborder;
+            if !self.vborder {
+                self.main_border = false;
+            }
+        }
+        if cycle_is_check_border_r(self.cycle_flags, csel) {
+            self.main_border = true;
+        }
+    }
+
+    // =========================================================================
+    // SECTION — the BA cycle-steal (PORT OF: mainc64cpu.c:194-208 check_ba /
+    // viciisc/vicii-cycle.c:628 vicii_steal_cycles).
+    // =========================================================================
+
+    /// PORT OF: vicii-cycle.c:628 vicii_steal_cycles, invoked by mainc64cpu.c:194
+    /// check_ba when `maincpu_ba_low_flags & MAINCPU_BA_LOW_VICII` is set:
+    /// ```c
+    /// do { maincpu_clk++; ba_low = vicii_cycle(); } while (ba_low);
+    /// ```
+    /// Each iteration is ONE stolen master cycle: `clk++` then `vicii_cycle()`
+    /// (= `tick()`), looping while BA stays low. Returns the stolen count; the
+    /// caller (FullBus::check_ba_before_read) advances the shared clk + CIAs by
+    /// it. Clears the VICII BA-low flag (mainc64cpu.c:119). Returns 0 when BA was
+    /// not low (no steal). This is the EXACT model — no hardcoded window, no
+    /// prefetch-blind over-steal: BA-low is re-sampled from the cycle table each
+    /// `tick()`, so the loop ends precisely when `cycle_is_fetch_ba` (or the
+    /// sprite BA mask) goes false — which is why the badline-stalled
+    /// `STA ($F3),Y` at $E4DD costs 48, not 49.
+    #[inline]
+    pub fn steal_cycles(&mut self, mem: &VicMemView) -> u32 {
+        self.steal_cycles_g::<false>(mem)
+    }
+
+    /// `steal_cycles` over `tick_g::<REC>` (Spec 859).
+    pub fn steal_cycles_g<const REC: bool>(&mut self, mem: &VicMemView) -> u32 {
+        if !self.ba_low_flag {
+            return 0;
+        }
+        self.last_steal_on_bus = 0;
+        let mut stolen: u32 = 0;
+        loop {
+            // VICE order: maincpu_clk++ (the caller folds `stolen` into clk) THEN
+            // vicii_cycle(). Each tick() is one stolen cycle that re-samples BA.
+            let ba = self.tick_g::<REC>(mem);
+            stolen += 1;
+            // Spec 850 — AEC follows BA down three cycles late (`prefetch_cycles`), and
+            // comes back up with it. While it is high the CPU still drives the address.
+            if self.prefetch_cycles != 0 {
+                self.last_steal_on_bus += 1;
+            }
+            if !ba {
+                break;
+            }
+            // Safety cap (a badline window is at most 43 cycles; sprite DMA tail
+            // bounded). Mirrors the TS guard. Never reached in correct operation.
+            if stolen > 64 {
+                break;
+            }
+        }
+        self.ba_low_flag = false;
+        stolen
+    }
+
+    // =========================================================================
+    // SECTION — register R/W (PORT OF: viciisc/vicii-mem.c).
+    // =========================================================================
+
+    /// PORT OF: vicii-mem.c:132 update_raster_line — relatch the 9-bit compare.
+    #[inline]
+    fn update_raster_line(&mut self) {
+        let mut new_line = self.regs[R_RASTER as usize] as u16;
+        new_line |= ((self.regs[R_CTRL1 as usize] & 0x80) as u16) << 1;
+        self.raster_irq_line = new_line;
+    }
+
+    /// PORT OF: vicii-mem.c:334 vicii_store. `addr` is the $D000-offset (masked to
+    /// 6 bits). Reproduces the register side effects timing depends on.
+    pub fn write_reg(&mut self, offset: u8, value: u8) {
+        let addr = offset & 0x3f;
+        // Spec 860 — a store that reached the VIC, for the frame map. Register writes are
+        // rare next to cycles; this test is not on the per-cycle path.
+        if let Some(r) = self.line_rec.as_deref_mut() {
+            r.reg_writes.push((r.clk, addr, value));
+        }
+        // vicii-mem.c:339 — last_bus_phi2 = value.
+        self.last_bus_phi2 = value;
+
+        match addr {
+            // store_sprite_x_position_lsb (vicii-mem.c:92).
+            0x00 | 0x02 | 0x04 | 0x06 | 0x08 | 0x0a | 0x0c | 0x0e => {
+                if value != self.regs[addr as usize] {
+                    self.regs[addr as usize] = value;
+                    let n = (addr >> 1) as usize;
+                    let msb = if self.regs[0x10] & (1 << n) != 0 { 0x100 } else { 0 };
+                    self.sprite[n].x = value as u16 | msb;
+                }
+            }
+            // store_sprite_y_position (vicii-mem.c:108).
+            0x01 | 0x03 | 0x05 | 0x07 | 0x09 | 0x0b | 0x0d | 0x0f => {
+                self.regs[addr as usize] = value;
+            }
+            // store_sprite_x_position_msb (vicii-mem.c:113).
+            0x10 => {
+                if value != self.regs[0x10] {
+                    self.regs[0x10] = value;
+                    let mut b = 0x01u8;
+                    for i in 0..8 {
+                        let msb = if value & b != 0 { 0x100 } else { 0 };
+                        self.sprite[i].x = self.regs[2 * i] as u16 | msb;
+                        b <<= 1;
+                    }
+                }
+            }
+            // d011_store (vicii-mem.c:145).
+            0x11 => {
+                self.ysmooth = value & 0x7;
+                self.regs[0x11] = value;
+                self.update_raster_line();
+            }
+            // d012_store (vicii-mem.c:158).
+            0x12 => {
+                if value != self.regs[0x12] {
+                    self.regs[0x12] = value;
+                    self.update_raster_line();
+                }
+            }
+            // $D013/$D014 light pen — no-op store (vicii-mem.c:255 break).
+            0x13 | 0x14 => {}
+            // d015_store (vicii-mem.c:171).
+            0x15 => self.regs[0x15] = value,
+            // d016_store (vicii-mem.c:176).
+            0x16 => self.regs[0x16] = value,
+            // d017_store (vicii-mem.c:183) — sprite Y-expand + crunch.
+            0x17 => self.d017_store(value),
+            // d018_store (vicii-mem.c:216).
+            0x18 => {
+                if self.regs[0x18] != value {
+                    self.regs[0x18] = value;
+                }
+            }
+            // d019_store (vicii-mem.c:227) — 1-to-clear ACK.
+            0x19 => {
+                self.irq_status &= !((value & 0xf) | 0x80);
+                self.vicii_irq_set_line();
+            }
+            // d01a_store (vicii-mem.c:235) — mask (low nibble).
+            0x1a => {
+                self.regs[0x1a] = value & 0xf;
+                self.vicii_irq_set_line();
+            }
+            // d01b/d01c/d01d (vicii-mem.c:244/251/258).
+            0x1b => self.regs[0x1b] = value,
+            0x1c => self.regs[0x1c] = value,
+            0x1d => self.regs[0x1d] = value,
+            // collision_store (vicii-mem.c:265) — read-only.
+            0x1e | 0x1f => {}
+            // color_reg_store (vicii-mem.c:270) — all $D020-$D02E colour registers
+            // (d020/d021/ext_background/d025/d026/sprite_color). Each writes the
+            // 4-bit value, sets last_color_reg/value (consumed by draw_colors8) AND
+            // eagerly pushes into cregs[] (= vicii_monitor_colreg_store) so the draw
+            // resolves the COL token to the live colour on the next drawn pixel.
+            0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2a | 0x2b
+            | 0x2c | 0x2d | 0x2e => {
+                let v4 = value & 0x0f;
+                self.regs[addr as usize] = v4;
+                self.color_reg_store(addr, v4);
+            }
+            // Spec 815 §2 — d02f_store / d030_store (`vicii-mem.c:960-980`), and
+            // only on the VIC-IIe profile. `fastmode` is STORED, not acted on:
+            // what a set speed bit does to the picture is §3, and it is unbuilt on
+            // purpose until hardware says which of two models is right.
+            0x2f if self.speed_profile == SpeedProfile::C128 => {
+                self.regs[0x2f] = value | 0xf8;
+            }
+            0x30 if self.speed_profile == SpeedProfile::C128 => {
+                self.regs[0x30] = value | 0xfc;
+                self.fastmode = value & 1;
+            }
+            // Spec 851 — the U64's turbo registers, each only with its bit in the
+            // firmware's enable word. `$D031` is speed index | badline timing << 7: bit 7
+            // is not speed, so `$80` (1 MHz, badline timing) is not turbo — 815 read any
+            // non-zero value as engaged.
+            0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
+                self.regs[0x30] = value | 0xfc;
+            }
+            0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
+                self.regs[0x31] = value;
+                self.u64_d031_written = true;
+                // Spec 868 §9 — the write reloads the divider's counter, so the
+                // sub-PHI2 phase restarts at this store.
+                self.u64_d031_written_this_instruction = true;
+            }
+            // default — unused (vicii-mem.c:333 `/* unused */ break`). VICE does
+            // NOT write the reg file here; addr is already masked to 0x3f so all
+            // offsets above $2E are unused (no $D02F-$D03F effect at non-DTV).
+            _ => {}
+        }
+    }
+
+    /// PORT OF: vicii-mem.c:183 d017_store — sprite Y-expand + the sprite-crunch.
+    fn d017_store(&mut self, value: u8) {
+        if value == self.regs[0x17] {
+            return;
+        }
+        let mut b = 0x01u8;
+        for i in 0..NUM_SPRITES {
+            if (value & b == 0) && self.sprite[i].exp_flop == 0 {
+                // sprite crunch.
+                if cycle_is_check_spr_crunch(self.cycle_flags) {
+                    let mc = self.sprite[i].mc;
+                    let mcbase = self.sprite[i].mcbase;
+                    self.sprite[i].mc = (0x2a & (mcbase & mc)) | (0x15 & (mcbase | mc));
+                }
+                self.sprite[i].exp_flop = 1;
+            }
+            b <<= 1;
+        }
+        self.regs[0x17] = value;
+    }
+
+    /// PORT OF: vicii-mem.c:270 color_reg_store + vicii-draw-cycle.c:120
+    /// vicii_monitor_colreg_store. Latches the write for draw_colors8 (last_color
+    /// reg/value, used for the grey-dot + per-cycle resolution) AND eagerly updates
+    /// cregs[addr] so the COL_D02x token resolves to the live colour on the very
+    /// next drawn pixel. `addr` = the $D020-$D02E offset; `v4` = the 4-bit value
+    /// already stored in regs.
+    #[inline]
+    fn color_reg_store(&mut self, addr: u8, v4: u8) {
+        // Spec 868 — a CPU that can write this register more than once per PHI2 cycle
+        // is saying something the single latch below cannot hold. Gated on the U64
+        // profile AND a divider above one, so every C64 and C128 keeps VICE's model
+        // exactly: same code, same order, same bytes.
+        if addr == 0x20 && self.turbo_div > 1 && self.speed_profile == SpeedProfile::U64 {
+            let pixel = SubCycleColour::pixel_for(self.turbo_phase, self.turbo_div);
+            let slots = self.subcycle_colour.get_or_insert(SubCycleColour {
+                reg: addr,
+                // Before the first store this cycle, every pixel still shows what the
+                // register already held.
+                slots: [self.cregs[addr as usize]; 8],
+            });
+            slots.set_from(pixel, v4);
+        }
+
+        self.last_color_reg = addr;
+        self.last_color_value = v4;
+        // vicii_monitor_colreg_store: cregs[reg]=value + draw_last_color_reg/value.
+        self.cregs[addr as usize] = v4;
+        self.draw_last_color_reg = addr;
+        self.draw_last_color_value = v4;
+    }
+
+    /// The value a colour register currently holds ($D020-$D02E, by $D000-offset).
+    ///
+    /// The register file is crate-private because everything inside reaches it directly;
+    /// this is the read door for a caller outside — a gate asserting what the CPU last
+    /// wrote, where the per-pixel slots (Spec 868) deliberately do NOT apply.
+    #[inline]
+    pub fn colour_register(&self, reg: u8) -> u8 {
+        self.cregs[(reg & 0x2f) as usize]
+    }
+
+    /// PORT OF: vicii-mem.c:492 read_raster_y.
+    #[inline]
+    fn read_raster_y(&self) -> u16 {
+        self.raster_line
+    }
+
+    /// PORT OF: vicii-mem.c:562 vicii_read. `offset` is the $D000-offset.
+    pub fn read_reg(&self, offset: u8) -> u8 {
+        let addr = offset & 0x3f;
+        match addr {
+            // Sprite X LSB / Y — straight reg read (vicii-mem.c:566-575).
+            0x00 | 0x02 | 0x04 | 0x06 | 0x08 | 0x0a | 0x0c | 0x0e
+            | 0x01 | 0x03 | 0x05 | 0x07 | 0x09 | 0x0b | 0x0d | 0x0f
+            | 0x10 => self.regs[addr as usize],
+            // d01112_read (vicii-mem.c:501).
+            0x11 => (self.regs[0x11] & 0x7f) | (((self.read_raster_y() & 0x100) >> 1) as u8),
+            0x12 => (self.read_raster_y() & 0xff) as u8,
+            // $D013/$D014 light pen — not modeled, returns 0.
+            0x13 | 0x14 => 0,
+            0x15 => self.regs[0x15],
+            0x16 => self.regs[0x16] | 0xc0,
+            0x17 => self.regs[0x17],
+            0x18 => self.regs[0x18] | 0x01,
+            // d019_read (vicii-mem.c:515) — irq_status | 0x70.
+            0x19 => self.irq_status | 0x70,
+            0x1a => self.regs[0x1a] | 0xf0,
+            0x1b => self.regs[0x1b],
+            0x1c => self.regs[0x1c],
+            0x1d => self.regs[0x1d],
+            // d01e_read / d01f_read (vicii-mem.c:520/537). The read-to-clear has
+            // side effects (clear_collisions + reg reset) handled in read_reg_mut.
+            // For the const read we return the latched collision value | open bits.
+            0x1e => self.sprite_sprite_collisions,
+            0x1f => self.sprite_background_collisions,
+            0x20 => self.regs[0x20] | 0xf0,
+            0x21 | 0x22 | 0x23 | 0x24 => self.regs[addr as usize] | 0xf0,
+            0x25 | 0x26 => self.regs[addr as usize] | 0xf0,
+            0x27 | 0x28 | 0x29 | 0x2a | 0x2b | 0x2c | 0x2d | 0x2e => {
+                self.regs[addr as usize] | 0xf0
+            }
+            // Spec 815 §2 — the probe registers. On the default profile they are
+            // open bus, exactly as a C64's are, and every existing gate stays true.
+            //
+            // PORT OF: `vicii-mem.c:960-980`. The two OR masks ARE the detection: a
+            // release writes $FE and reads both back as $FE, writes $00 and reads
+            // $F8 / $FC — a difference of exactly $04. Nothing else about the
+            // machine has to be true for the probe to answer correctly.
+            0x2f if self.speed_profile == SpeedProfile::C128 => self.regs[0x2f] | 0xf8,
+            0x30 if self.speed_profile == SpeedProfile::C128 => self.regs[0x30] | 0xfc,
+            // The extended speed register: readable (so the type-2 probe resolves)
+            // while $D030 stays open bus, which is what that probe distinguishes on.
+            // Spec 851 — read-back is not documented anywhere open: `$D030` reads bit 0
+            // with VICE's VIC-IIe mask, `$D031` the whole byte. Assumptions, gated.
+            0x30 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x04 != 0 => {
+                self.regs[0x30] | 0xfc
+            }
+            0x31 if self.speed_profile == SpeedProfile::U64 && self.u64_regs_en & 0x01 != 0 => {
+                self.u64_d031()
+            }
+            _ => 0xff,
+        }
+    }
+
+    /// Spec 851 — `$D031` as it reads: the last write, or the preferred speed before one.
+    pub fn u64_d031(&self) -> u8 {
+        if self.u64_d031_written {
+            self.regs[0x31]
+        } else {
+            self.u64_speed_prefer
+        }
+    }
+
+    /// Spec 851 D2 — the speed the Ultimate runs at: (speed index, badline timing).
+    /// `$D031` while its enable bit is set, else the preferred speed; in TurboEnable mode
+    /// `$D030` bit 0 switches between that and 1 MHz. A plain C64 is (0, true).
+    pub fn u64_speed(&self) -> (u8, bool) {
+        if self.speed_profile != SpeedProfile::U64 {
+            return (0, true);
+        }
+        // BUG-061 — inside the post-reset hold the C64 is a 1 MHz 6510, whatever is set.
+        // Afterwards the setting applies as it stands, which IS the last strobe.
+        if self.u64_reset_hold > 0 {
+            return (0, true);
+        }
+        let base = if self.u64_regs_en & 0x01 != 0 { self.u64_d031() } else { self.u64_speed_prefer };
+        let v = if self.u64_regs_en & 0x04 != 0 && self.regs[0x30] & 0x01 == 0 { base & 0x80 } else { base };
+        (v & 0x7f, v & 0x80 != 0)
+    }
+
+    /// Spec 851 — SuperCPU detection at `$D0BC-$D0BF`, only with bit 1 of the enable word.
+    /// A SuperCPU reads `dosext << 7 | ramlink << 6` there (VICE `scpu64mem.c:671-676`);
+    /// neither exists here, so `$00` — not the `$FF` a plain C64's open bus gives.
+    pub fn u64_extra_read(&self, addr: u16) -> Option<u8> {
+        if self.speed_profile == SpeedProfile::U64
+            && self.u64_regs_en & 0x02 != 0
+            && (0xd0bc..=0xd0bf).contains(&addr)
+        {
+            Some(0x00)
+        } else {
+            None
+        }
+    }
+
+    /// PORT OF: vicii-mem.c:520/537 — the read-to-clear collision reads (the
+    /// side-effecting variant the live bus must use for $D01E/$D01F). For all
+    /// other registers it is identical to `read_reg`. `last_bus_phi2` is updated
+    /// (vicii-mem.c:586). Returns the value.
+    pub fn read_reg_mut(&mut self, offset: u8) -> u8 {
+        let addr = offset & 0x3f;
+        let value = match addr {
+            0x1e => {
+                // d01e_read: latch collisions into reg, schedule clear, return.
+                self.regs[0x1e] = self.sprite_sprite_collisions;
+                self.clear_collisions = 0x1e;
+                // also clears the sscoll IRQ source (VICE vicii_irq_sscoll_clear is
+                // NOT called in the SC d01e_read; clear is purely via clear_collisions
+                // on the next cycle). Mirror vicii-mem.c:520 exactly.
+                self.regs[0x1e]
+            }
+            0x1f => {
+                self.regs[0x1f] = self.sprite_background_collisions;
+                self.clear_collisions = 0x1f;
+                self.regs[0x1f]
+            }
+            _ => return self.read_reg(offset),
+        };
+        self.last_bus_phi2 = value;
+        value
+    }
+
+    /// Merge freshly-computed collision masks (from the static pixel renderer,
+    /// `render::render_collisions`) into the $D01E/$D01F latches and fire the
+    /// collision IRQs on the 0→nonzero edge.
+    ///
+    /// PORT OF: vicii-cycle.c:407-433 (the `can_sprite_*` capture →
+    /// `vicii_draw_cycle()` sets the bits → IRQ-on-edge). VICE captures
+    /// `can_sprite_sprite = (collisions == 0)` BEFORE the draw cycle accumulates
+    /// new collision bits, then fires `vicii_irq_sscoll_set()` /
+    /// `vicii_irq_sbcoll_set()` iff the register WAS zero and is now non-zero.
+    /// Here the static renderer plays the role of `vicii_draw_cycle()`: we OR the
+    /// rendered masks into the latches (collisions are sticky / read-cleared) and
+    /// reproduce the identical edge trigger. Idempotent: re-merging the same masks
+    /// fires no new IRQ (no fresh 0→nonzero edge).
+    pub fn apply_collisions(&mut self, sprite_sprite: u8, sprite_background: u8) {
+        // vicii-cycle.c:407-408 — capture "was zero" BEFORE merging.
+        let can_sprite_sprite = self.sprite_sprite_collisions == 0;
+        let can_sprite_background = self.sprite_background_collisions == 0;
+
+        // The renderer's `vicii_draw_cycle()` equivalent: accumulate (|=) the new
+        // collision bits into the sticky latches.
+        self.sprite_sprite_collisions |= sprite_sprite;
+        self.sprite_background_collisions |= sprite_background;
+
+        // vicii-cycle.c:428-433 — IRQ on the 0→nonzero edge.
+        if can_sprite_sprite && self.sprite_sprite_collisions != 0 {
+            self.vicii_irq_sscoll_set();
+        }
+        if can_sprite_background && self.sprite_background_collisions != 0 {
+            self.vicii_irq_sbcoll_set();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A null memory view (all reads 0) for the timing-only unit tests — the draw
+    /// pipeline renders an all-zero frame, which is harmless for these assertions.
+    fn nm() -> VicMemView<'static> {
+        VicMemView::null()
+    }
+
+    // ── The ultimax fetch window ───────────────────────────────────────────────
+    //
+    // A MAX-machine cartridge (GAME=0, EXROM=1) has RAM only at $0000-$0FFF, so its
+    // charset cannot live in memory — the VIC reads it out of the cart. Jupiter Lander
+    // is the case that found this missing: screen codes and colour RAM came through
+    // fine, because both are in real memory, and every glyph was blank.
+
+    /// $3000-$3FFF of each bank comes from the cart, and only the cart's UPPER 4 KiB:
+    /// A13 is not driven out to the expansion port, so the VIC reaches $F000-$FFFF of
+    /// an $E000 window and never the bottom half.
+    #[test]
+    fn ultimax_redirects_the_top_of_each_bank_to_the_cart() {
+        let mut ram = [0x11u8; 0x10000];
+        ram[0x3000] = 0x22; // what a machine WITHOUT the redirect would read
+        let mut romh = [0u8; 0x2000];
+        romh[0x0000] = 0xaa; // the half the VIC cannot see
+        romh[0x1000] = 0xbb; // $F000 — the first byte it can
+        romh[0x1fff] = 0xcc; // $FFFF — the last
+        let chars = [0x99u8; 0x1000];
+
+        let v = VicMemView {
+            ram: &ram,
+            char_rom: Some(&chars),
+            color_ram: &ram[0xd800..0xdc00],
+            vbank: 0,
+            romh: Some(&romh),
+        };
+        assert_eq!(v.vic_phi1(0x3000), 0xbb, "the window starts at the cart's $F000");
+        assert_eq!(v.vic_phi1(0x3fff), 0xcc);
+        assert_ne!(v.vic_phi1(0x3000), 0xaa, "and never the cart's bottom half");
+        assert_eq!(v.vic_phi1(0x2fff), 0x11, "below $3000 the VIC still reads RAM");
+    }
+
+    /// Every bank, not only bank 0 — the redirect is on the VIC's own address bits,
+    /// which is why the mask is $3FFF and not $FFFF.
+    #[test]
+    fn ultimax_redirects_in_every_vic_bank() {
+        let ram = [0x11u8; 0x10000];
+        let mut romh = [0u8; 0x2000];
+        romh[0x1234] = 0x77;
+        for bank in 0..4u16 {
+            let v = VicMemView {
+                ram: &ram,
+                char_rom: None,
+                color_ram: &ram[0xd800..0xdc00],
+                vbank: bank * 0x4000,
+                romh: Some(&romh),
+            };
+            assert_eq!(v.vic_phi1(0x3234), 0x77, "bank {bank} reaches the cart too");
+        }
+    }
+
+    /// The other half of the port, and the one that is easy to miss: under ultimax the
+    /// CHARGEN shadow does not exist. VICE jumps clean past the `vaddr_chargen` test in
+    /// its ultimax branch, and it has to — a MAX machine has no character ROM in the
+    /// VIC's path, so leaving the shadow in would paint C64 glyphs over the window a
+    /// cart's own charset is supposed to come through.
+    #[test]
+    fn ultimax_has_no_chargen_shadow() {
+        let ram = [0x11u8; 0x10000];
+        let chars = [0x99u8; 0x1000];
+        let romh = [0u8; 0x2000];
+
+        let plain = VicMemView {
+            ram: &ram,
+            char_rom: Some(&chars),
+            color_ram: &ram[0xd800..0xdc00],
+            vbank: 0,
+            romh: None,
+        };
+        assert_eq!(plain.vic_phi1(0x1000), 0x99, "an ordinary C64 sees CHARGEN here");
+
+        let ultimax = VicMemView { romh: Some(&romh), ..plain };
+        assert_eq!(ultimax.vic_phi1(0x1000), 0x11, "a MAX machine sees RAM, not glyphs");
+    }
+
+    /// With no cart driving the window the fetch is byte-identical to what it always
+    /// was — which is every machine in the corpus.
+    #[test]
+    fn without_a_cart_the_fetch_is_unchanged() {
+        let ram = [0x11u8; 0x10000];
+        let chars = [0x99u8; 0x1000];
+        let v = VicMemView {
+            ram: &ram,
+            char_rom: Some(&chars),
+            color_ram: &ram[0xd800..0xdc00],
+            vbank: 0,
+            romh: None,
+        };
+        assert_eq!(v.vic_phi1(0x1000), 0x99, "CHARGEN in banks 0 and 2");
+        assert_eq!(v.vic_phi1(0x9000), 0x99);
+        assert_eq!(v.vic_phi1(0x5000), 0x11, "and RAM in banks 1 and 3");
+        assert_eq!(v.vic_phi1(0x3000), 0x11, "$3000 is RAM without a cart");
+    }
+
+    fn tick_n(v: &mut VicII, n: usize) {
+        for _ in 0..n {
+            v.tick(&nm());
+        }
+    }
+
+    #[test]
+    fn cycle_table_ba_window_matches_vice_pal() {
+        // VICE cycle_tab_pal: BaFetch set on PAL cycles 12..54 (table index
+        // 11..53) at the matrix-fetch BA, and the sprite BA masks elsewhere.
+        let t = build_cycle_table(CycleFamily::Pal);
+        // Cycle index 11 (PAL cycle 12) is the first BaFetch.
+        assert!(cycle_is_fetch_ba(t[11]), "PAL cycle 12 = first BaFetch");
+        assert!(cycle_is_fetch_ba(t[53]), "PAL cycle 54 = last BaFetch");
+        assert!(!cycle_is_fetch_ba(t[10]), "PAL cycle 11 (refresh) = no BaFetch");
+        assert!(!cycle_is_fetch_ba(t[54]), "PAL cycle 55 = sprite BA, no BaFetch");
+        // FetchC (Phi2 c-access) on cycles 15..54 (index 14..53).
+        assert!(cycle_may_fetch_c(t[14]), "PAL cycle 15 = first c-access");
+        assert!(cycle_may_fetch_c(t[53]), "PAL cycle 54 = last c-access");
+        assert!(!cycle_may_fetch_c(t[13]), "PAL cycle 14 = no c-access yet");
+    }
+
+    #[test]
+    fn cycle_table_flags_positions() {
+        let t = build_cycle_table(CycleFamily::Pal);
+        // UpdateVc on PAL cycle 14 (index 13).
+        assert!(cycle_is_update_vc(t[13]));
+        // UpdateRc + ChkSprDisp on PAL cycle 58 (index 57).
+        assert!(cycle_is_update_rc(t[57]));
+        assert!(cycle_is_check_spr_disp(t[57]));
+        // ChkSprDma on cycles 55 & 56 (index 54, 55).
+        assert!(cycle_is_check_spr_dma(t[54]));
+        assert!(cycle_is_check_spr_dma(t[55]));
+        // ChkSprExp + UpdateMcBase positions.
+        assert!(cycle_is_check_spr_exp(t[55]));
+        assert!(cycle_is_update_mcbase(t[15]));
+        // ChkSprCrunch on cycle 15 (index 14).
+        assert!(cycle_is_check_spr_crunch(t[14]));
+    }
+
+    #[test]
+    fn raster_advances_63_cycles_per_line_pal() {
+        let mut v = VicII::new();
+        assert_eq!(v.raster_line, 0);
+        assert_eq!(v.raster_cycle, 0);
+        tick_n(&mut v, 63);
+        assert_eq!(v.raster_line, 1, "one full line after 63 cycles");
+        assert_eq!(v.raster_cycle, 0);
+    }
+
+    #[test]
+    fn frame_is_periodic_19656_cycles() {
+        // VICE's start-of-frame is table-positioned: end_of_line latches
+        // start_of_frame at line 311/cycle 0, and vicii_cycle_start_of_frame
+        // resets raster_line=0 at the next cycle (pal_cycle 2). So the PHASE of
+        // when raster_line first reads 0 is offset by the start-of-frame latch,
+        // but the PERIOD is exactly 19656 cycles. Assert true periodicity: the
+        // (raster_line, raster_cycle) pair after N cycles equals the pair after
+        // N+19656 cycles, and `frame` advances by exactly 1 per 19656 cycles.
+        let mut a = VicII::new();
+        let mut b = VicII::new();
+        tick_n(&mut a, 5000); // arbitrary phase
+        tick_n(&mut b, 5000 + 19656); // one full PAL frame later
+        assert_eq!(a.raster_line, b.raster_line, "raster_line periodic at 19656");
+        assert_eq!(a.raster_cycle, b.raster_cycle, "raster_cycle periodic at 19656");
+        assert_eq!(b.frame, a.frame + 1, "exactly one frame elapsed per 19656 cycles");
+    }
+
+    #[test]
+    fn frame_counter_advances_once_per_frame() {
+        // start_of_frame fires (frame++) once per 19656-cycle frame. From a cold
+        // start at line0/cycle0, the FIRST wrap (vicii_cycle_start_of_frame, which
+        // runs at the table-positioned start-of-frame cycle) lands at clk 19657 —
+        // 1 cycle past nominal, the cold-start phase. Period is exactly 19656.
+        let mut v = VicII::new();
+        tick_n(&mut v, 19656);
+        assert_eq!(v.frame, 0, "frame not yet wrapped at exactly 19656 (cold phase)");
+        v.tick(&nm());
+        assert_eq!(v.frame, 1, "frame wraps at clk 19657 from cold start");
+    }
+
+    #[test]
+    fn pal_frame_is_19656_cycles() {
+        let v = VicII::new();
+        assert_eq!(v.cycles_per_line() as u32 * v.screen_height() as u32, 19656);
+    }
+
+    #[test]
+    fn no_badline_without_den() {
+        let mut v = VicII::new();
+        tick_n(&mut v, 63 * (FIRST_DMA_LINE as usize));
+        v.tick(&nm());
+        assert!(!v.allow_bad_lines, "DEN=0 => allow_bad_lines stays false");
+        assert!(!v.bad_line);
+    }
+
+    #[test]
+    fn badline_on_first_dma_line_with_den_and_ysmooth_zero() {
+        let mut v = VicII::new();
+        v.write_reg(R_CTRL1, 0x10); // DEN=1, YSCROLL=0
+        // Run into line 0x30, cycle 0 (where start-of-line + DEN check runs).
+        while !(v.raster_line == FIRST_DMA_LINE && v.raster_cycle == 0) {
+            v.tick(&nm());
+        }
+        // Walk one more cycle so the badline check (post-start-of-line) has run.
+        v.tick(&nm());
+        assert!(v.allow_bad_lines, "DEN seen on first_dma_line sets allow_bad_lines");
+        assert!(v.bad_line, "line 0x30, ysmooth 0 => badline");
+    }
+
+    #[test]
+    fn ba_low_window_present_on_badline() {
+        let mut v = VicII::new();
+        v.write_reg(R_CTRL1, 0x10); // DEN=1, YSCROLL=0
+        while !(v.raster_line == FIRST_DMA_LINE && v.raster_cycle == 0) {
+            v.tick(&nm());
+        }
+        let mut ba_cycles = Vec::new();
+        for _ in 0..v.cycles_per_line() {
+            let ba = v.tick(&nm());
+            if ba {
+                ba_cycles.push(v.raster_cycle);
+            }
+        }
+        // On a badline BA is low for the matrix fetch window: PAL cycles 12..54.
+        assert!(ba_cycles.contains(&cycle_index(12)), "BA low at cycle 12");
+        assert!(ba_cycles.contains(&cycle_index(54)), "BA low through cycle 54");
+        assert!(!ba_cycles.contains(&cycle_index(11)), "BA high at cycle 11 (refresh)");
+        assert!(!ba_cycles.contains(&0), "BA high at start of line");
+    }
+
+    #[test]
+    fn no_ba_low_on_non_badline() {
+        let mut v = VicII::new();
+        let mut any_ba = false;
+        for _ in 0..(63 * 64) {
+            if v.tick(&nm()) {
+                any_ba = true;
+            }
+        }
+        assert!(!any_ba, "no badlines + no sprites => BA stays high");
+    }
+
+    #[test]
+    fn raster_irq_latches_on_match() {
+        let mut v = VicII::new();
+        v.write_reg(R_IRQ_MASK, 0x01);
+        v.write_reg(R_RASTER, 5);
+        assert_eq!(v.raster_irq_line, 5);
+        // Run to the cycle where raster_line becomes 5 and the edge fires.
+        while v.raster_line != 5 {
+            v.tick(&nm());
+        }
+        // The trigger fires on the line==compare edge inside vicii_cycle.
+        assert!(v.irq_status & IRQ_RASTER != 0, "raster IRQ latched");
+        assert!(v.irq_line, "IRQ line asserted (enabled + latched)");
+        assert!(v.read_reg(R_IRQ_STATUS) & IRQ_SUMMARY != 0);
+    }
+
+    #[test]
+    fn raster_irq_ack_clears_latch() {
+        let mut v = VicII::new();
+        v.write_reg(R_IRQ_MASK, 0x01);
+        v.write_reg(R_RASTER, 5);
+        while v.raster_line != 5 {
+            v.tick(&nm());
+        }
+        assert!(v.irq_line);
+        v.write_reg(R_IRQ_STATUS, 0x01);
+        assert_eq!(v.irq_status & IRQ_RASTER, 0, "latch cleared");
+        assert!(!v.irq_line, "IRQ line deasserted after ack");
+    }
+
+    #[test]
+    fn d011_rst8_extends_raster_irq_line_to_9_bits() {
+        let mut v = VicII::new();
+        v.write_reg(R_CTRL1, 0x80);
+        v.write_reg(R_RASTER, 0x00);
+        assert_eq!(v.raster_irq_line, 256);
+    }
+
+    #[test]
+    fn d012_read_reflects_live_raster() {
+        let mut v = VicII::new();
+        tick_n(&mut v, 63 * 10);
+        assert_eq!(v.read_reg(R_RASTER), 10);
+    }
+
+    #[test]
+    fn sprite_dma_turns_on_for_enabled_sprite_at_matching_y() {
+        let mut v = VicII::new();
+        v.write_reg(R_SP_ENABLE, 0x01);
+        v.write_reg(0x01, 100); // sprite 0 Y
+        // DMA turns on at check_sprite_dma (cycles 55/56) of the matching Y line.
+        while !(v.raster_line == 100 && v.raster_cycle == cycle_index(57)) {
+            v.tick(&nm());
+        }
+        assert_eq!(v.sprite_dma & 0x01, 0x01, "sprite 0 DMA on at its Y line");
+    }
+
+    #[test]
+    fn sprite_dma_turns_off_at_mcbase_63() {
+        // A non-Y-expanded sprite runs its 21 lines then turns DMA off when
+        // mcbase reaches 63 (sprite_mcbase_update). We just assert the lifecycle
+        // is bounded and the turn-off path executes without panic.
+        let mut v = VicII::new();
+        v.write_reg(R_SP_ENABLE, 0x01);
+        v.write_reg(0x01, 50);
+        // Run enough lines to see the full sprite-DMA lifecycle: on at Y=50,
+        // 21 active data lines, then mcbase==63 turn-off. 80 lines covers it.
+        let mut saw_on = false;
+        let mut saw_off_after_on = false;
+        for _ in 0..(63 * 80) {
+            v.tick(&nm());
+            if v.sprite_dma & 1 != 0 {
+                saw_on = true;
+            } else if saw_on {
+                saw_off_after_on = true;
+            }
+        }
+        assert!(saw_on, "sprite DMA turned on");
+        assert!(saw_off_after_on, "sprite DMA turned off after its lines");
+    }
+
+    #[test]
+    fn reg_kind_classification_matches_ts() {
+        assert_eq!(VicII::reg_kind(R_RASTER), Some(VicRegKind::Raster));
+        assert_eq!(VicII::reg_kind(R_CTRL1), Some(VicRegKind::Raster));
+        assert_eq!(VicII::reg_kind(R_CTRL2), Some(VicRegKind::Mode));
+        assert_eq!(VicII::reg_kind(R_MEM_PTR), Some(VicRegKind::Mode));
+        assert_eq!(VicII::reg_kind(R_IRQ_STATUS), Some(VicRegKind::Irq));
+        assert_eq!(VicII::reg_kind(R_IRQ_MASK), Some(VicRegKind::Irq));
+        assert_eq!(VicII::reg_kind(0x20), None);
+    }
+
+    #[test]
+    fn vic_path_no_badline_matches_plain_path() {
+        use crate::{Machine, NullSink};
+        let prog = [0x78u8, 0xA9, 0x00, 0x8D, 0x11, 0xD0, 0x4C, 0x05, 0x08];
+        for budget in [19656u64, 25000, 40000] {
+            let mut a = Machine::new();
+            a.poke(0x0800, &prog);
+            a.set_pc(0x0800);
+            let mut o = NullSink;
+            a.run_for(budget, &mut o);
+
+            let mut b = Machine::new();
+            b.poke(0x0800, &prog);
+            b.set_pc(0x0800);
+            let mut o2 = NullSink;
+            b.run_for_vic(budget, &mut o2);
+            assert_eq!(a.clk, b.clk, "no-badline: vic path == plain path @budget {budget}");
+        }
+    }
+
+    #[test]
+    fn vic_path_badline_steals_cycles() {
+        use crate::{Machine, NullSink};
+        let prog = [0x78u8, 0xA9, 0x1B, 0x8D, 0x11, 0xD0, 0x4C, 0x05, 0x08];
+        let instr = 4000u64;
+        let mut a = Machine::new();
+        a.poke(0x0800, &prog);
+        a.set_pc(0x0800);
+        let mut oa = NullSink;
+        a.run_for_capped(u64::MAX, instr, &mut oa);
+
+        let mut b = Machine::new();
+        b.poke(0x0800, &prog);
+        b.set_pc(0x0800);
+        let mut ob = NullSink;
+        b.run_for_vic_capped(u64::MAX, instr, &mut ob);
+
+        assert!(
+            b.clk > a.clk,
+            "badline steal: vic path clk {} must exceed plain path clk {}",
+            b.clk,
+            a.clk
+        );
+    }
+    /// Spec 843 D1 — the record is WRITTEN, and it is written per line.
+    ///
+    /// The resolver could always honour a per-line record; nothing ever produced one.
+    /// This is the half that was missing: run a frame, change `$D018` partway down
+    /// the way a raster IRQ does, and the two halves must hold different values.
+    #[test]
+    fn a_mid_frame_register_change_lands_in_that_line_and_not_the_others() {
+        let mut v = VicII::new();
+        v.regs[R_MEM_PTR as usize] = 0x14; // screen $0400
+
+        // Run to a known line, flip $D018 as a raster split would, run on.
+        while v.raster_line != 100 || v.raster_cycle != 0 { v.tick(&nm()); }
+        tick_n(&mut v, 63 * 40); // lines 100..139 with the first value
+        v.regs[R_MEM_PTR as usize] = 0x34; // screen $0c00
+        tick_n(&mut v, 63 * 40); // lines 140..179 with the second
+
+        assert!(v.provenance[100].captured, "line 100 was passed and must be recorded");
+        assert_eq!(v.provenance[100].d018, 0x14, "the top half kept its own $D018");
+        assert_eq!(v.provenance[150].d018, 0x34, "the bottom half has the split's value");
+        assert_ne!(v.provenance[100].d018, v.provenance[150].d018,
+            "a frame is not one register state — that is the whole point of the record");
+
+        // A line the beam has not reached is absent, not a stale guess.
+        assert!(!v.provenance[250].captured, "an unvisited line stays uncaptured");
+    }
+
+    // ── Spec 863 — the NTSC family and the frame it makes ──────────────────────────
+
+    fn ntsc() -> VicII {
+        VicII::new_for(crate::model::resolve("c64-ntsc").unwrap())
+    }
+
+    /// The PAL table the port builds is the one TRX64 had: the xpos column the table now
+    /// carries is exactly the formula it replaced, and the whole compiled table hashes to
+    /// what the formula-built one did (FNV-1a over the 63 entries, computed from the
+    /// pre-863 builder).
+    #[test]
+    fn the_pal_table_is_the_one_trx64_had() {
+        let t = build_cycle_table(CycleFamily::Pal);
+        for (i, row) in cycle_tab(CycleFamily::Pal).iter().enumerate().filter(|(i, _)| i % 2 == 0) {
+            let cyc = (i / 2) as u16;
+            assert_eq!(row.xpos, (0x194 + 8 * cyc) % 0x1f8, "PAL Phi1({}) xpos", cyc + 1);
+        }
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for e in &t[..63] {
+            for b in e.to_le_bytes() {
+                h = (h ^ b as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        assert_eq!(h, PAL_TABLE_FNV, "compiled PAL table changed");
+        assert!(t[63..].iter().all(|&e| e == 0), "PAL has 63 entries");
+    }
+
+    /// Spec §2: what the 65-cycle line changes, read from the compiled NTSC table.
+    #[test]
+    fn the_ntsc_table_is_pal_with_two_idle_cycles() {
+        let p = build_cycle_table(CycleFamily::Pal);
+        let n = build_cycle_table(CycleFamily::Ntsc);
+        // Cycles 11-54 fetch, BA and check alike; the xpos column joins PAL's from cycle 14
+        // (11-13 read $1EC/$1F4/$1FC on NTSC against $1E4/$1EC/$1F4). 55-57 differ only in
+        // the sprite-0 BA and ChkSprDma that moved one cycle later.
+        for c in 11..=54usize {
+            assert_eq!(n[c - 1] & !XPOS_M, p[c - 1] & !XPOS_M, "cycle {c}");
+            if c >= 14 {
+                assert_eq!(n[c - 1], p[c - 1], "cycle {c}, xpos included");
+            }
+        }
+        // Idle at 10 and at 58.
+        assert!(!cycle_is_sprite_ptr_dma0(n[9]) && !cycle_is_sprite_dma1_dma2(n[9]) && !cycle_is_refresh(n[9]));
+        assert_eq!(cycle_get_sprite_ba_mask(n[9]), 0, "no BA at 10");
+        assert!(!cycle_is_sprite_ptr_dma0(n[57]) && !cycle_is_sprite_dma1_dma2(n[57]), "58 idle");
+        // Sprite 3 DMA at 1 (its pointer at 65), sprites 4-7 one cycle earlier than PAL.
+        assert!(cycle_is_sprite_dma1_dma2(n[0]) && cycle_get_sprite_num(n[0]) == 3);
+        assert!(cycle_is_sprite_ptr_dma0(n[64]) && cycle_get_sprite_num(n[64]) == 3);
+        for (s, c) in [(4usize, 2usize), (5, 4), (6, 6), (7, 8)] {
+            assert!(cycle_is_sprite_ptr_dma0(n[c - 1]) && cycle_get_sprite_num(n[c - 1]) == s, "s{s} ptr at {c}");
+        }
+        // Sprites 0-2 one cycle later: s0 59-60, s1 61-62, s2 63-64.
+        for (s, c) in [(0usize, 59usize), (1, 61), (2, 63)] {
+            assert!(cycle_is_sprite_ptr_dma0(n[c - 1]) && cycle_get_sprite_num(n[c - 1]) == s, "s{s} ptr at {c}");
+        }
+        // ChkSprDma 56/57, ChkSprDisp 59, sprite-0 BA from 56, UpdateRc still 58.
+        assert!(cycle_is_check_spr_dma(n[55]) && cycle_is_check_spr_dma(n[56]));
+        assert!(!cycle_is_check_spr_dma(n[54]));
+        assert!(cycle_is_check_spr_disp(n[58]) && !cycle_is_check_spr_disp(n[57]));
+        assert_eq!(cycle_get_sprite_ba_mask(n[54]), 0, "no sprite BA at 55 on NTSC");
+        assert_eq!(cycle_get_sprite_ba_mask(n[55]), 1, "sprite 0 BA from 56");
+        assert!(cycle_is_update_rc(n[57]));
+        // xpos from the table: $19C at cycle 1, $184 on Phi1 62 and Phi1 63.
+        assert_eq!(cycle_get_xpos(n[0]), 0x198, "$19C >> 3 << 3");
+        assert_eq!(cycle_get_xpos(n[61]), 0x180);
+        assert_eq!(cycle_get_xpos(n[62]), 0x180, "the repeated $184");
+        assert_eq!(cycle_get_xpos(n[63]), 0x188);
+        assert_eq!(n[65..].len(), 0);
+        let g = LineGeometry::of(CycleFamily::Ntsc);
+        assert_eq!((g.first_c, g.first_g, g.spr0_ptr, g.brd_r1, g.sample_cycle()), (15, 16, 59, 57, 20));
+        let g = LineGeometry::of(CycleFamily::Pal);
+        assert_eq!((g.first_c, g.first_g, g.spr0_ptr, g.brd_r1, g.sample_cycle()), (15, 16, 58, 57, 20));
+    }
+
+    /// Acceptance 3 — an NTSC frame is 17 095 cycles, the raster wraps at 263, line 0
+    /// appears at cycle 2, and a raster IRQ on line 262 fires while one on 263 never does.
+    #[test]
+    fn an_ntsc_frame_is_17095_cycles_and_wraps_at_263() {
+        let mut a = ntsc();
+        let mut b = ntsc();
+        tick_n(&mut a, 5000);
+        tick_n(&mut b, 5000 + 17095);
+        assert_eq!((a.raster_line, a.raster_cycle), (b.raster_line, b.raster_cycle), "periodic at 17095");
+        assert_eq!(b.frame, a.frame + 1);
+
+        // Walk to the wrap: the last line is 262, then 0 — seen at cycle 2 (index 1).
+        let mut v = ntsc();
+        let mut max_line = 0;
+        while !(v.raster_line == 262 && v.raster_cycle == 64) {
+            max_line = max_line.max(v.raster_line);
+            v.tick(&nm());
+        }
+        assert_eq!(max_line, 262);
+        v.tick(&nm()); // cycle 1 of the next line: the counter still reads 262
+        assert_eq!((v.raster_line, v.raster_cycle), (262, 0));
+        v.tick(&nm()); // cycle 2: line 0
+        assert_eq!((v.raster_line, v.raster_cycle), (0, 1));
+
+        // A raster IRQ on 262 fires; on 263 (a line the frame does not have) never.
+        let mut v = ntsc();
+        v.write_reg(R_IRQ_MASK, 0x01);
+        v.write_reg(R_CTRL1, 0x80);
+        v.write_reg(R_RASTER, (262 - 256) as u8);
+        tick_n(&mut v, 17095 + 100);
+        assert!(v.irq_status & IRQ_RASTER != 0, "line 262 fires");
+        let mut v = ntsc();
+        v.write_reg(R_IRQ_MASK, 0x01);
+        v.write_reg(R_CTRL1, 0x80);
+        v.write_reg(R_RASTER, (263 - 256) as u8);
+        tick_n(&mut v, 3 * 17095);
+        assert_eq!(v.irq_status & IRQ_RASTER, 0, "line 263 never fires");
+    }
+
+    /// Spec 863 — DISPLAY_X0 and SPRITE_DBUF_X0 re-derived from each family's own table:
+    /// display column 0 is the Φ1 row marked Vis(0) (cycle 17, 136 px in) and sprite X 0
+    /// lies 24 px left of it on every family; past NTSC's repeated $184 a sprite lands one
+    /// cycle further right. PAL is the calibrated straight line it always was.
+    #[test]
+    fn the_sprite_and_display_origins_come_from_each_table() {
+        for f in [CycleFamily::Pal, CycleFamily::Ntsc, CycleFamily::NtscOld] {
+            assert_eq!(display_dbuf_x0(f), crate::render::DISPLAY_X0, "{f:?}");
+            assert_eq!(sprite_dbuf_x0(f), crate::render::SPRITE_DBUF_X0, "{f:?}");
+            assert_eq!(sprite_dbuf_x(f, 24), crate::render::DISPLAY_X0, "{f:?}: X 24 = column 0");
+        }
+        for x in 0..0x200u16 {
+            assert_eq!(sprite_dbuf_x(CycleFamily::Pal, x), 112 + x as usize, "PAL x={x:#x}");
+        }
+        assert_eq!(sprite_dbuf_x(CycleFamily::Ntsc, 0x187), 112 + 0x187);
+        assert_eq!(sprite_dbuf_x(CycleFamily::Ntsc, 0x188), 112 + 0x188 + 8, "past the repeated $184");
+        assert_eq!(sprite_dbuf_x(CycleFamily::Ntsc, 0x190), 112 + 0x190 + 8);
+    }
+
+    /// A PAL-N chip is the NTSC table over 312 lines: 20 280 cycles a frame.
+    #[test]
+    fn a_paln_frame_is_20280_cycles() {
+        let m = crate::model::resolve("c64-paln").unwrap();
+        let mut a = VicII::new_for(m);
+        let mut b = VicII::new_for(m);
+        tick_n(&mut a, 7000);
+        tick_n(&mut b, 7000 + 20280);
+        assert_eq!((a.raster_line, a.raster_cycle), (b.raster_line, b.raster_cycle));
+        assert_eq!(b.frame, a.frame + 1);
+        assert_eq!((a.cycles_per_line(), a.screen_height()), (65, 312));
+    }
+
+    /// The model switch re-reads the cycle in hand from the new table and keeps every
+    /// value; a position the new geometry does not have is reported, not indexed.
+    #[test]
+    fn set_model_keeps_state_and_rereads_the_flags() {
+        let mut v = VicII::new();
+        tick_n(&mut v, 19656 * 2 + 3);
+        let (line, cycle, regs) = (v.raster_line, v.raster_cycle, v.regs);
+        let n = crate::model::resolve("c64-ntsc").unwrap();
+        v.set_model(n);
+        assert_eq!((v.raster_line, v.raster_cycle, v.regs), (line, cycle, regs));
+        assert_eq!(v.cycle_flags, build_cycle_table(CycleFamily::Ntsc)[cycle as usize]);
+        assert!(!v.fits(0, 65) && v.fits(262, 64) && !v.fits(263, 0));
+        let p = VicII::new();
+        assert!(!p.fits(0, 63) && !p.fits(0, 64) && p.fits(311, 62));
+    }
+}
+
+/// FNV-1a of the compiled PAL table as the pre-863 builder produced it (xpos from the
+/// formula `(0x194 + 8c) % 0x1f8`, the rest from the rows).
+#[cfg(test)]
+const PAL_TABLE_FNV: u64 = 0xc49a_5dd2_ef2a_bbcd;

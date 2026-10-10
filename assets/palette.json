@@ -1,0 +1,167 @@
+{
+  "name": "ultimate",
+  "source": "https://github.com/GideonZ/1541ultimate/blob/master/software/u64/u64_config.cc#L53-L69",
+  "description": "16 C64 colour indices in VIC-II order; Ultimate default HDMI calibration",
+  "entries": [
+    {
+      "index": 0,
+      "name": "black",
+      "rgb": [
+        0,
+        0,
+        0
+      ],
+      "hex": "#000000"
+    },
+    {
+      "index": 1,
+      "name": "white",
+      "rgb": [
+        247,
+        247,
+        247
+      ],
+      "hex": "#f7f7f7"
+    },
+    {
+      "index": 2,
+      "name": "red",
+      "rgb": [
+        141,
+        47,
+        52
+      ],
+      "hex": "#8d2f34"
+    },
+    {
+      "index": 3,
+      "name": "cyan",
+      "rgb": [
+        106,
+        212,
+        205
+      ],
+      "hex": "#6ad4cd"
+    },
+    {
+      "index": 4,
+      "name": "purple",
+      "rgb": [
+        152,
+        53,
+        164
+      ],
+      "hex": "#9835a4"
+    },
+    {
+      "index": 5,
+      "name": "green",
+      "rgb": [
+        76,
+        180,
+        66
+      ],
+      "hex": "#4cb442"
+    },
+    {
+      "index": 6,
+      "name": "blue",
+      "rgb": [
+        44,
+        41,
+        177
+      ],
+      "hex": "#2c29b1"
+    },
+    {
+      "index": 7,
+      "name": "yellow",
+      "rgb": [
+        239,
+        239,
+        93
+      ],
+      "hex": "#efef5d"
+    },
+    {
+      "index": 8,
+      "name": "orange",
+      "rgb": [
+        152,
+        78,
+        32
+      ],
+      "hex": "#984e20"
+    },
+    {
+      "index": 9,
+      "name": "brown",
+      "rgb": [
+        91,
+        56,
+        0
+      ],
+      "hex": "#5b3800"
+    },
+    {
+      "index": 10,
+      "name": "light_red",
+      "rgb": [
+        209,
+        103,
+        109
+      ],
+      "hex": "#d1676d"
+    },
+    {
+      "index": 11,
+      "name": "dark_grey",
+      "rgb": [
+        74,
+        74,
+        74
+      ],
+      "hex": "#4a4a4a"
+    },
+    {
+      "index": 12,
+      "name": "grey",
+      "rgb": [
+        123,
+        123,
+        123
+      ],
+      "hex": "#7b7b7b"
+    },
+    {
+      "index": 13,
+      "name": "light_green",
+      "rgb": [
+        159,
+        239,
+        147
+      ],
+      "hex": "#9fef93"
+    },
+    {
+      "index": 14,
+      "name": "light_blue",
+      "rgb": [
+        109,
+        106,
+        239
+      ],
+      "hex": "#6d6aef"
+    },
+    {
+      "index": 15,
+      "name": "light_grey",
+      "rgb": [
+        178,
+        178,
+        178
+      ],
+      "hex": "#b2b2b2"
+    }
+  ]
+}

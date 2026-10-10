@@ -1,0 +1,77 @@
+{
+  "frames": 12,
+  "source_sha256": "95e34eafdba76a924800a5d816dbccdfabefbaec60d0879488b4b656629e69f1",
+  "unique_rgb": 79381,
+  "threads": 8,
+  "results": [
+    {
+      "mode": "cpu1",
+      "run": 0,
+      "planning_seconds": 18.257702417,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "cpu1",
+      "run": 1,
+      "planning_seconds": 17.830266792,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "cpu1",
+      "run": 2,
+      "planning_seconds": 18.3267705,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "cpuN",
+      "run": 0,
+      "planning_seconds": 4.155385083,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "cpuN",
+      "run": 1,
+      "planning_seconds": 4.251869333,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "cpuN",
+      "run": 2,
+      "planning_seconds": 4.262817666,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "gpu+cpuN",
+      "run": 0,
+      "planning_seconds": 4.366050292,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "gpu+cpuN",
+      "run": 1,
+      "planning_seconds": 4.198968125,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    },
+    {
+      "mode": "gpu+cpuN",
+      "run": 2,
+      "planning_seconds": 4.362022125,
+      "hardware_pixels_sha256": "3798b6b39a850cb0f05a2e4926fe22bc7727a951ea69e6337fb14429c6379abc"
+    }
+  ],
+  "host": {
+    "gpu": "Apple M3",
+    "logical_cpu_threads": 8,
+    "macos": "27.0.1",
+    "contention": "An unrelated native C64 emulator used one CPU core during part of the measurements. These are indicative planning times, not an isolated whole-encoder throughput guarantee."
+  },
+  "native_gpu_initialization_seconds": 0.011,
+  "scope": "Fresh-cache author RGB planning only; excludes candidates/setup, source decoding, audio, compression and preview.",
+  "medians_seconds": {
+    "cpu1": 18.257702417,
+    "cpuN": 4.251869333,
+    "gpu+cpuN": 4.362022125
+  },
+  "all_hardware_hashes_identical": true,
+  "gpu_heuristic": "Historical weighted Lab point hints, before cached-chroma and exact initial-leaf reuse optimizations."
+}

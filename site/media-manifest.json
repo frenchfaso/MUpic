@@ -1,0 +1,15 @@
+{
+  "schema": "mupic-pages-media-v1",
+  "image_sha256": "41d5ae08cc26fe16e7cbbe454abbb7126960983c26343706501fa2bad6d4e16a",
+  "disk_bytes": 536870912,
+  "downloadable_chunk_bytes": 156114087,
+  "uncompressed_nonzero_chunk_bytes": 458227712,
+  "compression": "gzip",
+  "chunk_bytes": 262144,
+  "total_chunks": 2048,
+  "zero_chunks": 300,
+  "movies": [
+    "BUNNY.MUP",
+    "CYBER77.MUP"
+  ]
+}

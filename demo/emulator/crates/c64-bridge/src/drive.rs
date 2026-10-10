@@ -1,0 +1,778 @@
+//! Drives A and B: TRX64's two drive positions behind the firmware's drive registers (docs/specs/S27-drives-870.md).
+//!
+//! The firmware owns the disk (docs/hw/11-drives-iec-periph.md §Drive): it converts images to GCR in DDR, and
+//! `ue2_core::devices::drives::DriveRegs` hands the drive the bytes of each half-track and takes back what it wrote.
+//! Power, reset, the frozen clock, the ROM and the unit number are TRX64's drive part (Spec 870); the surface is
+//! still `rotation.image`, and writes are read back from it (S27 §3).
+//!
+//! S31: DRIVETYPE 2 makes the position a 1581 with the FPGA's WD177x fitted (TRX64 Spec 875, [`crate::wd177x`]): the
+//! firmware serves its sectors from the D81 file, as on the device.
+
+use std::cell::UnsafeCell;
+use std::sync::Arc;
+
+use trx64_core::drive::{pair_catch_up, pair_fold_into_iec, DrivePosition};
+use trx64_core::fdc_controller::{FdcBoardIn, FdcBoardOut, FdcController};
+use trx64_core::gcr::{GcrImage, GcrTrack};
+use trx64_core::iec::DriveType;
+use trx64_core::{Drive1541, Machine};
+use ue2_core::c64host::{C64Drive, DriveLines, DriveStatus, DRIVE_HALF_TRACKS};
+
+use crate::wd177x::{DmaMem, Ram, Wd177x};
+use crate::Trx64Backend;
+
+/// The drive area's ROM image: $8000-$FFFF, a 16 K file mirrored by the firmware (c1541.cc:937-940).
+const ROM_LEN: usize = 0x8000;
+const RAM_LEN: usize = 0x800;
+/// The unit HW_ADDR 0 selects; the register has two bits, so 8-11 (drive_registers.vhd:77).
+const UNIT_BASE: u8 = 8;
+
+/// One drive window's state beside TRX64's drive part.
+pub(crate) struct DriveSlot {
+    pos: DrivePosition,
+    lines: DriveLines,
+    /// The reset level last applied, so a release can be told from a held line.
+    reset: bool,
+    /// Half-tracks the drive may have written since `take_written`, bit n = half-track n.
+    written: u128,
+    /// Head position and TRX64's last written half-track (both 2-based) at the last check.
+    last_head: u32,
+    last_dirty: u32,
+    /// The ROM image last handed to TRX64, and whether it waits for a power-on to come into force (870 §4).
+    rom: Vec<u8>,
+    rom_pending: bool,
+    /// One-time notices.
+    rom_noted: bool,
+    type_noted: bool,
+    power_noted: bool,
+    /// S31: the WD177x fitted while the position is a 1581, shared with the controller TRX64 holds.
+    fdc: FdcHandle,
+}
+
+impl DriveSlot {
+    /// A drive window after a hardware reset: off and held in reset (drive_registers.vhd), its surface empty. The
+    /// C64's RESET line is cut in TRX64: the bridge drives the reset level itself (S27 §1).
+    pub(crate) fn new(m: &mut Machine, pos: DrivePosition) -> Self {
+        let d = m.drive_mut(pos);
+        d.set_reset_line_connected(false);
+        d.set_power(false);
+        attach_surface(d, empty_surface());
+        m.sync_drive_slots();
+        DriveSlot {
+            pos,
+            lines: DriveLines::default(),
+            reset: true,
+            written: 0,
+            last_head: 2,
+            last_dirty: 0,
+            rom: Vec::new(),
+            rom_pending: false,
+            rom_noted: false,
+            type_noted: false,
+            power_noted: false,
+            fdc: FdcHandle::default(),
+        }
+    }
+
+    /// Whether the position is a 1581 (with the WD177x fitted).
+    fn is_1581(&self, m: &Machine) -> bool {
+        m.drive(self.pos).board_type() == DriveType::Drive1581
+    }
+
+    /// S31: DRIVETYPE 2 fits a 1581 with the firmware's controller, 0 the 1541. TRX64 changes a board only while the
+    /// position is off (Spec 872, 875), where the firmware changes the type powered, with a reset (c1541.cc:906-947):
+    /// the position goes off, changes, and the ROM goes to the new board; the power comes back in `update`.
+    fn fit_board(&mut self, m: &mut Machine, want_1581: bool) {
+        if want_1581 == self.is_1581(m) {
+            return;
+        }
+        let pos = self.pos;
+        if let Err(e) = m.set_drive_power(pos, false) {
+            self.notice_power(&e);
+        }
+        if !want_1581 {
+            let _ = m.detach_fdc_controller(pos);
+        }
+        let board = if want_1581 { DriveType::Drive1581 } else { DriveType::Drive1541 };
+        let fitted = m.set_drive_type(pos, board).and_then(|_| {
+            if want_1581 {
+                m.attach_fdc_controller(pos, Box::new(FdcDevice(self.fdc.clone()))).map(|_| ())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(e) = fitted {
+            eprintln!("c64: drive {}: {e}", self.name());
+        }
+        // The board changed under the image: hand it over again.
+        let rom = std::mem::take(&mut self.rom);
+        if rom.len() == ROM_LEN {
+            self.set_rom(m, &rom);
+        }
+    }
+
+    fn name(&self) -> char {
+        match self.pos {
+            DrivePosition::A => 'A',
+            DrivePosition::B => 'B',
+        }
+    }
+
+    /// The firmware's lines, with the 32 K ROM image of the drive area (C64Drive::set_lines).
+    pub(crate) fn set_lines(&mut self, m: &mut Machine, lines: DriveLines, rom: &[u8], stopped: bool, reset: bool) {
+        self.set_rom(m, rom);
+        // The C1541 constructor probes DRIVETYPE with 2 before any drive type is set (c1541.cc:119-120).
+        if lines.power && lines.drive_type == 1 && !self.type_noted {
+            eprintln!("c64: drive {} type 1571 is not modelled; it stays off", self.name());
+            self.type_noted = true;
+        }
+        self.lines = lines;
+        self.fdc.with(|f| f.lines = lines);
+        m.drive_mut(self.pos).rotation.read_only = i32::from(lines.write_protect);
+        self.update(m, stopped, reset);
+    }
+
+    /// Apply the lines for the C64's stop and reset: power, unit, reset level and the frozen clock (S27 §1).
+    ///
+    /// Every drive reset TRX64 runs builds a new rotation model (`cold_reset`) and re-mounts only its own disk, so the
+    /// firmware's surface steps out for the calls and goes back in: as it was when nothing reset, re-mounted when
+    /// something did.
+    pub(crate) fn update(&mut self, m: &mut Machine, c64_stopped: bool, c64_reset: bool) {
+        let l = self.lines;
+        let pos = self.pos;
+        self.fit_board(m, l.drive_type == 2);
+        let surface = m.drive_mut(pos).rotation.image.replace(marker());
+        let power = l.power && l.drive_type != 1;
+        if let Err(e) = m.set_drive_unit(pos, UNIT_BASE + (l.device & 3)) {
+            self.notice_power(&e);
+        }
+        if power != m.drive(pos).powered() {
+            match m.set_drive_power(pos, power) {
+                Ok(()) if power => self.rom_pending = false,
+                Ok(()) => {}
+                Err(e) => self.notice_power(&e),
+            }
+        }
+        // c1541_timing.vhd `iec_reset_o`: the C64's reset reaches the drive with `use_c64_reset`.
+        let reset = l.reset || (l.follow_c64_reset && c64_reset);
+        let d = m.drive_mut(pos);
+        if reset && !self.reset && self.rom_pending && d.powered() {
+            // The firmware changes the ROM with a reset alone (c1541.cc:945, 1132); TRX64 takes a new ROM at power-on.
+            d.set_power(false);
+            d.set_power(true);
+            self.rom_pending = false;
+        }
+        d.set_reset_held(reset);
+        if self.reset && !reset {
+            // floppy_stream.vhd `p_move`: reset clears `track_i`, the head starts on track 1.
+            d.rotation.current_half_track = 2;
+            (self.last_head, self.last_dirty) = (2, 0);
+        }
+        self.reset = reset;
+        // c1541_drive.vhd:164-165: `drive_stop and stop_on_freeze` stops the drive's whole tick.
+        d.set_stopped(l.stop_on_freeze && c64_stopped);
+        let surface = surface.unwrap_or_else(empty_surface);
+        if d.rotation.image.as_ref().is_some_and(is_marker) {
+            d.rotation.image = Some(surface);
+        } else {
+            attach_surface(d, surface);
+            d.rotation.read_only = i32::from(l.write_protect);
+        }
+        m.sync_drive_slots();
+    }
+
+    fn notice_power(&mut self, e: &str) {
+        if !self.power_noted {
+            eprintln!("c64: drive {}: {e}", self.name());
+            self.power_noted = true;
+        }
+    }
+
+    /// After the drive ran: note the half-tracks it may have written.
+    pub(crate) fn after_run(&mut self, m: &mut Machine) {
+        if self.is_1581(m) {
+            return;
+        }
+        let d = m.drive_mut(self.pos);
+        if !d.powered() {
+            return;
+        }
+        let r = &mut d.rotation;
+        let head = r.current_half_track;
+        // The drive writes only under the head (rotation.rs). A step flushes TRX64's dirty flag without a write-back
+        // target, so the track stepped off counts too; DriveRegs keeps only the tracks whose bytes differ from the
+        // disk's.
+        let mut written = 0;
+        if !r.read_write_mode || r.gcr_dirty_track != 0 {
+            written |= bit(head) | bit(r.dirty_half_track);
+        }
+        if r.dirty_half_track != self.last_dirty {
+            written |= bit(r.dirty_half_track);
+        }
+        if head != self.last_head {
+            written |= bit(self.last_head);
+        }
+        r.gcr_dirty_track = 0;
+        (self.last_head, self.last_dirty) = (head, r.dirty_half_track);
+        self.written |= written;
+    }
+
+    pub(crate) fn set_track(&mut self, m: &mut Machine, half_track: u8, gcr: &[u8]) {
+        let r = &mut m.drive_mut(self.pos).rotation;
+        let ht = usize::from(half_track);
+        let Some(track) = r.image.as_mut().and_then(|i| i.tracks.get_mut(ht)) else { return };
+        track.data.clear();
+        track.data.extend_from_slice(gcr);
+        track.size = gcr.len();
+        if r.current_half_track as usize == ht + 2 {
+            // The track under the head changed size: re-select it.
+            let current = r.current_half_track;
+            r.set_half_track(current);
+        }
+    }
+
+    pub(crate) fn track<'a>(&self, m: &'a Machine, half_track: u8) -> &'a [u8] {
+        let image = m.drive(self.pos).rotation.image.as_ref();
+        image.and_then(|i| i.tracks.get(usize::from(half_track))).map_or(&[], |t| &t.data[..t.size.min(t.data.len())])
+    }
+
+    pub(crate) fn take_written(&mut self) -> u128 {
+        std::mem::take(&mut self.written)
+    }
+
+    pub(crate) fn status(&self, m: &Machine) -> DriveStatus {
+        if self.is_1581(m) {
+            let d = m.drive(self.pos);
+            return self.fdc.with(|f| DriveStatus {
+                half_track: f.wd.cur_track(),
+                motor: f.out.motor_on,
+                writing: false,
+                led: d.led_on(),
+                side: u8::from(f.out.side0),
+            });
+        }
+        let d = m.drive(self.pos);
+        let ports = d.ports();
+        DriveStatus {
+            half_track: (d.rotation.current_half_track.saturating_sub(2) as usize).min(DRIVE_HALF_TRACKS - 1) as u8,
+            motor: ports.motor_on,
+            writing: !d.rotation.read_write_mode,
+            led: d.led_on(),
+            side: 0,
+        }
+    }
+
+    /// S31: guest DDR for the controller's DMA while the C64 runs (`C64Backend::lend_ddr`).
+    pub(crate) fn lend_ddr(&mut self, ddr: Option<(*mut u8, usize)>) {
+        self.fdc.with(|f| f.ddr = ddr);
+    }
+
+    pub(crate) fn read_ram(&self, m: &Machine, out: &mut [u8]) {
+        let ram = m.drive(self.pos).ram();
+        let n = out.len().min(RAM_LEN).min(ram.len());
+        out[..n].copy_from_slice(&ram[..n]);
+    }
+
+    /// The drive area's ROM, handed to TRX64 when it changes. A powered drive takes it at its next power-on
+    /// ([`Self::update`] makes the firmware's reset one).
+    fn set_rom(&mut self, m: &mut Machine, rom: &[u8]) {
+        let Some(image) = rom.len().checked_sub(ROM_LEN).map(|at| &rom[at..]) else { return };
+        if image == self.rom.as_slice() {
+            return;
+        }
+        let d = m.drive_mut(self.pos);
+        match d.set_rom(image) {
+            Ok(()) => {
+                self.rom = image.to_vec();
+                self.rom_pending = d.powered();
+            }
+            Err(e) if !self.rom_noted => {
+                eprintln!("c64: drive {} ROM refused: {e}", self.name());
+                self.rom_noted = true;
+            }
+            Err(_) => {}
+        }
+    }
+}
+
+/// The C64 CPU is in reset, so TRX64's run loop clocks the VIC alone: catch both drives up and fold them into the
+/// bus, what that loop does after each instruction (S27 §2).
+pub(crate) fn run_with_chips(m: &mut Machine) {
+    let clk = m.c64_core.clk;
+    m.drive_c64_ref = pair_catch_up(&mut m.drive8, &mut m.drive_b, &mut m.iec, clk, m.drive_c64_ref, m.cia2_pa_out);
+    pair_fold_into_iec(&m.drive8, &m.drive_b, &mut m.iec, m.cia2_pa_out);
+}
+
+/// Bit of a 2-based TRX64 half-track in a written mask (bit n = firmware half-track n).
+fn bit(half_track: u32) -> u128 {
+    match half_track.checked_sub(2) {
+        Some(n) if (n as usize) < DRIVE_HALF_TRACKS => 1 << n,
+        _ => 0,
+    }
+}
+
+/// What stands in `rotation.image` while [`DriveSlot::update`] holds the surface: no tracks at all, which no mounted
+/// surface has.
+fn marker() -> GcrImage {
+    GcrImage { tracks: Vec::new() }
+}
+
+fn is_marker(image: &GcrImage) -> bool {
+    image.tracks.is_empty()
+}
+
+fn empty_surface() -> GcrImage {
+    GcrImage { tracks: (0..DRIVE_HALF_TRACKS).map(|_| GcrTrack { data: Vec::new(), size: 0 }).collect() }
+}
+
+/// Mount a surface without TRX64's attach delay: the firmware's own sensor sequence tells the DOS about a disk change
+/// (c1541.cc:456-514). The simple rotation engine is VICE's for dxx images; the firmware's GCR is standard.
+fn attach_surface(d: &mut Drive1541, surface: GcrImage) {
+    let r = &mut d.rotation;
+    r.image = Some(surface);
+    r.gcr_image_loaded = 1;
+    r.complicated_image_loaded = 0;
+    (r.attach_clk, r.attach_detach_clk) = (0, 0);
+    (r.gcr_current_track_size, r.gcr_head_offset) = (0, 0);
+    let current = r.current_half_track;
+    r.set_half_track(current);
+}
+
+impl C64Drive for Trx64Backend {
+    fn set_lines(&mut self, lines: DriveLines, rom: &[u8]) {
+        let (stopped, reset) = (self.stopped, self.reset_held);
+        self.drives[self.drive_sel].set_lines(&mut self.m, lines, rom, stopped, reset);
+    }
+
+    fn set_track(&mut self, half_track: u8, gcr: &[u8]) {
+        self.drives[self.drive_sel].set_track(&mut self.m, half_track, gcr);
+    }
+
+    fn track(&self, half_track: u8) -> &[u8] {
+        self.drives[self.drive_sel].track(&self.m, half_track)
+    }
+
+    fn take_written(&mut self) -> u128 {
+        self.drives[self.drive_sel].take_written()
+    }
+
+    fn status(&self) -> DriveStatus {
+        self.drives[self.drive_sel].status(&self.m)
+    }
+
+    fn read_ram(&self, out: &mut [u8]) {
+        self.drives[self.drive_sel].read_ram(&self.m, out);
+    }
+
+    fn has_wd(&self) -> bool {
+        self.drives[self.drive_sel].is_1581(&self.m)
+    }
+
+    fn wd_read(&self, off: u16) -> u8 {
+        self.drives[self.drive_sel].fdc.with(|f| f.wd.fw_read(off))
+    }
+
+    fn wd_write(&mut self, off: u16, val: u8, ram: &mut [u8]) {
+        self.drives[self.drive_sel].fdc.with(|f| f.wd.fw_write(off, val, &mut Ram(ram)));
+    }
+
+    fn wd_irq(&self) -> bool {
+        let d = &self.drives[self.drive_sel];
+        d.is_1581(&self.m) && d.fdc.with(|f| f.wd.irq())
+    }
+}
+
+/// S31: the controller's state, shared by the drive slot (the firmware's side) and the controller TRX64 holds.
+#[derive(Clone, Default)]
+struct FdcHandle(Arc<FdcCell>);
+
+#[derive(Default)]
+struct FdcCell(UnsafeCell<Fdc>);
+
+// SAFETY: the backend, TRX64's `Machine` and every copy of the handle live on the emulation thread; `Send` is only
+// required because `FdcController: Send`.
+unsafe impl Send for FdcCell {}
+unsafe impl Sync for FdcCell {}
+
+impl FdcHandle {
+    /// Run `f` on the state. Calls do not nest: the slot never holds one across a call into TRX64, and the controller
+    /// holds one only inside a single `FdcController` call.
+    fn with<R>(&self, f: impl FnOnce(&mut Fdc) -> R) -> R {
+        // SAFETY: single thread, and no two borrows are live at once (see above).
+        f(unsafe { &mut *self.0 .0.get() })
+    }
+}
+
+struct Fdc {
+    wd: Wd177x,
+    /// The drive registers' lines: the mechanism's inputs (inserted, disk change, force ready, write protect).
+    lines: DriveLines,
+    /// What the 1581's CIA drives (PA0 side, PA2 motor).
+    out: FdcBoardOut,
+    /// Guest DDR while the C64 runs.
+    ddr: Option<(*mut u8, usize)>,
+}
+
+impl Default for Fdc {
+    fn default() -> Self {
+        Fdc { wd: Wd177x::new(), lines: DriveLines::default(), out: FdcBoardOut::RELEASED, ddr: None }
+    }
+}
+
+/// Guest DDR through the lease `C64Backend::lend_ddr` gives: reads 0 and drops writes without one.
+struct Lease(Option<(*mut u8, usize)>);
+
+impl DmaMem for Lease {
+    fn read(&mut self, addr: u32) -> u8 {
+        match self.0 {
+            // SAFETY: the lease is `IoCtx::ram`, lent by `C64Port` for the access in progress and taken back before the
+            // access returns; nothing else touches guest DDR while the C64 runs inside that access.
+            Some((ptr, len)) if (addr as usize) < len => unsafe { *ptr.add(addr as usize) },
+            _ => 0,
+        }
+    }
+    fn write(&mut self, addr: u32, val: u8) {
+        if let Some((ptr, _)) = self.0.filter(|&(_, len)| (addr as usize) < len) {
+            // SAFETY: as in `read`.
+            unsafe { *ptr.add(addr as usize) = val };
+        }
+    }
+}
+
+/// The WD177x in TRX64's 1581 (Spec 875). `clk` is the drive clock, 2 MHz.
+struct FdcDevice(FdcHandle);
+
+impl FdcController for FdcDevice {
+    fn name(&self) -> String {
+        "U64 WD177x".into()
+    }
+
+    fn read(&mut self, clk: u64, reg: u8) -> u8 {
+        self.0.with(|f| {
+            f.wd.run_to(clk, f.out.motor_on);
+            f.wd.cpu_read(u16::from(reg), &mut Lease(f.ddr))
+        })
+    }
+
+    fn store(&mut self, clk: u64, reg: u8, val: u8) {
+        self.0.with(|f| {
+            f.wd.run_to(clk, f.out.motor_on);
+            f.wd.cpu_store(u16::from(reg), val, &mut Lease(f.ddr));
+        });
+    }
+
+    fn peek(&self, reg: u8) -> u8 {
+        self.0.with(|f| f.wd.cpu_peek(u16::from(reg)))
+    }
+
+    fn clock_to(&mut self, clk: u64) {
+        self.0.with(|f| f.wd.run_to(clk, f.out.motor_on));
+    }
+
+    fn board_out(&mut self, clk: u64, out: FdcBoardOut) {
+        self.0.with(|f| {
+            f.wd.run_to(clk, f.out.motor_on);
+            f.out = out;
+        });
+    }
+
+    /// mm_drive.vhd:269: /RDY = motor and a disk in, or force ready; /DISK CHANGE and /WPS from the registers
+    /// (drive_registers.vhd:176-177).
+    fn board_in(&self) -> FdcBoardIn {
+        self.0.with(|f| FdcBoardIn {
+            ready: (f.out.motor_on && f.lines.inserted) || f.lines.force_ready,
+            disk_changed: f.lines.disk_change,
+            write_protected: f.lines.write_protect,
+        })
+    }
+
+    fn head(&self) -> (u8, u8) {
+        self.0.with(|f| (f.wd.cur_track(), u8::from(!f.out.side0)))
+    }
+
+    /// `drv_reset` (drive_registers.vhd:138) is the WD's reset; the drive clock restarts.
+    fn drive_reset(&mut self, clk: u64) {
+        self.0.with(|f| {
+            f.wd.set_reset(true);
+            f.wd.set_reset(false);
+            f.wd.rebase(clk);
+            f.out = FdcBoardOut::RELEASED;
+        });
+    }
+
+    fn rebase(&mut self, clk: u64) {
+        self.0.with(|f| f.wd.rebase(clk));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use trx64_core::gcr::{gcr_read_sector, CBMDOS_FDC_ERR_OK};
+    use trx64_core::iec::IECBUS_DEVICE_NONE;
+    use ue2_core::c64host::C64Backend;
+
+    /// The 1541 DOS ROM file in the firmware's roms directory.
+    const ROM_FILE: &str = "1541.bin";
+    /// Drive RAM holding the DOS's LISTEN and TALK addresses, which its reset derives from the unit (1541 ROM
+    /// $EB3A-$EB49): $20/$40 + unit.
+    const LISTEN: usize = 0x77;
+    const TALK: usize = 0x78;
+    use ue2_core::time::CLOCKS_PER_MS;
+
+    use super::*;
+
+    /// Firmware roms directory with the C64 ROMs and 1541.bin, or None (tests skip).
+    fn roms() -> Option<PathBuf> {
+        let root = std::env::var_os("UE2_FIRMWARE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../firmware/1541ultimate"));
+        let dir = root.join("roms");
+        if dir.join("basic.bin").is_file() && dir.join(ROM_FILE).is_file() {
+            Some(dir)
+        } else {
+            eprintln!("skipping: no C64 and 1541 ROMs in {} (set UE2_FIRMWARE)", dir.display());
+            None
+        }
+    }
+
+    fn run_ms(c64: &mut Trx64Backend, now: &mut u64, ms: u64) {
+        for _ in 0..ms {
+            *now += CLOCKS_PER_MS;
+            c64.advance_to(*now);
+        }
+    }
+
+    /// How often `text` (upper case and punctuation) is on the C64 screen, reverse video included (the directory
+    /// header is printed in reverse).
+    fn on_screen(c64: &Trx64Backend, text: &str) -> usize {
+        let codes: Vec<u8> = text.bytes().map(|b| if b.is_ascii_uppercase() { b - b'@' } else { b }).collect();
+        let screen = c64.frame().screen;
+        screen.windows(codes.len()).filter(|w| w.iter().zip(&codes).all(|(s, c)| s & 0x7F == *c)).count()
+    }
+
+    /// Run until `text` is on the screen `count` times; false after `ms`.
+    fn run_until(c64: &mut Trx64Backend, now: &mut u64, text: &str, count: usize, ms: u64) -> bool {
+        (0..ms / 10).any(|_| {
+            run_ms(c64, now, 10);
+            on_screen(c64, text) >= count
+        })
+    }
+
+    /// Type up to 10 PETSCII characters through the KERNAL keyboard buffer ($0277, count at $C6).
+    fn type_keys(c64: &mut Trx64Backend, keys: &str) {
+        for (i, key) in keys.bytes().enumerate() {
+            c64.dma_write(0x0277 + i as u16, key, true);
+        }
+        c64.dma_write(0x00C6, keys.len() as u8, true);
+    }
+
+    /// 10 PRINT"HI THERE", loaded at $0801.
+    fn hi_prg() -> Vec<u8> {
+        let mut prg = vec![0x01, 0x08, 0x11, 0x08, 10, 0, 0x99, b'"'];
+        prg.extend_from_slice(b"HI THERE\"\0\0\0");
+        prg
+    }
+
+    fn name16(name: &[u8]) -> Vec<u8> {
+        let mut padded = name.to_vec();
+        padded.resize(16, 0xA0);
+        padded
+    }
+
+    fn sectors(track: usize) -> usize {
+        match track {
+            1..=17 => 21,
+            18..=24 => 19,
+            25..=30 => 18,
+            _ => 17,
+        }
+    }
+
+    fn sector_offset(track: usize, sector: usize) -> usize {
+        ((1..track).map(sectors).sum::<usize>() + sector) * 256
+    }
+
+    /// A 35-track D64 "UE2 TEST", ID U2, holding the PRG "HI" at 17/0.
+    fn d64() -> Vec<u8> {
+        let mut d = vec![0; sector_offset(36, 0)];
+        let bam = sector_offset(18, 0);
+        d[bam..bam + 4].copy_from_slice(&[18, 1, 0x41, 0]);
+        for track in 1..=35 {
+            let used: &[usize] = match track {
+                17 => &[0],
+                18 => &[0, 1],
+                _ => &[],
+            };
+            let free = (0..sectors(track)).filter(|s| !used.contains(s)).fold(0u32, |bits, s| bits | 1 << s);
+            let count = (sectors(track) - used.len()) as u8;
+            d[bam + 4 * track..bam + 4 * track + 4].copy_from_slice(&[count, free as u8, (free >> 8) as u8, (free >> 16) as u8]);
+        }
+        d[bam + 0x90..bam + 0xA0].copy_from_slice(&name16(b"UE2 TEST"));
+        d[bam + 0xA0..bam + 0xAB].copy_from_slice(b"\xA0\xA0U2\xA02A\xA0\xA0\xA0\xA0");
+        let dir = sector_offset(18, 1);
+        d[dir..dir + 5].copy_from_slice(&[0, 0xFF, 0x82, 17, 0]);
+        d[dir + 5..dir + 21].copy_from_slice(&name16(b"HI"));
+        d[dir + 30] = 1;
+        let prg = hi_prg();
+        let file = sector_offset(17, 0);
+        d[file..file + 2].copy_from_slice(&[0, prg.len() as u8 + 1]);
+        d[file + 2..file + 2 + prg.len()].copy_from_slice(&prg);
+        d
+    }
+
+    /// The drive area's ROM image: the 16 K DOS mirrored at $8000 and $C000 (c1541.cc:937-940).
+    fn rom_image(dir: &Path) -> Vec<u8> {
+        let dos = ue2_host::fs::read(dir.join(ROM_FILE)).expect("1541 ROM");
+        [dos.clone(), dos].concat()
+    }
+
+    /// Drive `unit` (0 = A, 1 = B) holds [`d64`] and runs with `lines`: the firmware's insert (c1541.cc:456-514)
+    /// and power-on (c1541.cc:324-349) reduced to surfaces and lines.
+    fn insert_and_start(c64: &mut Trx64Backend, now: &mut u64, unit: u8, lines: DriveLines, rom: &[u8]) {
+        let image = GcrImage::from_d64(&d64());
+        let drive = c64.drive(unit).expect("a drive");
+        for (half_track, track) in image.tracks.iter().enumerate() {
+            drive.set_track(half_track as u8, &track.data[..track.size]);
+        }
+        drive.set_lines(DriveLines { reset: true, ..lines }, rom);
+        run_ms(c64, now, 1);
+        c64.drive(unit).expect("a drive").set_lines(lines, rom);
+    }
+
+    /// A C64 at READY. whose drive A holds [`d64`] and runs with `lines`.
+    fn with_drive(lines: DriveLines) -> Option<(Trx64Backend, u64)> {
+        let dir = roms()?;
+        let mut c64 = Trx64Backend::new(&dir);
+        let rom = rom_image(&dir);
+        let mut now = 0;
+        c64.advance_to(now);
+        c64.set_reset(true);
+        run_ms(&mut c64, &mut now, 20);
+        c64.set_reset(false);
+        insert_and_start(&mut c64, &mut now, 0, lines, &rom);
+        assert!(run_until(&mut c64, &mut now, "READY.", 1, 3000), "no READY.");
+        Some((c64, now))
+    }
+
+    fn running(device: u8) -> DriveLines {
+        DriveLines { power: true, reset: false, write_protect: false, device, ..DriveLines::default() }
+    }
+
+    #[test]
+    fn held_or_unpowered_drive_runs_nothing() {
+        let mut c64 = Trx64Backend::new(Path::new("/nonexistent"));
+        // Drive 8's own bus slot: the IEC processor stands at slot 4 for good (S30), so the bus as a whole is never
+        // empty again.
+        let off = |c64: &Trx64Backend| c64.m.iec.iecbus_device[8] == IECBUS_DEVICE_NONE;
+        let clocked = |c64: &Trx64Backend| c64.m.drive8.is_clocked();
+        assert!(off(&c64) && !clocked(&c64), "power-on: off and in reset");
+        c64.advance_to(0);
+        c64.set_reset(true);
+        c64.set_reset(false);
+        assert!(off(&c64) && !clocked(&c64), "a C64 reset leaves an unpowered drive alone");
+        let rom = vec![0; 0x8000];
+        c64.set_lines(DriveLines { power: true, ..DriveLines::default() }, &rom);
+        assert!(off(&c64) && !clocked(&c64), "powered, still in reset: nothing on the bus");
+        c64.set_lines(running(0), &rom);
+        assert!(!off(&c64) && clocked(&c64), "released");
+        c64.set_stopped(true);
+        assert!(!clocked(&c64) && c64.m.drive8.stopped() && !off(&c64), "stops with the C64, stays on the bus");
+        c64.set_stopped(false);
+        c64.set_lines(DriveLines { stop_on_freeze: false, ..running(0) }, &rom);
+        c64.set_stopped(true);
+        assert!(clocked(&c64), "runs on while the C64 is frozen");
+        c64.set_stopped(false);
+        c64.set_reset(true);
+        assert!(!clocked(&c64) && c64.m.drive8.reset_held(), "follows the C64's reset (RESET bit 1)");
+        c64.set_reset(false);
+        assert!(clocked(&c64) && !off(&c64));
+        c64.set_lines(DriveLines { power: false, ..running(0) }, &rom);
+        assert!(off(&c64) && !clocked(&c64), "power off releases the bus");
+        assert!(!c64.m.drive_b.powered(), "drive B was never switched on");
+    }
+
+    #[test]
+    fn dos_lists_loads_and_saves() {
+        let Some((mut c64, mut now)) = with_drive(running(0)) else { return };
+        type_keys(&mut c64, "LOAD\"$\",8\r");
+        assert!(run_until(&mut c64, &mut now, "READY.", 2, 10_000), "directory not loaded: {:?}", c64.frame().screen);
+        assert_eq!(c64.status().half_track, 34, "head on track 18");
+        type_keys(&mut c64, "LIST\r");
+        assert!(run_until(&mut c64, &mut now, "BLOCKS FREE.", 1, 2000));
+        assert_eq!((on_screen(&c64, "\"UE2 TEST        \" U2 2A"), on_screen(&c64, "\"HI\"")), (1, 1));
+
+        // CLR/HOME first, so the READY. count is not cut short by the screen scrolling.
+        let clear = |c64: &mut Trx64Backend, now: &mut u64| {
+            type_keys(c64, "\u{93}");
+            assert!(run_until(c64, now, "READY.", 0, 100));
+            run_ms(c64, now, 100);
+            assert_eq!(on_screen(c64, "READY."), 0, "screen cleared");
+        };
+        clear(&mut c64, &mut now);
+        type_keys(&mut c64, "LOAD\"HI\",8\r");
+        assert!(run_until(&mut c64, &mut now, "READY.", 1, 10_000), "HI not loaded");
+        type_keys(&mut c64, "RUN\r");
+        assert!(run_until(&mut c64, &mut now, "HI THERE", 1, 2000));
+
+        clear(&mut c64, &mut now);
+        c64.take_written();
+        type_keys(&mut c64, "SAVE\"N\",8\r");
+        assert!(run_until(&mut c64, &mut now, "READY.", 1, 20_000), "SAVE did not finish");
+        run_ms(&mut c64, &mut now, 500);
+        let written = c64.take_written();
+        assert_ne!(written & 1 << 34, 0, "directory track written: {written:#x}");
+        // Decode what the DOS wrote: the directory entry N on 18/1, then its first block.
+        let read = |c64: &Trx64Backend, track: u8, sector: u8| {
+            let data = c64.track((track - 1) * 2).to_vec();
+            let mut block = [0; 256];
+            assert_eq!(gcr_read_sector(&GcrTrack { size: data.len(), data }, &mut block, sector), CBMDOS_FDC_ERR_OK);
+            block
+        };
+        let dir = read(&c64, 18, 1);
+        let entry = (0..8).map(|i| &dir[2 + 32 * i..34 + 32 * i]).find(|e| e[0] == 0x82 && e[3..19] == name16(b"N")[..]);
+        let entry = entry.expect("N in the directory");
+        assert_ne!(written & 1 << ((entry[1] - 1) * 2), 0, "file track written");
+        let block = read(&c64, entry[1], entry[2]);
+        assert_eq!((block[0], &block[2..usize::from(block[1]) + 1]), (0, &hi_prg()[..]), "N holds the program");
+    }
+
+    #[test]
+    fn device_jumpers_move_the_dos_address() {
+        let Some((mut c64, mut now)) = with_drive(running(1)) else { return };
+        assert_eq!(c64.m.drive8.unit(), 9, "HW_ADDR 1 is unit 9");
+        let listen_talk = |c64: &Trx64Backend| (c64.m.drive8.ram()[LISTEN], c64.m.drive8.ram()[TALK]);
+        assert!((0..300).any(|_| {
+            run_ms(&mut c64, &mut now, 10);
+            listen_talk(&c64) == (0x29, 0x49)
+        }));
+        let mut ram = [0; RAM_LEN];
+        c64.read_ram(&mut ram);
+        assert_eq!(ram[TALK], 0x49, "device 9");
+    }
+
+    /// S27 §4: drive B is TRX64's position B behind the second window: at unit 9 it lists its own disk while drive A,
+    /// off, answers nothing at 8.
+    #[test]
+    fn drive_b_answers_at_its_own_unit() {
+        let Some(dir) = roms() else { return };
+        let mut c64 = Trx64Backend::new(&dir);
+        let rom = rom_image(&dir);
+        let mut now = 0;
+        c64.advance_to(now);
+        c64.set_reset(true);
+        run_ms(&mut c64, &mut now, 20);
+        c64.set_reset(false);
+        insert_and_start(&mut c64, &mut now, 1, running(1), &rom);
+        assert!(run_until(&mut c64, &mut now, "READY.", 1, 3000), "no READY.");
+        assert!(c64.m.drive_b.powered() && !c64.m.drive8.powered());
+        type_keys(&mut c64, "LOAD\"$\",9\r");
+        assert!(run_until(&mut c64, &mut now, "READY.", 2, 10_000), "directory not loaded from 9");
+        type_keys(&mut c64, "LIST\r");
+        assert!(run_until(&mut c64, &mut now, "BLOCKS FREE.", 1, 2000));
+        assert_eq!(on_screen(&c64, "\"UE2 TEST        \" U2 2A"), 1);
+        type_keys(&mut c64, "LOAD\"$\",8\r");
+        assert!(run_until(&mut c64, &mut now, "DEVICE NOT PRESENT", 1, 3000), "drive A is off");
+    }
+}

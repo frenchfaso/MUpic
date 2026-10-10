@@ -1,0 +1,17 @@
+{
+  "schema": "mupic-samples-v1",
+  "files": {
+    "BUNNY.MUP": {
+      "bytes": 417136640,
+      "sha256": "ec35a7ee07cf1884e6c2a8024c3e19ae76b49fcb4291487726a61c710717d3c5",
+      "compressed_bytes": 141217188,
+      "compressed_sha256": "939963b92f78ade6da87ced8212e37cd20be51b803c37dd3151937d121551705"
+    },
+    "CYBER77.MUP": {
+      "bytes": 39649280,
+      "sha256": "2ed8c14eeb816a1f1aa519e6b20fcd6843c1cf3e614fbc26291c3dc2cee132e5",
+      "compressed_bytes": 15298195,
+      "compressed_sha256": "dfd22e69df8ff34ca2b29734b7f16581ad04a0f92a33ac0028c8c8492fcc69ff"
+    }
+  }
+}

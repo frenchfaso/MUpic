@@ -1,0 +1,12 @@
+[package]
+name = "c64-bridge"
+description = "TRX64 (trx64-core) as the C64 behind the U64-II cart/DMA registers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+ue2-host = { path = "../ue2-host" }
+ue2-core = { path = "../ue2-core" }
+# Private all-Rust vendored core; no network Git dependency.
+trx64-core = { path = "../../vendor/trx64-core" }

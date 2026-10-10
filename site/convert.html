@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#080b0d">
+  <meta name="description" content="Convert a local video to MUpic, privately in your browser.">
+  <title>Convert · MUpic</title>
+  <link rel="stylesheet" href="style.css"><link rel="stylesheet" href="mupic.css"><link rel="stylesheet" href="converter.css">
+</head>
+<body data-preset="converter">
+<main>
+  <header class="page-title"><h1>16 colors is all you need!</h1>
+    <nav class="project-nav" aria-label="Project"><a href="index.html">Demo</a><a href="convert.html" aria-current="page">Converter</a><a href="https://github.com/frenchfaso/MUpic">GitHub</a></nav>
+  </header>
+  <section id="drop-zone" class="drop-zone" aria-label="Choose a local video">
+    <span class="drop-icon" aria-hidden="true">↓</span>
+    <p>Drop a video</p>
+    <button id="choose-video" type="button">Choose a video</button>
+    <input id="video-file" type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.mkv" hidden>
+  </section>
+  <section class="conversion-panel" aria-label="Conversion">
+    <p id="file-details" class="file-details" hidden></p>
+    <div class="conversion-actions"><button id="convert" type="button" disabled>Convert</button><button id="cancel" type="button" hidden>Cancel</button><a id="download" class="button-link" hidden>Download MUP</a></div>
+    <details class="options"><summary>Options</summary>
+      <div class="settings">
+        <label><input id="silent-source" type="checkbox"> Silent source</label>
+        <label>Audio gain <select id="audio-gain"><option value="0">0 dB</option><option value="6">+6 dB</option><option value="12">+12 dB</option></select></label>
+        <a href="https://github.com/frenchfaso/MUpic">Native CLI</a>
+      </div>
+    </details>
+    <progress id="conversion-progress" max="1" value="0" hidden aria-label="Conversion progress"></progress>
+    <p id="conversion-status" role="status" aria-live="polite" hidden></p>
+  </section>
+  <section id="comparison" class="comparison" aria-label="Original and converted video preview" hidden>
+    <figure><figcaption>Original</figcaption>
+      <div class="preview-screen"><video id="original-video" controls playsinline preload="metadata" aria-label="Original video and shared playback controls"></video></div>
+    </figure>
+    <figure><figcaption>MUpic</figcaption>
+      <div class="preview-screen"><canvas id="mup-preview" width="360" height="200" aria-label="Decoded MUP preview"></canvas></div>
+    </figure>
+  </section>
+  <div id="preview-controls" class="preview-controls" hidden>
+    <label>Audio <select id="preview-audio"><option value="mup">MUpic</option><option value="original">Original</option><option value="mute">Mute</option></select></label>
+  </div>
+  <video id="decode-video" muted playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
+</main>
+<script type="module" src="converter.mjs"></script>
+</body>
+</html>

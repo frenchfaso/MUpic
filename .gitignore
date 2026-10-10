@@ -1,0 +1,12 @@
+**/target/
+**/cache/
+**/__pycache__/
+**/.DS_Store
+build/
+site/media/
+*.mup
+*.MUP
+*.img
+reports/local-*
+.env
+*.log

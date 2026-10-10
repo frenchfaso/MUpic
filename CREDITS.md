@@ -1,0 +1,13 @@
+# Credits and licenses
+
+- **UPIC:** Aleksi Eeben / CNCD, border-color raster graphics and UPIC 1.3. [Original release](https://csdb.dk/release/?id=263980). The player builds on the corrected viewer work maintained by **Xander Mol / xahmol**, [Mandelbrot UPIC](https://github.com/xahmol/mandelbrot-upic). The player is GPL-3.0-only.
+- **Positional dithering:** Joel Yliluoma / Bisqwit, [arbitrary-palette positional dithering](https://bisqwit.iki.fi/story/howto/dither/jy/). Our Rust implementation reconstructs improved algorithm 1, with an optional neutral guard; the fixed 8×8 Bayer threshold matrix does not move between frames.
+- **Perceptual color:** Björn Ottosson, [OKLab](https://bjoernottosson.github.io/posts/oklab/), for rate-control error; CIEDE2000 for author-plan matching (M. R. Luo, G. Cui and B. Rigg; implementation guidance by G. Sharma, W. Wu and E. N. Dalal). [CIEDE2000 resources](https://hajim.rochester.edu/ece/sites/gsharma/ciede2000/).
+- **Ultimate hardware, firmware and audio:** Gideon Zweijtzer / Gideon's Logic, [1541ultimate](https://github.com/GideonZ/1541ultimate), [UltimateAudio specification](https://github.com/GideonZ/1541ultimate/blob/master/doc/ultimate_audio_v0.2.pdf).
+- **Browser emulator:** the UE2-C64U-WebRust integration, with its corresponding Rust sources under `demo/emulator`; trx64-core and reSID-rs retain the notices and GPL licenses in their vendor directories. Firmware and Commodore ROM data retain their respective authors' rights and are not relicensed as MUpic code.
+- **CRT:** guest.r / libretro's [slang-shaders](https://github.com/libretro/slang-shaders), pinned in `site/crt/UPSTREAM.json`. WGSL conversions and the included upstream resources retain individual license headers and the bundled copying texts.
+- **Movie:** Big Buck Bunny, © 2008 Blender Foundation / [bigbuckbunny.org](https://peach.blender.org/about/), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Adaptation: resized, converted to the C64 palette and MUpic rate-controlled video; audio resampled to UltimateAudio PCM. The complete movie retains its ending credits.
+- **Second sample:** the supplied [Cyberpunk video](https://youtu.be/VmyOU3jLQWU), resized and converted to MUpic. Its original audiovisual content remains the property of its authors and is not relicensed under the project's GPL.
+- **Media decoding:** FFmpeg is used by the native command line encoder, installed separately. Browser conversion uses local media APIs and does not upload input videos.
+
+MUpic project code is distributed under GPL-3.0; third-party licenses and copyright notices take precedence for their respective components. This project is not affiliated with Commodore, Gideon's Logic, or the Blender Foundation.

@@ -1,0 +1,8 @@
+[package]
+name = "ue2-host"
+description = "Rust host boundary for native and browser emulator instances"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]

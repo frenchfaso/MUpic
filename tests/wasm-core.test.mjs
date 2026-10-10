@@ -1,0 +1,37 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile,writeFile} from 'node:fs/promises';
+import {EncoderCore} from '../site/wasm-core.mjs';
+import {MupPreview,PALETTE,CONTENT_FPS} from '../site/mup-decoder.mjs';
+const wasmFile=new URL('../site/assets/encoder.wasm',import.meta.url);
+const makeCore=async()=>new EncoderCore((await WebAssembly.instantiate(await readFile(wasmFile),{})).instance.exports);
+const rowFrame=front=>Uint8Array.from({length:36000},(_,i)=>front[(i%180)*256+Math.floor(i/180)]);
+test('the real Rust WASM quantizes hardware colors and emits independently decodable MUP9',async()=>{
+  const quantizer=await makeCore(),encoder=await makeCore(),frames=8,parts=[],previews=[];
+  const pcm=new Uint8Array(Math.ceil(frames/CONTENT_FPS*22085)*4);
+  const pcmView=new DataView(pcm.buffer);for(let i=0;i<pcm.length;i+=4){pcmView.setInt16(i,1234,true);pcmView.setInt16(i+2,-5678,true);}
+  encoder.begin(frames,pcm,'BROWSER ABI TEST');
+  for(let frame=0;frame<frames;frame++) {
+    const rgb=new Uint8Array(216000);
+    for(let y=0;y<200;y++)for(let x=2;x<358;x++)rgb.set(PALETTE[(Math.floor(x/23)+Math.floor(y/31)+frame)%16],(y*360+x)*3);
+    const packed=quantizer.quantize(rgb);
+    assert.equal(packed.length,36000);
+    for(let y=0;y<200;y++)for(let x=2;x<358;x++)assert.equal((packed[y*180+Math.floor(x/2)]>>((x%2)*4))&15,(Math.floor(x/23)+Math.floor(y/31)+frame)%16);
+    parts.push(...encoder.frame(packed));
+    const e=encoder.exports;previews.push(encoder.bytes(e.mup_preview_ptr(),e.mup_preview_len()).slice());
+  }
+  const finished=encoder.finish();parts.push(...finished.chunks);
+  assert.equal(finished.stats.receivedFrames,frames);assert.ok(finished.stats.peakSlots<=425000);
+  const blob=new Blob([finished.prefix,...parts]),preview=await MupPreview.open(blob);
+  assert.equal(preview.header.frameCount,frames);assert.equal(preview.header.divider,281);
+  for(const frame of [0,1,7,4,2,6]){await preview.frame(frame);assert.deepEqual(rowFrame(preview.state.front),previews[frame],`frame${frame} post-rate-control`);}
+  const fakeContext={createBuffer(channels,samples,rate){return {sampleRate:rate,data:[new Float32Array(samples),new Float32Array(samples)],getChannelData(index){return this.data[index];}};}};
+  const audio=await preview.audioBuffer(fakeContext);
+  assert.equal(audio.sampleRate,22085);assert.equal(audio.data[0][0],1234/32768);assert.equal(audio.data[1][0],-5678/32768);
+  assert.equal(audio.data[0].at(-1),1234/32768);
+  if(process.env.MUP_TEST_OUTPUT)await writeFile(process.env.MUP_TEST_OUTPUT,new Uint8Array(await blob.arrayBuffer()));
+});
+test('raw ABI validation errors propagate from Rust with readable messages',async()=>{
+  const core=await makeCore();assert.throws(()=>core.quantize(Uint8Array.of(0,0,0)),/360x200/);
+  assert.throws(()=>core.begin(1,new Uint8Array(),'INVALID'),/Frame count/);
+});
