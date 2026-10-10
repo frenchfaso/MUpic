@@ -10,17 +10,17 @@ body[data-preset="mupic"] main {
 .page-title h1 {
   margin: 0;
   color: var(--yellow);
-  font-size: clamp(20px, 3.6vw, 36px);
+  font-size: clamp(32px, 5vw, 48px);
   line-height: 1.25;
   font-weight: 600;
   letter-spacing: -.04em;
   text-wrap: balance;
 }
-body[data-preset="mupic"] .page-title h1 { font-size: clamp(32px, 5vw, 48px); }
 .page-subtitle { margin: 6px 0 0; color: var(--muted); font-size: clamp(12px, 1.8vw, 15px); line-height: 1.5; }
 .project-nav { display: flex; justify-content: center; gap: 24px; margin-top: 12px; font-size: 12px; }
 .project-nav a, .tech-credit a { color: var(--yellow); text-decoration: none; }
 .project-nav a:hover, .tech-credit a:hover { text-decoration: underline; }
+.project-nav [aria-current="page"] { color: var(--cyan); text-decoration: underline; text-underline-offset: 3px; }
 .tech-credit { max-width: 700px; margin: 12px 0 0; text-align: center; color: var(--muted); font-size: 11px; line-height: 1.6; }
 body[data-preset="mupic"] .hardware-stage {
   width: min(100%, 960px, max(280px, calc(107.95848vh - 280px)));
