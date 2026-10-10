@@ -1,5 +1,5 @@
 //! Shared bounded-memory encoder used by the CLI and isolated browser workers.
-use crate::{audio::sample_at_tick, author_dither::AuthorDither, dict4_rate, sd};
+use crate::{audio::sample_at_tick, author_dither::AuthorDither, dict4_rate, lut, sd};
 use sha2::{Digest, Sha256};
 
 pub const VIDEO_WIDTH: usize = 360;
@@ -54,6 +54,10 @@ pub fn frame_count(seconds: f64) -> Result<usize, String> {
 /// Bayer positions are physical canvas positions and never depend on time.
 pub struct Quantizer {
     author: AuthorDither,
+    lut: Vec<u32>,
+    lut_blocks: Vec<bool>,
+    lut_loaded: usize,
+    lut_asset: Option<lut::AssetImporter>,
 }
 impl Quantizer {
     pub fn new(threads: usize) -> Result<Self, String> {
@@ -62,7 +66,13 @@ impl Quantizer {
         }
         let mut author = AuthorDither::new(&PALETTE, true)?;
         author.set_threads(threads);
-        Ok(Self { author })
+        Ok(Self {
+            author,
+            lut: Vec::new(),
+            lut_blocks: vec![false; lut::BLOCK_COUNT],
+            lut_loaded: 0,
+            lut_asset: None,
+        })
     }
     fn cache_limit() -> usize {
         if cfg!(target_arch = "wasm32") {
@@ -77,7 +87,11 @@ impl Quantizer {
         if rgb.len() % RGB_BYTES != 0 || rgb.is_empty() {
             return Err("RGB batch must contain whole 360x200 RGB24 frames".into());
         }
+        if self.lut_complete() {
+            return Ok(Vec::new());
+        }
         let mut missing = self.author.missing_rgb_keys(rgb);
+        missing.retain(|&key| !self.lut_has(key));
         let limit = Self::cache_limit();
         if missing.len() > limit {
             return Err("RGB planning batch exceeds the bounded color cache".into());
@@ -85,6 +99,7 @@ impl Quantizer {
         if self.author.cached_rgb_count() + missing.len() > limit {
             self.author.clear_cache();
             missing = self.author.missing_rgb_keys(rgb);
+            missing.retain(|&key| !self.lut_has(key));
             if missing.len() > limit {
                 return Err("RGB planning batch exceeds the bounded color cache".into());
             }
@@ -113,6 +128,26 @@ impl Quantizer {
         Ok(self.pack_plans(rgb))
     }
     pub fn pack_plans(&mut self, rgb: &[u8]) -> Vec<u8> {
+        if !self.lut.is_empty() {
+            let mut packed = vec![0; PACKED_BYTES];
+            for y in 0..VIDEO_HEIGHT {
+                for x in 2..VIDEO_WIDTH - 2 {
+                    let offset = (y * VIDEO_WIDTH + x) * 3;
+                    let pixel = [rgb[offset], rgb[offset + 1], rgb[offset + 2]];
+                    let key = (u32::from(pixel[0]) << 16
+                        | u32::from(pixel[1]) << 8
+                        | u32::from(pixel[2])) as usize;
+                    let stored = self.lut[key];
+                    let plan = if stored == u32::MAX {
+                        self.author.plan(pixel)
+                    } else {
+                        stored as usize
+                    };
+                    packed[y * 180 + x / 2] |= self.author.colour(plan, x, y) << ((x & 1) * 4);
+                }
+            }
+            return packed;
+        }
         let plans = self.author.frame_plans(rgb);
         let mut packed = vec![0; PACKED_BYTES];
         for y in 0..VIDEO_HEIGHT {
@@ -122,6 +157,82 @@ impl Quantizer {
             }
         }
         packed
+    }
+    fn lut_has(&self, key: u32) -> bool {
+        !self.lut.is_empty() && self.lut[key as usize] != u32::MAX
+    }
+    pub fn generate_lut_block(&self, number: usize) -> Result<Vec<u8>, String> {
+        lut::generate_block(number, &self.author)
+    }
+    pub fn import_lut_block(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let block = lut::decode_block(bytes, &self.author)?;
+        if self.lut.is_empty() {
+            self.lut = vec![u32::MAX; lut::DOMAIN];
+        }
+        let start = block.number * lut::BLOCK_SIZE;
+        self.lut[start..start + lut::BLOCK_SIZE].copy_from_slice(&block.plans);
+        if !self.lut_blocks[block.number] {
+            self.lut_blocks[block.number] = true;
+            self.lut_loaded += 1;
+        }
+        Ok(block.number)
+    }
+    pub fn lut_loaded_blocks(&self) -> usize {
+        self.lut_loaded
+    }
+    #[cfg(test)]
+    pub(crate) fn lut_allocated_colors(&self) -> usize {
+        self.lut.len()
+    }
+    pub fn lut_complete(&self) -> bool {
+        self.lut_loaded == lut::BLOCK_COUNT
+    }
+    pub fn clear_lut(&mut self) {
+        self.lut = Vec::new();
+        self.lut_blocks.fill(false);
+        self.lut_loaded = 0;
+        self.lut_asset = None;
+    }
+    pub fn begin_lut_asset(&mut self, header: &[u8]) -> Result<(), String> {
+        if self.lut_asset.is_some() {
+            return Err("A LUT asset import is already running".into());
+        }
+        self.lut_asset = Some(lut::AssetImporter::begin(header, &self.author)?);
+        Ok(())
+    }
+    pub fn append_lut_asset(&mut self, chunk: &[u8]) -> Result<(), String> {
+        let result = self
+            .lut_asset
+            .as_mut()
+            .ok_or("Begin LUT asset import before appending data")?
+            .append(chunk);
+        if result.is_err() {
+            self.lut_asset = None;
+        }
+        result
+    }
+    pub fn finish_lut_asset(&mut self) -> Result<(), String> {
+        self.finish_lut_asset_inner(None)
+    }
+    pub fn finish_lut_asset_verified(&mut self, expected_hash: &[u8]) -> Result<(), String> {
+        if expected_hash.len() != 32 {
+            return Err("Expected LUT asset checksum must contain 32 bytes".into());
+        }
+        self.finish_lut_asset_inner(Some(expected_hash))
+    }
+    fn finish_lut_asset_inner(&mut self, expected_hash: Option<&[u8]>) -> Result<(), String> {
+        let importer = self
+            .lut_asset
+            .take()
+            .ok_or("Begin LUT asset import before finishing")?;
+        let plans = importer.finish(expected_hash)?;
+        self.lut = plans;
+        self.lut_blocks.fill(true);
+        self.lut_loaded = lut::BLOCK_COUNT;
+        Ok(())
+    }
+    pub fn abort_lut_asset(&mut self) {
+        self.lut_asset = None;
     }
     pub fn author_mut(&mut self) -> &mut AuthorDither {
         &mut self.author

@@ -18,6 +18,12 @@
       <a href="https://github.com/frenchfaso/MUpic">GitHub</a>
     </nav>
   </header>
+  <section class="lut-panel" aria-label="Color table">
+    <p id="lut-status" role="status" aria-live="polite">Loading color table…</p>
+    <progress id="lut-progress" max="1" value="0" aria-label="Color table loading progress"></progress>
+    <p id="lut-note">The color table downloads once and is saved on this device. You can choose a video while it loads; videos stay on your device.</p>
+    <div class="conversion-actions"><button id="lut-retry" type="button" hidden>Retry loading</button><button id="lut-standard" type="button">Use standard encoding</button></div>
+  </section>
   <section id="drop-zone" class="drop-zone" aria-label="Choose a local video">
     <span class="drop-icon" aria-hidden="true">↓</span>
     <p>Drop a video</p>
@@ -50,6 +56,6 @@
   </div>
   <video id="decode-video" muted playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
 </main>
-<script type="module" src="converter.mjs?v=f02227f35f0fafe7"></script>
+<script type="module" src="converter.mjs?v=83c743bb6a39bcbc"></script>
 </body>
 </html>

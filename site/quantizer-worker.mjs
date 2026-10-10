@@ -1,10 +1,16 @@
-import {EncoderCore} from './wasm-core.mjs?v=65be04c379a52579';
+import {EncoderCore} from './wasm-core.mjs?v=8cecc6abd7bccd64';
 let core,frames=[];
 self.onmessage = async ({data}) => {
   const {id,method,args={}}=data;
   try {
     let result,transfer=[];
     if(method==='init') { core=await EncoderCore.load(args.url); result={ready:true}; }
+    else if(method==='lutIdentity')result=core.lutIdentity();
+    else if(method==='lutInfo')result=core.lutInfo();
+    else if(method==='beginLutAsset')core.beginLutAsset(new Uint8Array(args.header));
+    else if(method==='appendLutAsset')core.appendLutAsset(new Uint8Array(args.chunk));
+    else if(method==='finishLutAsset')core.finishLutAsset(args.expectedSha);
+    else if(method==='abortLutAsset')core.abortLutAsset();
     else if(method==='prepare') {
       frames=args.frames.map(buffer=>new Uint8Array(buffer));
       if(frames.length<1||frames.length>3||frames.some(frame=>frame.length!==216000))

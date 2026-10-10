@@ -2,6 +2,7 @@
 """Audit the exact public Git payload, including the two authorized LFS movies."""
 import argparse, hashlib, json, re, subprocess
 from pathlib import Path
+from package_lut import validate_asset
 ROOT=Path(__file__).resolve().parent.parent
 PREFIXES={'demo','encoder','media','player','releases','site','tests','tools','.github'}
 ROOT_FILES={'.gitignore','.gitattributes','README.md','CREDITS.md','LICENSE'}
@@ -15,6 +16,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,default=ROOT/'build'/'publication-audit.json')
     args=parser.parse_args()
+    validate_asset(ROOT/'site')
     names=sorted(set(run('git','ls-files','-z','--cached','--others','--exclude-standard').decode().split('\0'))-{''})
     deleted=set(run('git','ls-files','-z','--deleted').decode().split('\0'))
     names=[name for name in names if name not in deleted]

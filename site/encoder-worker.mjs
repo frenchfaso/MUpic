@@ -1,4 +1,4 @@
-import {EncoderCore} from './wasm-core.mjs?v=65be04c379a52579';
+import {EncoderCore} from './wasm-core.mjs?v=8cecc6abd7bccd64';
 let core;
 self.onmessage = async ({data}) => {
   const {id,method,args={}}=data;

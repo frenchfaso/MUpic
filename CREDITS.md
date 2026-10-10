@@ -9,5 +9,6 @@
 - **Big Buck Bunny:** © 2008 Blender Foundation / [bigbuckbunny.org](https://peach.blender.org/about/), [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/). Adaptation: resized, converted to the C64 palette and rate-controlled MUpic video; audio resampled to UltimateAudio PCM. Its complete credits roll is preserved.
 - **Second sample:** [Commodore 77: The Commodore 64 Just Went Cyberpunk!](https://youtu.be/VmyOU3jLQWU), resized and converted to MUpic. The original audiovisual content remains its authors' property and is not relicensed under the project's GPL.
 - **Media decoding:** FFmpeg is installed separately for the native encoder. Browser conversion uses local media APIs without uploading input videos.
+- **Offline LUT tooling:** [WABT](https://github.com/WebAssembly/wabt), licensed under Apache-2.0, translates the shared encoder into C for table generation. Its runtime and license accompany distributed generator bundles.
 
 MUpic code is distributed under GPL-3.0; third-party licenses and copyright notices govern their components. This project is not affiliated with Commodore, Gideon's Logic or the Blender Foundation.

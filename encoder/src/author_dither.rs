@@ -9,6 +9,7 @@
 //! component list. Selection uses CIEDE2000, with a conservative branch bound
 //! rather than treating that colour difference as an Euclidean metric.
 
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
 #[cfg(not(target_arch = "wasm32"))]
@@ -312,6 +313,18 @@ impl AuthorDither {
 
     pub fn cached_rgb_count(&self) -> usize {
         self.cache.len()
+    }
+    pub fn candidate_count(&self) -> usize {
+        self.candidates.len()
+    }
+    /// Fingerprint the exact integer output for every plan and Bayer position.
+    pub fn pattern_fingerprint(&self) -> [u8; 32] {
+        let mut hash = Sha256::new();
+        hash.update((self.candidates.len() as u32).to_le_bytes());
+        for candidate in &self.candidates {
+            hash.update(BAYER.map(|rank| candidate.colour(rank)));
+        }
+        hash.finalize().into()
     }
 
     pub(crate) fn additional_key_count(&self, keys: &[u32]) -> usize {

@@ -3,6 +3,7 @@ mod audio;
 pub mod author_dither;
 mod core;
 mod dict4_rate;
+pub mod lut;
 mod sd;
 mod wasm;
 

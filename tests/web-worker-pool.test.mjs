@@ -15,7 +15,7 @@ test('worker RPC matches out-of-order responses and surfaces errors',async()=>{
   const bad=client.call('bad');client.worker.reply(2,null,'Rust says no');await assert.rejects(bad,/Rust says no/);client.close();
 });
 test('cancel rejects pending requests and terminates all isolated WASM workers',async()=>{
-  const pool=new QuantizerPool(3,'quantizer-worker.mjs');
+  const pool=new QuantizerPool(3,'quantizer-worker.mjs',{eager:true});
   const request=pool.workers[0].call('quantize',{});pool.close();await assert.rejects(request,/cancelled/);
   assert.ok(pool.workers.every(worker=>worker.worker.closed));await assert.rejects(pool.workers[1].call('init'),/cancelled/);
 });
@@ -25,7 +25,7 @@ test('a failed transfer rejects the call without retaining an RPC entry',async()
   await assert.rejects(client.call('plan'),/Invalid transfer/);assert.equal(client.pending.size,0);client.close();
 });
 test('color work is disjoint, dynamically balanced and imported before packing',async()=>{
-  const pool=new QuantizerPool(3,'quantizer-worker.mjs'),keys=Uint32Array.from({length:5200},(_,i)=>i);
+  const pool=new QuantizerPool(3,'quantizer-worker.mjs',{eager:true}),keys=Uint32Array.from({length:5200},(_,i)=>i);
   const searched=[],workers=new Set();
   for(const [index,client] of pool.workers.entries())client.worker.handle=message=>{
     const {id,method,args}=message;
@@ -47,7 +47,7 @@ test('color work is disjoint, dynamically balanced and imported before packing',
   assert.deepEqual(result.map(buffer=>new Uint8Array(buffer)[0]),[1,2]);pool.close();
 });
 test('queued batches retain one cache owner and preserve frame order',async()=>{
-  const pool=new QuantizerPool(2,'quantizer-worker.mjs');let active=0,peak=0,marker=0;
+  const pool=new QuantizerPool(2,'quantizer-worker.mjs',{eager:true});let active=0,peak=0,marker=0;
   pool.workers[0].worker.handle=message=>{
     const {id,method,args}=message;
     if(method==='prepare') {

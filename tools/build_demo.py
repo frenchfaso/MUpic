@@ -3,10 +3,27 @@
 import argparse, gzip, hashlib, json, re, subprocess, sys
 from pathlib import Path
 from package_disk import build_image, sha256_file
+from package_lut import validate_asset
 ROOT = Path(__file__).resolve().parent.parent
 
 def version_browser_entrypoints(site):
     """Refresh entrypoints and their workers whenever a deployed module changes."""
+    # A module worker resolves its own imports independently of the page URL.
+    # Hash dependencies before their importers so cached workers cannot combine
+    # a previous adapter with a new raw-WASM ABI.
+    for parent, child in [
+        ('worker-pool.mjs', 'lut-cache.mjs'),
+        ('quantizer-worker.mjs', 'wasm-core.mjs'),
+        ('encoder-worker.mjs', 'wasm-core.mjs'),
+        ('converter.mjs', 'worker-pool.mjs'),
+    ]:
+        path = site/parent
+        version = hashlib.sha256((site/child).read_bytes()).hexdigest()[:16]
+        text, count = re.subn(r"(from\s+['\"]\./"+re.escape(child)+r")(?:\?[^'\"]*)?(['\"])",
+                             lambda match: match[1]+'?v='+version+match[2], path.read_text())
+        if count != 1:
+            raise ValueError(f'Expected one {child} import in {parent}')
+        path.write_text(text)
     digest = hashlib.sha256()
     for source in sorted(site.rglob('*')):
         if source.suffix in {'.js', '.mjs', '.wasm'} and source.is_file():
@@ -26,6 +43,7 @@ def main():
     parser.add_argument('--output', type=Path, default=ROOT/'build'/'MUpic-demo.img')
     parser.add_argument('--site', type=Path, default=ROOT/'site')
     args = parser.parse_args()
+    validate_asset(args.site)
     specs = json.loads((ROOT/'media'/'checksums.json').read_text())['files']
     files = {'MUPIC.PRG': ROOT/'releases'/'MUPIC.PRG'}
     for name, spec in specs.items():

@@ -1,6 +1,6 @@
 import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
 import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent} from './media.mjs?v=4b5fa7b3ec416362';
-import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=d0f95ba62665f6ce';
+import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=f2dd967349f8b8a2';
 import {ConversionProgress} from './conversion-progress.mjs';
 const $=id=>document.getElementById(id);
 const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-preview');
@@ -15,6 +15,9 @@ function assetUrl(name) {
 const wasmUrl=assetUrl('./assets/encoder.wasm').href;
 let selected=null,plan=null,inputUrl=null,outputUrl=null,busy=false,loadSerial=0,abortController=null;
 let pool=null,encoder=null,preview=null,previewSerial=0,paintRequested=-1,painting=false;
+const workerCount=Math.max(1,Math.min(8,(navigator.hardwareConcurrency||2)-1));
+let poolInitialization=null,preparation=null,preparationController=null,preparationState='starting',standardEncoding=false;
+const hasLut=()=>Boolean(pool?.lutReady&&!pool.closed&&!pool.workers[0]?.closed);
 let audioContext=null,audioBuffer=null,audioSource=null,audioLoading=null;
 function status(message,{error=false}={}) {
   $('conversion-status').hidden=!message;$('conversion-status').textContent=message;$('conversion-status').classList.toggle('error',error);
@@ -29,10 +32,60 @@ function clearOutput() {
   context.fillStyle='#000';context.fillRect(0,0,360,200);
 }
 function setBusy(value) {
-  busy=value;$('convert').disabled=value||!plan;$('choose-video').disabled=value;$('video-file').disabled=value;
+  busy=value;$('convert').disabled=value||!plan||(!hasLut()&&!standardEncoding&&!preparation);$('choose-video').disabled=value;$('video-file').disabled=value;
   $('cancel').hidden=!value;$('drop-zone').classList.toggle('busy',value);
   for(const id of ['silent-source','audio-gain']) $(id).disabled=value;
 }
+async function readyPool() {
+  if(!pool||pool.closed||pool.workers[0]?.closed) {
+    pool?.close();
+    pool=new QuantizerPool(workerCount,assetUrl('./quantizer-worker.mjs'));
+    poolInitialization=pool.init(wasmUrl);
+  }
+  await poolInitialization;return pool;
+}
+function tableStatus(message,{error=false}={}) {
+  $('lut-status').textContent=message;$('lut-status').classList.toggle('error',error);
+  const active=preparationState==='starting'||preparationState==='loading';
+  $('lut-retry').hidden=active||hasLut();
+  $('lut-retry').disabled=busy||Boolean(preparation);$('lut-standard').hidden=hasLut()||standardEncoding;
+  setBusy(busy);
+}
+async function loadTable() {
+  if(preparation||busy)return;
+  preparationController=new AbortController();
+  standardEncoding=false;preparationState='loading';tableStatus('Loading color table…');
+  preparation=(async()=>{
+    try {
+      const active=await readyPool();
+      const result=await active.loadLut(assetUrl('./assets/rgb24-lut.json'),{signal:preparationController.signal,onProgress:snapshot=>{
+        $('lut-progress').value=snapshot.received/snapshot.total;
+        const percentage=(snapshot.received/snapshot.total*100).toFixed(0);
+        tableStatus(snapshot.phase==='cached'?'Loading saved color table…':
+          snapshot.phase==='validating'?'Checking color table…':
+          `${snapshot.phase==='downloading'?`Downloading color table (${sizeLabel(snapshot.total)})`:'Unpacking color table'} · ${percentage}%`);
+      }});
+      preparationState='ready';$('lut-progress').value=1;
+      tableStatus(result.saved?'Color table ready · saved on this device':'Color table ready · browser storage unavailable');
+      $('lut-note').textContent=result.saved?'Future visits load the saved table. Videos stay on your device.':
+        'The table is ready for this visit. Your browser could not save it; future visits download it again.';
+    } catch(error) {
+      if(error.name==='AbortError') {
+        preparationState='standard';
+        tableStatus(standardEncoding?'Standard encoding selected.':'Color table loading cancelled. Retry loading or use standard encoding.');
+      } else {
+        standardEncoding=true;preparationState='standard';
+        tableStatus(`${error.message} Using standard encoding.`,{error:true});
+      }
+    } finally {preparation=null;preparationController=null;$('lut-retry').disabled=busy;setBusy(busy);}
+  })();
+  setBusy(busy);await preparation;
+}
+$('lut-retry').addEventListener('click',()=>{void loadTable();});
+$('lut-standard').addEventListener('click',()=>{
+  standardEncoding=true;preparationState='standard';preparationController?.abort();pool?.stopLut();
+  tableStatus('Standard encoding selected.');
+});
 async function selectFile(file) {
   if(!file || busy) return;
   const serial=++loadSerial;selected=null;plan=null;setBusy(false);original.pause();clearOutput();
@@ -84,16 +137,23 @@ $('convert').addEventListener('click',async()=>{
       `Processing ${snapshot.quantizedFrames} / ${snapshot.totalFrames} frames`;
     status(message);
   }
-  const workers=Math.max(1,Math.min(8,(navigator.hardwareConcurrency||2)-1));
   $('conversion-progress').hidden=false;$('conversion-progress').removeAttribute('value');
   status('Preparing audio…');
   try {
+    if(!standardEncoding&&!hasLut()) {
+      if(!preparation) {
+        pool?.checkOwner();
+        throw new Error('Reload the color table or use standard encoding before conversion.');
+      }
+      status('Waiting for the color table…');await preparation;checkAbort(signal);
+      if(!hasLut()&&!standardEncoding)throw new DOMException('Color table loading was cancelled.','AbortError');
+    }
+    await readyPool();checkAbort(signal);status('Preparing audio…');
     const pcm=await decodePcm(selected,plan.duration,{silent:$('silent-source').checked,gainDb:Number($('audio-gain').value),signal});
     checkAbort(signal);
-    pool=new QuantizerPool(workers,assetUrl('./quantizer-worker.mjs'));
     encoder=new WorkerClient(assetUrl('./encoder-worker.mjs'));
     status('Preparing…');
-    await Promise.all([pool.init(wasmUrl),encoder.call('init',{url:wasmUrl})]);checkAbort(signal);
+    await encoder.call('init',{url:wasmUrl});checkAbort(signal);
     await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name)},[pcm.buffer]);
     updateProgress(progress.start());
     const pending=[];
@@ -139,7 +199,10 @@ $('convert').addEventListener('click',async()=>{
     if(error.name==='AbortError'||signal.aborted)status('Cancelled.');
     else status(error.message,{error:true});
   } finally {
-    pool?.close();encoder?.close();pool=null;encoder=null;abortController=null;setBusy(false);
+    encoder?.close();encoder=null;abortController=null;setBusy(false);
+    if((pool?.closed||pool?.workers[0]?.closed)&&!standardEncoding) {
+      preparationState='standard';tableStatus('Reload the color table or use standard encoding before the next conversion.');
+    }
   }
 });
 async function paintFrame(index) {
@@ -185,3 +248,4 @@ function playbackFrame() {
 }
 window.addEventListener('pagehide',()=>{abortController?.abort();pool?.close();encoder?.close();stopAudio();audioContext?.close();});
 status($('conversion-status').textContent);
+void loadTable();

@@ -23,6 +23,8 @@ REQUIRED = {
     "mup_preview_ptr", "mup_preview_len", "mup_error_ptr", "mup_error_len",
     "mup_peak_slots", "mup_adapted_frames", "mup_received_frames",
     "mup_prepare_keys", "mup_plan_keys", "mup_import_plans",
+    "mup_lut_identity", "mup_lut_info", "mup_lut_patterns", "mup_lut_asset_begin", "mup_lut_asset_chunk",
+    "mup_lut_asset_end", "mup_lut_asset_abort", "mup_lut_reset",
 }
 
 def main() -> None:

@@ -15,16 +15,16 @@ try {
   execFileSync('ffmpeg', ['-v','error','-nostdin','-f','lavfi','-i','color=c=red:size=640x360:rate=30','-t','0.48','-c:v','libx264','-pix_fmt','yuv420p','-y',source]);
   fs.writeFileSync(target, Buffer.from('Previously generated output must survive.'));
   const before = hash(target), sourceBefore = hash(source);
-  let result = spawnSync(binary, [source, '-o', target], { encoding: 'utf8' });
+  let result = spawnSync(binary, [source, '-o', target, '--no-cache'], { encoding: 'utf8' });
   assert.equal(result.status, 1); assert.match(result.stderr, /Output already exists/); assert.equal(hash(target), before);
-  result = spawnSync(binary, [source, '-o', source, '--force'], { encoding: 'utf8' });
+  result = spawnSync(binary, [source, '-o', source, '--force', '--no-cache'], { encoding: 'utf8' });
   assert.equal(result.status, 1); assert.match(result.stderr, /must not overwrite the source/); assert.equal(hash(source), sourceBefore);
   if (process.platform !== 'win32') {
     const commands = path.join(directory, 'commands'); fs.mkdirSync(commands);
     const pidLog = path.join(directory, 'ffmpeg.pid');
     const wrapper = '#!/usr/bin/env python3\nimport os,sys\nif "rawvideo" not in sys.argv: raise SystemExit(90)\nwith open(' + JSON.stringify(pidLog) + ',"w") as f: f.write(str(os.getpid()))\nsys.stdout.buffer.write(bytes(100));sys.stdout.buffer.flush()\nraise SystemExit(23)\n';
     fs.writeFileSync(path.join(commands,'ffmpeg'),wrapper,{mode:0o755});
-    result = spawnSync(binary, [source,'-o',target,'--force','--threads','1'], { encoding:'utf8',env:{...process.env,PATH:commands+path.delimiter+process.env.PATH} });
+    result = spawnSync(binary, [source,'-o',target,'--force','--threads','1','--no-cache'], { encoding:'utf8',env:{...process.env,PATH:commands+path.delimiter+process.env.PATH} });
     assert.equal(result.status,1); assert.match(result.stderr,/Truncated video/); assert.equal(hash(target),before);
     assert.ok(!fs.readdirSync(directory).some(f=>f.includes('.partial-')));
     const pid=Number(fs.readFileSync(pidLog,'utf8'));

@@ -18,6 +18,12 @@ select { color: var(--yellow); background: #152225; border: 1px solid #39585a; p
 #conversion-progress { position: static; display: block; width: 100%; margin: 20px 0 0; height: 7px; accent-color: var(--cyan); }
 #conversion-status { margin: 16px 0 0; color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 #conversion-status.error { color: #efaaa3; }
+.lut-panel { padding: 16px 18px; margin-bottom: 20px; border: 1px solid #39585a; border-radius: 6px; background: #11232566; }
+.lut-panel p { margin: 0 0 12px; color: var(--muted); font-size: 11px; line-height: 1.7; }
+#lut-status { color: var(--yellow); }
+#lut-status.error { color: #efaaa3; }
+#lut-progress { position: static; display: block; width: 100%; height: 7px; margin: 0 0 12px; accent-color: var(--cyan); }
+.lut-panel .conversion-actions { gap: 8px; }
 .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; }
 .comparison figure { margin: 0; min-width: 0; }
 .comparison figcaption { display: flex; justify-content: space-between; color: var(--yellow); font-size: 13px; margin: 0 0 12px; }

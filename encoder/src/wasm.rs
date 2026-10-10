@@ -141,6 +141,139 @@ pub extern "C" fn mup_import_plans(
     })
 }
 #[no_mangle]
+pub extern "C" fn mup_lut_identity() -> i32 {
+    operation(|r| {
+        r.result = lut::identity().as_bytes().to_vec();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_info() -> i32 {
+    operation(|r| {
+        let loaded = r.quantizer.as_ref().map_or(0, Quantizer::lut_loaded_blocks);
+        r.result = [
+            lut::BLOCK_COUNT as u32,
+            lut::BLOCK_SIZE as u32,
+            loaded as u32,
+            lut::DOMAIN as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_patterns() -> i32 {
+    operation(|r| {
+        r.result = r
+            .quantizer()?
+            .author_mut()
+            .pattern_fingerprint()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+            .into_bytes();
+        Ok(())
+    })
+}
+// Offline generators translate this same module to C. These exports are absent
+// from the browser build, which only imports the completed portable asset.
+#[cfg(feature = "lut-tools")]
+#[no_mangle]
+pub extern "C" fn mup_lut_block_identity() -> i32 {
+    operation(|r| {
+        r.result = lut::block_identity().as_bytes().to_vec();
+        Ok(())
+    })
+}
+#[cfg(feature = "lut-tools")]
+#[no_mangle]
+pub extern "C" fn mup_lut_candidate_count() -> i32 {
+    operation(|r| {
+        r.result = (r.quantizer()?.author_mut().candidate_count() as u32)
+            .to_le_bytes()
+            .to_vec();
+        Ok(())
+    })
+}
+#[cfg(feature = "lut-tools")]
+#[no_mangle]
+pub extern "C" fn mup_lut_generate(number: usize) -> i32 {
+    operation(|r| {
+        r.result = r.quantizer()?.generate_lut_block(number)?;
+        Ok(())
+    })
+}
+#[cfg(feature = "lut-tools")]
+#[no_mangle]
+pub extern "C" fn mup_lut_validate(pointer: usize, length: usize) -> i32 {
+    operation(|r| {
+        let bytes = r.input(pointer, length)?;
+        if bytes.len() != lut::BLOCK_BYTES {
+            return Err("Invalid LUT block size".into());
+        }
+        let bytes = bytes.to_vec();
+        let block = lut::decode_block(&bytes, r.quantizer()?.author_mut())?;
+        r.result = (block.number as u32).to_le_bytes().to_vec();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_asset_begin(pointer: usize, length: usize) -> i32 {
+    operation(|r| {
+        let bytes = r.input(pointer, length)?.to_vec();
+        r.quantizer()?.begin_lut_asset(&bytes)?;
+        r.result.clear();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_asset_chunk(pointer: usize, length: usize) -> i32 {
+    operation(|r| {
+        if length > 1_048_576 {
+            return Err("LUT asset chunks must not exceed 1 MiB".into());
+        }
+        let bytes = r.input(pointer, length)?.to_vec();
+        r.quantizer()?.append_lut_asset(&bytes)?;
+        r.result.clear();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_asset_end(pointer: usize, length: usize) -> i32 {
+    operation(|r| {
+        let expected = r.input(pointer, length)?.to_vec();
+        if expected.is_empty() {
+            r.quantizer()?.finish_lut_asset()?;
+        } else {
+            r.quantizer()?.finish_lut_asset_verified(&expected)?;
+        }
+        r.result.clear();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_asset_abort() -> i32 {
+    operation(|r| {
+        if let Some(core) = &mut r.quantizer {
+            core.abort_lut_asset();
+        }
+        r.result.clear();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_reset() -> i32 {
+    operation(|r| {
+        if let Some(quantizer) = &mut r.quantizer {
+            quantizer.clear_lut();
+        }
+        r.result.clear();
+        Ok(())
+    })
+}
+#[no_mangle]
 pub extern "C" fn mup_encode_packed(pointer: usize, length: usize) -> i32 {
     operation(|r| {
         let packed = r.input(pointer, length)?.to_vec();

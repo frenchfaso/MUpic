@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "algorithm_identity": "8a5d6d7f3ff2dedb5114ab1352695938945ca2c7d53f4d51865e7a71169419a4",
+  "asset": "rgb24-lut.bin.gz",
+  "compression": "gzip",
+  "compressed_bytes": 4801212,
+  "compressed_sha256": "1a436b9be39daa874246e20c73a6748113f0460fc0aacd91c97f11f8ea4fa58e",
+  "uncompressed_bytes": 50331776,
+  "uncompressed_sha256": "f6b8c18a53fde45b2163e16dcbb3aed38583a942d12b6d6aab67db5895bb8c06"
+}

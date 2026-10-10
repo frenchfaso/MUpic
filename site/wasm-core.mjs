@@ -13,7 +13,9 @@ export class EncoderCore {
     this.exports = exports;
     for (const name of ['memory','mup_alloc','mup_free','mup_quantize','mup_begin','mup_encode_packed',
       'mup_finish','mup_result_ptr','mup_result_len','mup_output_ptr','mup_output_len','mup_output_clear',
-      'mup_error_ptr','mup_error_len']) if (!(name in exports)) throw new Error(`Missing Rust encoder export: ${name}.`);
+      'mup_error_ptr','mup_error_len','mup_prepare_keys','mup_plan_keys','mup_import_plans',
+      'mup_lut_identity','mup_lut_info','mup_lut_patterns','mup_lut_asset_begin','mup_lut_asset_chunk',
+      'mup_lut_asset_end','mup_lut_asset_abort','mup_lut_reset']) if (!(name in exports)) throw new Error(`Missing Rust encoder export: ${name}.`);
   }
   bytes(pointer,length) { return new Uint8Array(this.exports.memory.buffer,pointer,length); }
   allocate(bytes) {
@@ -62,6 +64,37 @@ export class EncoderCore {
       this.check(this.exports.mup_import_plans(keyPointer,rawKeys.byteLength,planPointer,rawPlans.byteLength));
     } finally {if(planPointer)this.free(planPointer,rawPlans.byteLength);this.free(keyPointer,rawKeys.byteLength);}
   }
+  lutIdentity() {
+    this.check(this.exports.mup_lut_identity());const e=this.exports;
+    return new TextDecoder().decode(this.bytes(e.mup_result_ptr(),e.mup_result_len()));
+  }
+  lutInfo() {
+    this.check(this.exports.mup_lut_info());const e=this.exports;
+    const [blockCount,blockSize,loadedBlocks,totalColors]=new Uint32Array(this.bytes(e.mup_result_ptr(),e.mup_result_len()).slice().buffer);
+    return {blockCount,blockSize,loadedBlocks,totalColors};
+  }
+  lutPatternFingerprint() {
+    this.check(this.exports.mup_lut_patterns());const e=this.exports;
+    return new TextDecoder().decode(this.bytes(e.mup_result_ptr(),e.mup_result_len()));
+  }
+  lutAssetOperation(name,bytes) {
+    const pointer=this.allocate(bytes);
+    try {
+      this.check(this.exports[name](pointer,bytes.byteLength));
+    } finally {this.free(pointer,bytes.byteLength);}
+  }
+  beginLutAsset(header) {this.lutAssetOperation('mup_lut_asset_begin',header);}
+  appendLutAsset(chunk) {this.lutAssetOperation('mup_lut_asset_chunk',chunk);}
+  finishLutAsset(expectedSha) {
+    let digest=new Uint8Array();
+    if(expectedSha!==undefined) {
+      if(!(/^[a-f0-9]{64}$/).test(expectedSha))throw new Error('Invalid LUT asset checksum.');
+      digest=Uint8Array.from(expectedSha.match(/../g),value=>parseInt(value,16));
+    }
+    this.lutAssetOperation('mup_lut_asset_end',digest);
+  }
+  abortLutAsset() {this.check(this.exports.mup_lut_asset_abort());}
+  resetLut() { this.check(this.exports.mup_lut_reset()); }
   begin(frameCount,pcm,title) {
     const titleBytes=new TextEncoder().encode(title), pcmPointer=this.allocate(pcm), titlePointer=this.allocate(titleBytes);
     try { this.check(this.exports.mup_begin(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength)); }
