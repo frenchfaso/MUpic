@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-10",
+  "toolchain": "rustc 1.93.0 (254b59607 2026-01-19)",
+  "profile": {
+    "container": "MUP9",
+    "codec": 9,
+    "canvas": [360, 200],
+    "maximum_active_picture": [356, 200],
+    "frame_ticks": 3,
+    "tick_budget_slots": 425000,
+    "reu_prefetch_windows": 13,
+    "audio": "stereo S16LE, nominal 22085 Hz"
+  },
+  "shipped_wasm": {
+    "path": "site/assets/encoder.wasm",
+    "bytes": 240954,
+    "sha256": "8a781b1820481392315954108f18fb872c02c2f6901cf9673c7302f46e51d473",
+    "host_imports": 0,
+    "required_raw_abi_exports": "verified",
+    "release_rebuild_byte_identical": true
+  },
+  "shared_shader": {
+    "source": "encoder/shaders/author-seed.wgsl",
+    "browser_asset": "site/assets/author-seed.wgsl",
+    "sha256": "630e630fda6059fee85208a1e8cdda610ed9b1c6494f75c0e973c3015591f813",
+    "byte_identical": true
+  },
+  "checks": [
+    {
+      "command": "cargo test --manifest-path encoder/Cargo.toml --offline --lib",
+      "passed": 88,
+      "failed": 0,
+      "coverage": "Legacy codec algorithms, exact author search and seeded refinement, original packet parity, container hashes and PCM layout, frame bounds, cache eviction pixel identity"
+    },
+    {
+      "command": "node encoder/tests/wasm-abi.cjs site/assets/encoder.wasm",
+      "passed": true,
+      "frames": 8,
+      "records": 24,
+      "cache_blocks": 2,
+      "bytes": 589824,
+      "peak_slots": 21242,
+      "coverage": "Actual portable module, independent header CRC and stream SHA checks, exact PCM bytes, replay preview and ABI error propagation"
+    },
+    {
+      "command": "node encoder/tests/cli-failures.cjs",
+      "passed": true,
+      "coverage": "Existing-output protection, source-overwrite protection, partial-file cleanup, previous-output preservation and FFmpeg child reaping after a decode failure"
+    },
+    {
+      "command": "node encoder/tests/cli-wasm-parity.cjs",
+      "passed": true,
+      "fixture": "Generated 0.48-second MP4 with testsrc2 and AAC sine audio",
+      "frames": 8,
+      "native_quantizer_workers": 4,
+      "wasm_quantizer_workers": 1,
+      "bytes": 589824,
+      "peak_slots": 200582,
+      "sha256": "7e64af92f4573ad177b55b968f1e4870f0f40ddbfa5eae88a0f620f0c48093d3",
+      "coverage": "Entire native CLI and actual WASM MUP files are byte-identical, including frames, dictionaries, rate control, PCM and container metadata"
+    },
+    {
+      "command": "python3 tools/build_encoder_wasm.py --offline --check",
+      "passed": true,
+      "coverage": "Locked release rebuild and shipped WASM/shader byte identity"
+    }
+  ],
+  "scope": "Functional encoder verification. Color-planning acceleration measurements are separate; these checks do not measure complete conversion throughput or hardware playback timing."
+}

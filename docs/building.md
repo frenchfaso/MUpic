@@ -16,7 +16,7 @@ encoder/target/release/mupic-encoder input.mp4 -o movie.mup
 ```sh
 rustup target add wasm32-unknown-unknown
 python3 tools/build_encoder_wasm.py
-python3 -m http.server 6411 --directory site --bind 127.0.0.1
+python3 tools/serve.py
 ```
 
 Visit `http://localhost:6411/convert.html`. The deployed WASM binary is included, so rebuilding is optional for a local preview. All video processing stays in the browser. Independent worker instances parallelize color conversion without requiring cross-origin isolation; the history-dependent codec and mux stay ordered. WebGPU requires a compatible browser on HTTPS or localhost.

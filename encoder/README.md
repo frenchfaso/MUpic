@@ -47,4 +47,7 @@ All status functions return **0 on success, 1 on error**. Read `mup_error_ptr/le
 ```sh
 cargo test --manifest-path encoder/Cargo.toml
 node encoder/tests/wasm-abi.cjs site/assets/encoder.wasm
+# These use FFmpeg and the release CLI built above.
+node encoder/tests/cli-failures.cjs
+node encoder/tests/cli-wasm-parity.cjs
 ```

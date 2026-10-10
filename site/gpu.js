@@ -2,6 +2,7 @@
 // WebGPU transport for the exact native Commodore 1702 Guest PAL preset.
 // The offline Rust exporter compiles GLSL to WGSL. This module schedules passes,
 // binds the native reflected uniforms, and advances history on complete VIC frames.
+import {fetchBytes} from "./fetch-bytes.mjs";
 const IDENTITY=[1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1];
 const FINAL=[2,0,0,0,0,2,0,0,0,0,0,0,-1,-1,0,1];
 const BLIT=`
@@ -18,14 +19,20 @@ const VERTICES=new Float32Array([
   -1,-1,0,1,0,0,-1,1,0,1,0,1,1,-1,0,1,1,0,1,1,0,1,1,1,
   0,0,0,1,0,0,0,1,0,1,0,1,1,0,0,1,1,0,1,1,0,1,1,1,
 ]);
-async function checkedBytes(url,asset) {
-  const response=await fetch(url,{cache:"no-cache"});
-  if (!response.ok) throw new Error(`CRT asset ${url}: HTTP ${response.status}.`);
-  const data=await response.arrayBuffer();
+export async function checkedBytes(url,asset) {
+  const data=(await fetchBytes(url,()=>{},{cache:"no-cache"})).buffer;
   if (data.byteLength!==asset.bytes) throw new Error(`CRT asset size mismatch: ${url}.`);
   const hash=Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256",data)),n=>n.toString(16).padStart(2,"0")).join("");
   if (hash!==asset.sha256) throw new Error(`CRT asset hash mismatch: ${url}. Reload after staging the build.`);
   return data;
+}
+export async function mapConcurrent(items,limit,operation) {
+  if (!Number.isInteger(limit)||limit<1) throw new Error("Invalid asset download concurrency.");
+  const result=new Array(items.length);let next=0;
+  await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{
+    while(next<items.length){const index=next++;result[index]=await operation(items[index],index);}
+  }));
+  return result;
 }
 function imageSize(image) { return image.size; }
 function cachedGroup(groups,resources) {
@@ -73,12 +80,15 @@ class Guest1702 {
     const manifest=JSON.parse(new TextDecoder().decode(raw));
     if (manifest.version!==1||manifest.kind!=="guest1702"||manifest.passes.length!==19) throw new Error("Unsupported native CRT manifest.");
     this.manifest=manifest; this.parameters={...manifest.parameters};
-    const [shaders,lutData]=await Promise.all([
-      Promise.all(manifest.passes.map(async pass=>({
-        vertex:new TextDecoder().decode(await checkedBytes(new URL(pass.vertex.file,url),pass.vertex)),
-        fragment:new TextDecoder().decode(await checkedBytes(new URL(pass.fragment.file,url),pass.fragment)),
-      }))),Promise.all(manifest.luts.map(lut=>checkedBytes(new URL(lut.asset.file,url),lut.asset))),
-    ]);
+    // Keep HTTP startup pressure bounded while the CPU worker loads firmware.
+    // Every shader/LUT retains its native index and checksum verification.
+    const shaders=manifest.passes.map(()=>({})),lutData=new Array(manifest.luts.length);
+    const assets=[...manifest.passes.flatMap((pass,index)=>["vertex","fragment"].map(kind=>({kind,index,asset:pass[kind]}))),
+      ...manifest.luts.map((lut,index)=>({kind:"lut",index,asset:lut.asset}))];
+    await mapConcurrent(assets,6,async({kind,index,asset})=>{
+      const bytes=await checkedBytes(new URL(asset.file,url),asset);
+      if(kind==="lut")lutData[index]=bytes;else shaders[index][kind]=new TextDecoder().decode(bytes);
+    });
     this.passes=await Promise.all(manifest.passes.map(async (meta,index)=>{
       const vertex=this.device.createShaderModule({code:shaders[index].vertex,label:`Guest ${index} vertex`});
       const fragment=this.device.createShaderModule({code:shaders[index].fragment,label:`Guest ${index} fragment`});

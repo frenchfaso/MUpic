@@ -1,9 +1,9 @@
 /** Fetch a boot asset while retaining useful context for network/body errors. */
-export async function fetchBytes(url,onProgress=()=>{},{fetcher=globalThis.fetch.bind(globalThis),baseUrl=import.meta.url}={}) {
+export async function fetchBytes(url,onProgress=()=>{},{fetcher=globalThis.fetch.bind(globalThis),baseUrl=import.meta.url,cache='no-store'}={}) {
   const assetUrl=new URL(url,baseUrl).href;
   let stage='request',loaded=0;
   try {
-    const response=await fetcher(assetUrl,{cache:'no-store'});
+    const response=await fetcher(assetUrl,{cache});
     if(!response.ok)throw new Error(`HTTP ${response.status}`);
     const total=Number(response.headers.get('Content-Length'))||0;
     stage='response body';
