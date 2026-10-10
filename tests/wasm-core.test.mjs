@@ -35,3 +35,36 @@ test('raw ABI validation errors propagate from Rust with readable messages',asyn
   const core=await makeCore();assert.throws(()=>core.quantize(Uint8Array.of(0,0,0)),/360x200/);
   assert.throws(()=>core.begin(1,new Uint8Array(),'INVALID'),/Frame count/);
 });
+test('split color searches reproduce sequential quantization and retain shared cached colors',async()=>{
+  const owner=await makeCore(),reference=await makeCore(),workers=await Promise.all([makeCore(),makeCore(),makeCore()]);
+  const frames=Array.from({length:4},(_,frame)=>{
+    const rgb=new Uint8Array(216000);
+    for(let pixel=0;pixel<72000;pixel++) {
+      const index=(pixel+frame*13)%80;
+      const color=index<16?PALETTE[index]:[(index*61)&255,(index*97)&255,(index*31)&255];
+      rgb.set(color,pixel*3);
+    }
+    return rgb;
+  });
+  const batch=new Uint8Array(frames.length*216000);frames.forEach((rgb,index)=>batch.set(rgb,index*216000));
+  const keys=owner.prepareKeys(batch),plans=new Uint32Array(keys.length);
+  assert.equal(keys.length,80);
+  for(let index=0;index<keys.length;index+=27) {
+    const part=keys.slice(index,index+27);
+    plans.set(workers[Math.floor(index/27)].planKeys(part),index);
+  }
+  owner.importPlans(keys,plans);
+  assert.equal(owner.prepareKeys(batch).length,0);
+  for(const rgb of frames)assert.deepEqual(owner.quantize(rgb),reference.quantize(rgb));
+  // Bad imports cannot partially insert any of the accompanying valid keys.
+  const missing=owner.prepareKeys(new Uint8Array(216000).fill(33));
+  assert.throws(()=>owner.importPlans(missing,Uint32Array.of(0xffffffff)),/Invalid/);
+  assert.deepEqual(owner.prepareKeys(new Uint8Array(216000).fill(33)),missing);
+  assert.throws(()=>owner.planKeys(Uint32Array.of(0x1000000)),/Invalid/);
+  assert.throws(()=>owner.planKeys(Uint32Array.of(0),new Uint32Array(2)),/count/);
+  assert.deepEqual(owner.planKeys(new Uint32Array()),new Uint32Array());
+  assert.throws(()=>owner.check(owner.exports.mup_plan_keys(0,4,0,0)),/live mup_alloc/);
+  const pointer=owner.allocate(Uint8Array.of(0,0,0));
+  try {assert.throws(()=>owner.check(owner.exports.mup_plan_keys(pointer,3,0,0)),/whole u32/);}
+  finally {owner.free(pointer,3);}
+});

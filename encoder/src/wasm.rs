@@ -24,6 +24,16 @@ impl Runtime {
             .and_then(|v| v.get(..length))
             .ok_or_else(|| "Input must be a live mup_alloc allocation with valid length".into())
     }
+    fn input_u32(&self, pointer: usize, length: usize) -> Result<Vec<u32>, String> {
+        if !length.is_multiple_of(4) {
+            return Err("RGB keys, seeds and plans must contain whole u32 values".into());
+        }
+        Ok(self
+            .input(pointer, length)?
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect())
+    }
     fn quantizer(&mut self) -> Result<&mut Quantizer, String> {
         if self.quantizer.is_none() {
             self.quantizer = Some(Quantizer::new(1)?);
@@ -92,6 +102,56 @@ pub extern "C" fn mup_quantize(pointer: usize, length: usize) -> i32 {
     })
 }
 #[no_mangle]
+pub extern "C" fn mup_prepare_keys(pointer: usize, length: usize) -> i32 {
+    operation(|r| {
+        let rgb = r.input(pointer, length)?.to_vec();
+        r.result = r
+            .quantizer()?
+            .prepare_keys(&rgb)?
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_plan_keys(
+    keys: usize,
+    keys_length: usize,
+    seeds: usize,
+    seeds_length: usize,
+) -> i32 {
+    operation(|r| {
+        let keys = r.input_u32(keys, keys_length)?;
+        let seeds = if seeds_length == 0 {
+            None
+        } else {
+            Some(r.input_u32(seeds, seeds_length)?)
+        };
+        r.result = r
+            .quantizer()?
+            .author_mut()
+            .plan_keys(&keys, seeds.as_deref())?
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_import_plans(
+    keys: usize,
+    keys_length: usize,
+    plans: usize,
+    plans_length: usize,
+) -> i32 {
+    operation(|r| {
+        let keys = r.input_u32(keys, keys_length)?;
+        let plans = r.input_u32(plans, plans_length)?;
+        r.quantizer()?.import_plans(&keys, &plans)
+    })
+}
+#[no_mangle]
 pub extern "C" fn mup_quantize_seeded(
     pointer: usize,
     length: usize,
@@ -103,13 +163,9 @@ pub extern "C" fn mup_quantize_seeded(
         if rgb.len() != RGB_BYTES || seeds_length != VIDEO_WIDTH * VIDEO_HEIGHT * 4 {
             return Err("GPU seed array must contain one u32 per pixel".into());
         }
-        let seeds: Vec<u32> = r
-            .input(seeds, seeds_length)?
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
+        let seeds = r.input_u32(seeds, seeds_length)?;
         let q = r.quantizer()?;
-        q.prepare_cache(rgb.len())?;
+        q.prepare_keys(&rgb)?;
         q.author_mut().preplan_rgb_seeded(&rgb, &seeds)?;
         r.result = q.pack_plans(&rgb);
         Ok(())

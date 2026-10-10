@@ -40,7 +40,9 @@ export function captureRgb(video,context,plan) {
   context.imageSmoothingEnabled=true;context.imageSmoothingQuality='high';
   context.drawImage(video,plan.left,plan.top,plan.width,plan.height);
   const rgba=context.getImageData(0,0,360,200).data,rgb=new Uint8Array(360*200*3);
-  for(let pixel=0;pixel<360*200;pixel++) rgb.set(rgba.subarray(pixel*4,pixel*4+3),pixel*3);
+  for(let source=0,target=0;source<rgba.length;source+=4,target+=3) {
+    rgb[target]=rgba[source];rgb[target+1]=rgba[source+1];rgb[target+2]=rgba[source+2];
+  }
   return rgb;
 }
 export function interleavePcm(left,right,gainDb=0) {

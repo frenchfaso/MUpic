@@ -11,7 +11,9 @@ export class WorkerClient {
   call(method,args={},transfer=[]) {
     if(this.closed) return Promise.reject(new Error('Conversion was cancelled.'));
     return new Promise((resolve,reject)=>{
-      const id=++this.serial; this.pending.set(id,{resolve,reject}); this.worker.postMessage({id,method,args},transfer);
+      const id=++this.serial;this.pending.set(id,{resolve,reject});
+      try {this.worker.postMessage({id,method,args},transfer);}
+      catch(error){this.pending.delete(id);reject(error);}
     });
   }
   close(error=new DOMException('Conversion was cancelled.','AbortError')) {
@@ -20,14 +22,36 @@ export class WorkerClient {
   }
 }
 export class QuantizerPool {
-  constructor(count,url) { this.workers=Array.from({length:count},()=>new WorkerClient(url)); }
+  constructor(count,url) {
+    if(!Number.isInteger(count)||count<1)throw new Error('Worker count must be positive.');
+    this.workers=Array.from({length:count},()=>new WorkerClient(url));this.pending=Promise.resolve();
+  }
   async init(wasmUrl) { await Promise.all(this.workers.map(worker=>worker.call('init',{url:wasmUrl}))); }
-  async batch(frames,seeds=[]) {
-    return Promise.all(frames.map((frame,index)=>{
-      const hint=seeds[index],args={rgb:frame.buffer,seeds:hint?.buffer},transfer=[frame.buffer];
-      if(hint) transfer.push(hint.buffer);
-      return this.workers[index].call('quantize',args,transfer);
+  batch(frames,gpu=null) {
+    // One owner retains the cache; workers only search disjoint missing colors.
+    const request=this.pending.then(()=>this.planBatch(frames,gpu));
+    this.pending=request.catch(()=>{});return request;
+  }
+  async planBatch(frames,gpu) {
+    const coordinator=this.workers[0],buffers=frames.map(frame=>
+      frame.byteOffset===0&&frame.byteLength===frame.buffer.byteLength?frame.buffer:frame.slice().buffer);
+    const keys=new Uint32Array(await coordinator.call('prepare',{frames:buffers},buffers));
+    let seeds=null;
+    if(gpu&&gpu!==this.failedGpu&&keys.length) {
+      try {seeds=await gpu.seeds(keys);}catch{gpu.destroy();this.failedGpu=gpu;}
+    }
+    const plans=new Uint32Array(keys.length);let next=0;
+    // Small work units balance cheap palette colors and expensive exact searches.
+    await Promise.all(this.workers.map(async worker=>{
+      while(next<keys.length) {
+        const start=next,end=Math.min(next+256,keys.length);next=end;
+        const batch=keys.slice(start,end),hint=seeds?.slice(start,end),transfer=[batch.buffer];
+        if(hint)transfer.push(hint.buffer);
+        const result=await worker.call('plan',{keys:batch.buffer,seeds:hint?.buffer},transfer);
+        plans.set(new Uint32Array(result),start);
+      }
     }));
+    return coordinator.call('pack',{keys:keys.buffer,plans:plans.buffer},[keys.buffer,plans.buffer]);
   }
   close() { for(const worker of this.workers) worker.close(); }
 }

@@ -1,7 +1,7 @@
 import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
-import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent} from './media.mjs';
-import {WorkerClient,QuantizerPool} from './worker-pool.mjs';
-import {createGpuPlanner} from './gpu-planner.js';
+import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent} from './media.mjs?v=4b5fa7b3ec416362';
+import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=2ce0eec53470a004';
+import {createGpuPlanner} from './gpu-planner.js?v=ef76c7df2a9b703b';
 import {ConversionProgress} from './conversion-progress.mjs';
 const $=id=>document.getElementById(id);
 const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-preview');
@@ -85,7 +85,7 @@ $('convert').addEventListener('click',async()=>{
       `Processing ${snapshot.quantizedFrames} / ${snapshot.totalFrames} frames`;
     status(message);
   }
-  const workers=Math.max(1,Math.min(4,(navigator.hardwareConcurrency||2)-1));
+  const workers=Math.max(1,Math.min(8,(navigator.hardwareConcurrency||2)-1));
   $('conversion-progress').hidden=false;$('conversion-progress').removeAttribute('value');
   status('Preparing audio…');
   try {
@@ -106,28 +106,28 @@ $('convert').addEventListener('click',async()=>{
     const addChunks=chunks=>{for(const chunk of chunks)parts.push(new Blob([chunk]));};
     async function publishOne() {
       const {result,error}=await pending.shift();if(error)throw error;checkAbort(signal);
-      const encoded=await encoder.call('frame',{packed:result},[result]);addChunks(encoded.chunks);
-      updateProgress(progress.encodedFrame(progress.encodedFrames));
+      for(const packed of result) {
+        const encoded=await encoder.call('frame',{packed},[packed]);addChunks(encoded.chunks);
+        updateProgress(progress.encodedFrame(progress.encodedFrames));
+      }
     }
-    for(let index=0;index<plan.frameCount;index++) {
-      checkAbort(signal);await seekFrame(decoder,index/CONTENT_FPS,signal);
-      const rgb=captureRgb(decoder,captureContext,plan),worker=pool.workers[index%workers];
-      // Seeking the next source frame overlaps GPU hints and CPU quantization.
+    const batchFrames=3;
+    for(let first=0;first<plan.frameCount;first+=batchFrames) {
+      const frames=[],last=Math.min(first+batchFrames,plan.frameCount);
+      for(let index=first;index<last;index++) {
+        checkAbort(signal);await seekFrame(decoder,index/CONTENT_FPS,signal);
+        frames.push(captureRgb(decoder,captureContext,plan));
+      }
+      // Capture overlaps color planning; final codec writes retain frame order.
       pending.push((async()=>{
         try {
-          let seeds;
-          if(gpu) {
-            try{seeds=await gpu.seeds(rgb);}catch(error){gpu?.destroy();gpu=null;console.info(error.message);}
-          }
+          const result=await pool.batch(frames,gpu);
           checkAbort(signal);
-          const transfer=[rgb.buffer];if(seeds)transfer.push(seeds.buffer);
-          const result=await worker.call('quantize',{rgb:rgb.buffer,seeds:seeds?.buffer},transfer);
-          checkAbort(signal);
-          updateProgress(progress.quantizedFrame(index));
+          for(let index=first;index<last;index++)updateProgress(progress.quantizedFrame(index));
           return {result};
         } catch(error){return {error};}
       })());
-      if(pending.length>=workers)await publishOne();
+      if(pending.length>=2)await publishOne();
     }
     while(pending.length)await publishOne();
     updateProgress(progress.finishing());

@@ -9,7 +9,7 @@
 //! component list. Selection uses CIEDE2000, with a conservative branch bound
 //! rather than treating that colour difference as an Euclidean metric.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::PI;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -186,18 +186,21 @@ impl SearchTree {
             query,
             query_chroma,
             self.root,
+            self.nodes[self.root].lower_bound(query, query_chroma),
             visited_leaf,
             &mut best,
         );
         best.1
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn search(
         &self,
         candidates: &[Candidate],
         query: [f64; 3],
         query_chroma: f64,
         id: usize,
+        lower_bound: f64,
         visited_leaf: usize,
         best: &mut (f64, usize),
     ) {
@@ -208,7 +211,7 @@ impl SearchTree {
         }
         let node = &self.nodes[id];
         // The small tolerance also admits deterministic equal-distance ties.
-        if node.lower_bound(query, query_chroma) > best.0 * (1.0 + 1e-12) + 1e-12 {
+        if lower_bound > best.0 * (1.0 + 1e-12) + 1e-12 {
             return;
         }
         if node.children[0] == NONE {
@@ -223,9 +226,21 @@ impl SearchTree {
             let [a, b] = node.children;
             let ba = self.nodes[a].lower_bound(query, query_chroma);
             let bb = self.nodes[b].lower_bound(query, query_chroma);
-            let children = if ba <= bb { [a, b] } else { [b, a] };
-            for child in children {
-                self.search(candidates, query, query_chroma, child, visited_leaf, best);
+            let children = if ba <= bb {
+                [(a, ba), (b, bb)]
+            } else {
+                [(b, bb), (a, ba)]
+            };
+            for (child, bound) in children {
+                self.search(
+                    candidates,
+                    query,
+                    query_chroma,
+                    child,
+                    bound,
+                    visited_leaf,
+                    best,
+                );
             }
         }
     }
@@ -332,6 +347,13 @@ impl AuthorDither {
 
     pub fn cached_rgb_count(&self) -> usize {
         self.cache.len()
+    }
+
+    pub(crate) fn additional_key_count(&self, keys: &[u32]) -> usize {
+        keys.iter()
+            .filter(|key| !self.cache.contains_key(key))
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     /// Discard only memoized lookups; fixed candidates, palette and positional
@@ -449,80 +471,91 @@ impl AuthorDither {
         Ok(())
     }
 
-    fn preplan_keys(&mut self, missing: &[u32], seeds: Option<&[u32]>) {
-        if missing.is_empty() {
-            return;
+    fn preplan_keys(&mut self, keys: &[u32], seeds: Option<&[u32]>) {
+        let plans = self
+            .plan_keys(keys, seeds)
+            .expect("Collected RGB keys and seed counts are valid");
+        self.import_plans(keys, &plans)
+            .expect("Exact search returns valid candidate ids");
+    }
+
+    /// Compute exact plans independently of memoization. Work can be divided
+    /// among native threads or browser instances, then imported by one owner.
+    pub fn plan_keys(&self, keys: &[u32], seeds: Option<&[u32]>) -> Result<Vec<u32>, String> {
+        if keys.iter().any(|&key| key > 0xffffff)
+            || seeds.is_some_and(|hints| hints.len() != keys.len())
+        {
+            return Err("Invalid RGB key or seed count".into());
         }
-        self.cache.reserve(missing.len());
-        let workers = self.threads.min(missing.len().div_ceil(RGB_WORK_BATCH));
-        #[cfg(not(target_arch = "wasm32"))]
-        let next = AtomicUsize::new(0);
-        // A single scoped pool drains the whole clip. Dynamic batches balance
-        // unequal exact CIEDE2000 search costs without changing tie-breaking.
-        let calculate = |begin: usize, end: usize| {
-            missing[begin..end]
+        let calculate = |index: usize| {
+            let rgb = key_rgb(keys[index]);
+            self.palette
                 .iter()
-                .enumerate()
-                .map(|(i, &key)| {
-                    let rgb = key_rgb(key);
-                    let id = self
-                        .palette
-                        .iter()
-                        .position(|&p| p == rgb)
-                        .unwrap_or_else(|| {
-                            self.uncached_plan_seeded(rgb, seeds.map(|s| s[begin + i]))
-                        });
-                    (key, id)
-                })
-                .collect::<Vec<_>>()
+                .position(|&p| p == rgb)
+                .unwrap_or_else(|| self.uncached_plan_seeded(rgb, seeds.map(|s| s[index])))
+                as u32
         };
-        // This path is essential for portable WASM and also avoids thread
-        // setup on short native batches. Browser workers own separate caches.
-        if workers == 1 {
-            let calculated = calculate(0, missing.len());
-            self.cache.extend(calculated);
-            return;
+        let workers = self.threads.min(keys.len().div_ceil(RGB_WORK_BATCH));
+        // Portable WASM runs this same search on worker-sized key batches.
+        if workers <= 1 {
+            return Ok((0..keys.len()).map(calculate).collect());
         }
         #[cfg(not(target_arch = "wasm32"))]
-        let calculated: Vec<Vec<(u32, usize)>> = std::thread::scope(|scope| {
-            let this = &*self;
-            let tasks: Vec<_> = (0..workers)
-                .map(|_| {
-                    let missing = &missing;
-                    let next = &next;
-                    scope.spawn(move || {
-                        let mut result = Vec::new();
-                        loop {
-                            let begin = next.fetch_add(RGB_WORK_BATCH, Ordering::Relaxed);
-                            if begin >= missing.len() {
-                                break;
+        {
+            let next = AtomicUsize::new(0);
+            let calculated: Vec<Vec<(usize, u32)>> = std::thread::scope(|scope| {
+                let tasks: Vec<_> = (0..workers)
+                    .map(|_| {
+                        let next = &next;
+                        let calculate = &calculate;
+                        scope.spawn(move || {
+                            let mut result = Vec::new();
+                            loop {
+                                let begin = next.fetch_add(RGB_WORK_BATCH, Ordering::Relaxed);
+                                if begin >= keys.len() {
+                                    break;
+                                }
+                                let end = (begin + RGB_WORK_BATCH).min(keys.len());
+                                result.extend((begin..end).map(|index| (index, calculate(index))));
                             }
-                            let end = (begin + RGB_WORK_BATCH).min(missing.len());
-                            for (offset, &key) in missing[begin..end].iter().enumerate() {
-                                let rgb = key_rgb(key);
-                                let id =
-                                    this.palette.iter().position(|&p| p == rgb).unwrap_or_else(
-                                        || {
-                                            this.uncached_plan_seeded(
-                                                rgb,
-                                                seeds.map(|s| s[begin + offset]),
-                                            )
-                                        },
-                                    );
-                                result.push((key, id));
-                            }
-                        }
-                        result
+                            result
+                        })
                     })
-                })
-                .collect();
-            tasks.into_iter().map(|t| t.join().unwrap()).collect()
-        });
-        #[cfg(target_arch = "wasm32")]
-        let calculated = vec![calculate(0, missing.len())];
-        for batch in calculated {
-            self.cache.extend(batch);
+                    .collect();
+                tasks.into_iter().map(|t| t.join().unwrap()).collect()
+            });
+            let mut plans = vec![0; keys.len()];
+            for batch in calculated {
+                for (index, plan) in batch {
+                    plans[index] = plan;
+                }
+            }
+            Ok(plans)
         }
+        #[cfg(target_arch = "wasm32")]
+        Ok((0..keys.len()).map(calculate).collect())
+    }
+
+    /// Validate the entire batch before updating the cache. Candidate ids use
+    /// the same fixed palette/tree generation in every CLI and WASM instance.
+    pub fn import_plans(&mut self, keys: &[u32], plans: &[u32]) -> Result<(), String> {
+        self.validate_plans(keys, plans)?;
+        self.cache.reserve(keys.len());
+        self.cache
+            .extend(keys.iter().copied().zip(plans.iter().map(|&p| p as usize)));
+        Ok(())
+    }
+
+    pub(crate) fn validate_plans(&self, keys: &[u32], plans: &[u32]) -> Result<(), String> {
+        if keys.len() != plans.len()
+            || keys.iter().any(|&key| key > 0xffffff)
+            || plans
+                .iter()
+                .any(|&plan| plan as usize >= self.candidates.len())
+        {
+            return Err("Invalid RGB key, candidate id or plan count".into());
+        }
+        Ok(())
     }
 
     /// Shared native/browser WGSL ABI: header[8], nodes[12], candidate Lab[4],
@@ -986,6 +1019,54 @@ mod tests {
             let rev: Vec<_> = source.chunks_exact(3).rev().flatten().copied().collect();
             parallel.frame_plans(&rev);
         }
+    }
+
+    #[test]
+    fn split_key_work_preserves_input_order_and_exact_cached_plans() {
+        let mut keys: Vec<u32> = (0..513u32)
+            .map(|i| i.wrapping_mul(7919) & 0xffffff)
+            .collect();
+        keys.extend(PALETTE.map(rgb_key));
+        keys.extend([rgb_key([80, 80, 80]), rgb_key([124, 129, 124]), keys[17]]);
+        let source: Vec<u8> = keys.iter().flat_map(|&key| key_rgb(key)).collect();
+        let mut reference = AuthorDither::new(&PALETTE, true).unwrap();
+        reference.set_threads(1);
+        let expected = reference.frame_plans(&source);
+        let mut owner = AuthorDither::new(&PALETTE, true).unwrap();
+        let mut worker = AuthorDither::new(&PALETTE, true).unwrap();
+        worker.set_threads(4);
+        for batch in keys.chunks(137).rev() {
+            let plans = worker.plan_keys(batch, None).unwrap();
+            owner.import_plans(batch, &plans).unwrap();
+        }
+        assert_eq!(owner.frame_plans(&source), expected);
+        assert_eq!(worker.cached_rgb_count(), 0);
+        let bad_hints = vec![u32::MAX; keys.len()];
+        assert_eq!(
+            worker.plan_keys(&keys, Some(&bad_hints)).unwrap(),
+            expected.iter().map(|&id| id as u32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn invalid_key_work_and_import_cannot_partially_update_cache() {
+        let mut d = AuthorDither::new(&PALETTE, true).unwrap();
+        let key = rgb_key([131, 79, 36]);
+        let plans = d.plan_keys(&[key], None).unwrap();
+        d.import_plans(&[key], &plans).unwrap();
+        let before = d.cache.clone();
+        for (keys, plans) in [
+            (vec![key, 0x1000000], vec![0, 0]),
+            (vec![key], vec![]),
+            (vec![key, 1], vec![0, d.candidates.len() as u32]),
+        ] {
+            assert!(d.import_plans(&keys, &plans).is_err());
+            assert_eq!(d.cache, before);
+        }
+        assert!(d.plan_keys(&[0x1000000], None).is_err());
+        assert!(d.plan_keys(&[key], Some(&[])).is_err());
+        assert_eq!(d.plan_keys(&[], None).unwrap(), Vec::<u32>::new());
+        assert!(d.import_plans(&[], &[]).is_ok());
     }
 
     #[test]

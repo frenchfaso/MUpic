@@ -25,7 +25,7 @@ Run the PRG from the Ultimate file browser. Arrow keys select, Return plays, Lef
 
 ## Build and run locally
 
-Use Python 3 and Node.js 24 for tooling and tests; the emulator build also needs Binaryen's `wasm-opt` on `PATH` (or `--wasm-opt /path/to/wasm-opt`). Rebuild browser assets after changing their sources:
+Use Python 3 and Node.js 24 for tooling and tests. Both WASM builds need Binaryen's `wasm-opt` on `PATH` (or `--wasm-opt /path/to/wasm-opt`) and use SIMD128, linker O3 and Binaryen O3. Rebuild browser assets after changing their sources:
 
 ```sh
 rustup target add wasm32-unknown-unknown

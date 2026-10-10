@@ -75,30 +75,47 @@ impl Quantizer {
         self.gpu = Some(crate::gpu::GpuPlanner::new(&self.author)?);
         Ok(())
     }
-    /// Cache eviction changes only work, never color decisions or the Bayer pattern.
-    pub fn prepare_cache(&mut self, rgb_bytes: usize) -> Result<(), String> {
-        let limit = if cfg!(target_arch = "wasm32") {
+    fn cache_limit() -> usize {
+        if cfg!(target_arch = "wasm32") {
             262_144
         } else {
             1_048_576
-        };
-        let pixels = rgb_bytes / 3;
-        if pixels > limit {
-            return Err("RGB planning batch exceeds the bounded color cache".into());
         }
-        if self.author.cached_rgb_count() + pixels > limit {
-            self.author.clear_cache();
-        }
-        Ok(())
     }
-    pub fn preplan(&mut self, rgb: &[u8]) -> Result<(), String> {
+    /// Return distinct missing keys for shared work. Eviction counts actual
+    /// colors, so repeated frames keep their exact plans without re-searching.
+    pub fn prepare_keys(&mut self, rgb: &[u8]) -> Result<Vec<u32>, String> {
         if rgb.len() % RGB_BYTES != 0 || rgb.is_empty() {
             return Err("RGB batch must contain whole 360x200 RGB24 frames".into());
         }
-        self.prepare_cache(rgb.len())?;
+        let mut missing = self.author.missing_rgb_keys(rgb);
+        let limit = Self::cache_limit();
+        if missing.len() > limit {
+            return Err("RGB planning batch exceeds the bounded color cache".into());
+        }
+        if self.author.cached_rgb_count() + missing.len() > limit {
+            self.author.clear_cache();
+            missing = self.author.missing_rgb_keys(rgb);
+            if missing.len() > limit {
+                return Err("RGB planning batch exceeds the bounded color cache".into());
+            }
+        }
+        Ok(missing)
+    }
+    pub fn import_plans(&mut self, keys: &[u32], plans: &[u32]) -> Result<(), String> {
+        self.author.validate_plans(keys, plans)?;
+        if self.author.cached_rgb_count() + self.author.additional_key_count(keys)
+            > Self::cache_limit()
+        {
+            return Err("Imported plans exceed the bounded color cache".into());
+        }
+        self.author.import_plans(keys, plans)
+    }
+    pub fn preplan(&mut self, rgb: &[u8]) -> Result<(), String> {
+        let missing = self.prepare_keys(rgb)?;
         #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
         if let Some(gpu) = &self.gpu {
-            match gpu.preplan(&mut self.author, rgb) {
+            match gpu.preplan_keys(&mut self.author, &missing) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     eprintln!("GPU planning failed; using exact CPU search: {error}");
@@ -106,8 +123,8 @@ impl Quantizer {
                 }
             }
         }
-        self.author.preplan_rgb(rgb);
-        Ok(())
+        let plans = self.author.plan_keys(&missing, None)?;
+        self.import_plans(&missing, &plans)
     }
     pub fn quantize(&mut self, rgb: &[u8]) -> Result<Vec<u8>, String> {
         if rgb.len() != RGB_BYTES {
@@ -479,11 +496,39 @@ mod tests {
             .collect();
         let a = q.quantize(&rgb).unwrap();
         assert!(q.author_mut().cached_rgb_count() > 0);
-        q.prepare_cache(1_048_576 * 3).unwrap();
+        // Fill the remaining cache slots without spending time searching a
+        // million colors; only the eviction decision is under test here.
+        let keys: Vec<u32> = (0..Quantizer::cache_limit() as u32 - 1).collect();
+        q.import_plans(&keys, &vec![0; keys.len()]).unwrap();
+        assert_eq!(q.author_mut().cached_rgb_count(), Quantizer::cache_limit());
+        assert!(q.prepare_keys(&rgb).unwrap().is_empty());
+        assert_eq!(q.author_mut().cached_rgb_count(), Quantizer::cache_limit());
+        let next: Vec<u8> = (0..VIDEO_WIDTH * VIDEO_HEIGHT)
+            .flat_map(|_| [100, 120, 141])
+            .collect();
+        assert_eq!(q.prepare_keys(&next).unwrap(), [0x64788d]);
         assert_eq!(q.author_mut().cached_rgb_count(), 0);
         let b = q.quantize(&rgb).unwrap();
         assert_eq!(a, b);
-        assert!(q.prepare_cache((1_048_576 + 1) * 3).is_err());
+    }
+    #[test]
+    fn repeated_frame_batches_are_bounded_by_unique_colors() {
+        let mut q = Quantizer::new(1).unwrap();
+        let rgb: Vec<u8> = (0..VIDEO_WIDTH * VIDEO_HEIGHT)
+            .flat_map(|_| [100, 120, 140])
+            .collect();
+        let expected = q.quantize(&rgb).unwrap();
+        let frames = Quantizer::cache_limit().div_ceil(VIDEO_WIDTH * VIDEO_HEIGHT) + 1;
+        let batch: Vec<u8> = rgb
+            .iter()
+            .copied()
+            .cycle()
+            .take(frames * RGB_BYTES)
+            .collect();
+        assert!(q.prepare_keys(&batch).unwrap().is_empty());
+        assert_eq!(q.author_mut().cached_rgb_count(), 1);
+        assert_eq!(q.quantize(&rgb).unwrap(), expected);
+        assert!(q.prepare_keys(&batch[..batch.len() - 1]).is_err());
     }
     #[test]
     fn rejects_bad_bounds_and_nonblack_edges() {
