@@ -19,6 +19,8 @@ import subprocess
 
 SECTOR = 512
 PARTITION_LBA = 2048
+VOLUME_SERIAL = 0x4D555049
+DOS_DATE = (20 << 9) | (1 << 5) | 1  # 2000-01-01
 
 
 def sha256_file(path: Path) -> str:
@@ -34,6 +36,46 @@ def _checksum(short_name: bytes) -> int:
     for byte in short_name:
         value = (((value & 1) << 7) + (value >> 1) + byte) & 255
     return value
+
+
+def _normalize_directory_times(image: Path) -> None:
+    """Keep identical web disks at identical URLs across Pages deployments."""
+    with image.open("r+b") as disk:
+        start = PARTITION_LBA * SECTOR
+        disk.seek(start)
+        boot = disk.read(SECTOR)
+        reserved = struct.unpack_from("<H", boot, 14)[0]
+        fat_sectors = struct.unpack_from("<I", boot, 36)[0]
+        cluster_bytes = boot[13] * SECTOR
+        data_start = start + (reserved + boot[16] * fat_sectors) * SECTOR
+        cluster_count = (image.stat().st_size - data_start) // cluster_bytes
+        disk.seek(start + reserved * SECTOR)
+        fat = disk.read(fat_sectors * SECTOR)
+        cluster = struct.unpack_from("<I", boot, 44)[0]
+        visited = set()
+        while True:
+            if not 2 <= cluster < cluster_count + 2 or cluster in visited:
+                raise ValueError("invalid root directory chain")
+            visited.add(cluster)
+            offset = data_start + (cluster - 2) * cluster_bytes
+            disk.seek(offset)
+            directory = bytearray(disk.read(cluster_bytes))
+            for position in range(0, len(directory), 32):
+                if directory[position] == 0:
+                    break
+                attr = directory[position + 11]
+                if directory[position] == 229 or attr == 15:
+                    continue
+                if attr & 16:
+                    raise ValueError("unexpected directory in flat distribution")
+                directory[position + 13] = 0
+                struct.pack_into("<HHH", directory, position + 14, 0, DOS_DATE, DOS_DATE)
+                struct.pack_into("<HH", directory, position + 22, 0, DOS_DATE)
+            disk.seek(offset)
+            disk.write(directory)
+            cluster = struct.unpack_from("<I", fat, cluster * 4)[0] & 0x0FFFFFFF
+            if cluster >= 0x0FFFFFF8:
+                break
 
 
 def audit_image(image: Path, expected: dict[str, Path] | None = None) -> dict:
@@ -230,9 +272,11 @@ def build_image(image: Path, files: dict[str, Path], size_mib: int = 512) -> dic
     while cluster_sectors < 8 and partition_bytes // (cluster_sectors * 2 * SECTOR) >= 70000:
         cluster_sectors *= 2
     subprocess.run([mformat, "-i", volume, "-F", "-T", str(image_bytes // SECTOR - PARTITION_LBA),
-                    "-H", str(PARTITION_LBA), "-c", str(cluster_sectors), "-v", "MUPIC", "::"], check=True)
-    for name, source in checked.items():
+                    "-H", str(PARTITION_LBA), "-c", str(cluster_sectors), "-N", hex(VOLUME_SERIAL),
+                    "-v", "MUPIC", "::"], check=True)
+    for name, source in sorted(checked.items(), key=lambda entry: entry[0].casefold()):
         subprocess.run([mcopy, "-i", volume, str(source), "::/" + name], check=True)
+    _normalize_directory_times(image)
     report = audit_image(image, checked)
     report["source_files"] = {name: str(source) for name, source in checked.items()}
     report["image_sha256"] = sha256_file(image)

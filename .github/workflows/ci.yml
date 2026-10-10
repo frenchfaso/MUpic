@@ -15,6 +15,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - run: sudo apt-get update && sudo apt-get install -y mtools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -22,3 +23,4 @@ jobs:
       - run: cargo check --locked --manifest-path encoder/Cargo.toml --features gpu
       - run: python3 tools/build_encoder_wasm.py
       - run: node --test tests/*.test.mjs
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'

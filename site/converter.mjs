@@ -2,6 +2,7 @@ import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
 import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent} from './media.mjs';
 import {WorkerClient,QuantizerPool} from './worker-pool.mjs';
 import {createGpuPlanner} from './gpu-planner.js';
+import {ConversionProgress} from './conversion-progress.mjs';
 const $=id=>document.getElementById(id);
 const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-preview');
 const context=canvas.getContext('2d',{alpha:false});
@@ -71,10 +72,22 @@ $('convert').addEventListener('click',async()=>{
   if(busy||!selected||!plan)return;
   clearOutput();original.pause();setBusy(true);abortController=new AbortController();
   const signal=abortController.signal,parts=[],started=performance.now();
-  let converted=0,gpuEnabled=false,gpuUsed=false,gpuSeededFrames=0;
+  let gpuEnabled=false,gpuUsed=false,gpuSeededFrames=0;
+  const progress=new ConversionProgress(plan.frameCount);
+  function updateProgress(snapshot=progress.snapshot()) {
+    if(signal.aborted)return;
+    const bar=$('conversion-progress');
+    if(snapshot.value===null)bar.removeAttribute('value');else bar.value=snapshot.value;
+    const elapsed=(performance.now()-started)/1000;
+    const message=snapshot.phase==='finishing'?'Finishing…':
+      snapshot.quantizedFrames===snapshot.totalFrames?`Writing ${snapshot.encodedFrames} / ${snapshot.totalFrames} frames`:
+      `Processing ${snapshot.quantizedFrames} / ${snapshot.totalFrames} frames`;
+    status(message,{update:{state:snapshot.phase,frames:snapshot.encodedFrames,quantizedFrames:snapshot.quantizedFrames,
+      encodedFrames:snapshot.encodedFrames,progress:snapshot.value,gpu:gpuEnabled,gpuUsed,gpuSeededFrames,elapsedSeconds:elapsed}});
+  }
   const workers=Math.max(1,Math.min(4,(navigator.hardwareConcurrency||2)-1));
-  $('conversion-progress').hidden=false;$('conversion-progress').value=0;
-  status('Preparing audio…',{update:{state:'audio',frames:0,totalFrames:plan.frameCount,workers,gpu:false,gpuAvailable:Boolean(navigator.gpu),gpuAttempted:false,gpuUsed:false,gpuSeededFrames:0,error:null}});
+  $('conversion-progress').hidden=false;$('conversion-progress').removeAttribute('value');
+  status('Preparing audio…',{update:{state:'audio',frames:0,quantizedFrames:0,encodedFrames:0,progress:null,totalFrames:plan.frameCount,workers,gpu:false,gpuAvailable:Boolean(navigator.gpu),gpuAttempted:false,gpuUsed:false,gpuSeededFrames:0,error:null}});
   try {
     const pcm=await decodePcm(selected,plan.duration,{silent:$('silent-source').checked,gainDb:Number($('audio-gain').value),signal});
     checkAbort(signal);
@@ -89,15 +102,13 @@ $('convert').addEventListener('click',async()=>{
       if(search) gpu=await createGpuPlanner(new Uint32Array(search),{shaderUrl:new URL('./assets/author-seed.wgsl',import.meta.url).href});
       gpuEnabled=Boolean(gpu);
     }
+    updateProgress(progress.start());
     const pending=[];
     const addChunks=chunks=>{for(const chunk of chunks)parts.push(new Blob([chunk]));};
     async function publishOne() {
       const {result,error}=await pending.shift();if(error)throw error;checkAbort(signal);
-      const encoded=await encoder.call('frame',{packed:result},[result]);addChunks(encoded.chunks);converted++;
-      const elapsed=(performance.now()-started)/1000,eta=converted>1?(plan.frameCount-converted)*elapsed/converted:null;
-      $('conversion-progress').value=converted/plan.frameCount;
-      status(`${converted} / ${plan.frameCount} frames${eta!==null?` · ${timeLabel(eta)} remaining`:''}`,
-        {update:{state:'encoding',frames:converted,gpu:gpuEnabled,gpuUsed,gpuSeededFrames,elapsedSeconds:elapsed}});
+      const encoded=await encoder.call('frame',{packed:result},[result]);addChunks(encoded.chunks);
+      updateProgress(progress.encodedFrame(progress.encodedFrames));
     }
     for(let index=0;index<plan.frameCount;index++) {
       checkAbort(signal);await seekFrame(decoder,index/CONTENT_FPS,signal);
@@ -112,14 +123,16 @@ $('convert').addEventListener('click',async()=>{
           checkAbort(signal);
           const transfer=[rgb.buffer];if(seeds)transfer.push(seeds.buffer);
           const result=await worker.call('quantize',{rgb:rgb.buffer,seeds:seeds?.buffer},transfer);
+          checkAbort(signal);
           if(seeds){gpuUsed=true;gpuSeededFrames++;}
+          updateProgress(progress.quantizedFrame(index));
           return {result};
         } catch(error){return {error};}
       })());
       if(pending.length>=workers)await publishOne();
     }
     while(pending.length)await publishOne();
-    status('Finishing…',{update:{state:'finishing'}});
+    updateProgress(progress.finishing());
     const finished=await encoder.call('finish');addChunks(finished.chunks);checkAbort(signal);
     const movie=new Blob([finished.prefix,...parts],{type:'application/octet-stream'});
     preview=await MupPreview.open(movie);checkAbort(signal);
@@ -128,9 +141,10 @@ $('convert').addEventListener('click',async()=>{
     $('download').hidden=false;$('preview-controls').hidden=false;
     original.currentTime=0;original.muted=true;$('preview-audio').value='mup';
     await paintFrame(0);
+    $('conversion-progress').value=progress.complete().value;
     const elapsed=(performance.now()-started)/1000;
     status(`Done · ${sizeLabel(movie.size)}`,
-      {update:{state:'complete',bytes:movie.size,duration:preview.header.duration,elapsedSeconds:elapsed,stats:finished.stats,gpu:gpuEnabled,gpuUsed,gpuSeededFrames,preview:'decoded-MUP9'}});
+      {update:{state:'complete',progress:1,quantizedFrames:progress.quantized.size,encodedFrames:progress.encodedFrames,bytes:movie.size,duration:preview.header.duration,elapsedSeconds:elapsed,stats:finished.stats,gpu:gpuEnabled,gpuUsed,gpuSeededFrames,preview:'decoded-MUP9'}});
   } catch(error) {
     if(error.name==='AbortError'||signal.aborted)status('Cancelled.',{update:{state:'cancelled'}});
     else status(error.message,{error:true,update:{state:'error',error:error.message}});
