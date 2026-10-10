@@ -27,27 +27,22 @@ export class QuantizerPool {
     this.workers=Array.from({length:count},()=>new WorkerClient(url));this.pending=Promise.resolve();
   }
   async init(wasmUrl) { await Promise.all(this.workers.map(worker=>worker.call('init',{url:wasmUrl}))); }
-  batch(frames,gpu=null) {
+  batch(frames) {
     // One owner retains the cache; workers only search disjoint missing colors.
-    const request=this.pending.then(()=>this.planBatch(frames,gpu));
+    const request=this.pending.then(()=>this.planBatch(frames));
     this.pending=request.catch(()=>{});return request;
   }
-  async planBatch(frames,gpu) {
+  async planBatch(frames) {
     const coordinator=this.workers[0],buffers=frames.map(frame=>
       frame.byteOffset===0&&frame.byteLength===frame.buffer.byteLength?frame.buffer:frame.slice().buffer);
     const keys=new Uint32Array(await coordinator.call('prepare',{frames:buffers},buffers));
-    let seeds=null;
-    if(gpu&&gpu!==this.failedGpu&&keys.length) {
-      try {seeds=await gpu.seeds(keys);}catch{gpu.destroy();this.failedGpu=gpu;}
-    }
     const plans=new Uint32Array(keys.length);let next=0;
     // Small work units balance cheap palette colors and expensive exact searches.
     await Promise.all(this.workers.map(async worker=>{
       while(next<keys.length) {
         const start=next,end=Math.min(next+256,keys.length);next=end;
-        const batch=keys.slice(start,end),hint=seeds?.slice(start,end),transfer=[batch.buffer];
-        if(hint)transfer.push(hint.buffer);
-        const result=await worker.call('plan',{keys:batch.buffer,seeds:hint?.buffer},transfer);
+        const batch=keys.slice(start,end);
+        const result=await worker.call('plan',{keys:batch.buffer},[batch.buffer]);
         plans.set(new Uint32Array(result),start);
       }
     }));

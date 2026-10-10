@@ -9,7 +9,7 @@ use std::{
 };
 
 fn help() {
-    println!("MUpic — 16 colors is all you need!\n\nUsage: mupic-encoder INPUT -o OUTPUT.mup [options]\n\n  --duration SECONDS  Convert a shorter clip (default: whole video)\n  --start SECONDS     Start at this timestamp (default: 0)\n  --threads auto|N    Exact color-search workers (default: auto)\n  --gpu auto|off|on   Auto prefers CPU; on enables compute search hints\n  --gain-db DB       Offline PCM gain (default: 0)\n  --title TITLE      Up to 63 ASCII characters (default: input stem)\n  --force            Replace an existing output\n  --help             Show this help\n\nOutput: native SD MUP9, PAL/3 (~16.708 fps), fixed Bayer8x8 Yliluoma author\npreset + neutral guard, 360x200 canvas, 356x200 maximum active picture.\nRequires FFmpeg and ffprobe on PATH. GPU hints always undergo exact CPU refinement.");
+    println!("MUpic — 16 colors is all you need!\n\nUsage: mupic-encoder INPUT -o OUTPUT.mup [options]\n\n  --duration SECONDS  Convert a shorter clip (default: whole video)\n  --start SECONDS     Start at this timestamp (default: 0)\n  --threads auto|N    Exact color-search workers (default: auto)\n  --gain-db DB       Offline PCM gain (default: 0)\n  --title TITLE      Up to 63 ASCII characters (default: input stem)\n  --force            Replace an existing output\n  --help             Show this help\n\nOutput: native SD MUP9, PAL/3 (~16.708 fps), fixed Bayer8x8 Yliluoma author\npreset + neutral guard, 360x200 canvas, 356x200 maximum active picture.\nRequires FFmpeg and ffprobe on PATH.");
 }
 #[derive(Debug)]
 struct Args {
@@ -18,7 +18,6 @@ struct Args {
     duration: Option<f64>,
     start: f64,
     threads: usize,
-    gpu: String,
     gain: f64,
     title: Option<String>,
     force: bool,
@@ -30,7 +29,6 @@ fn args() -> Result<Option<Args>, String> {
     let mut duration = None;
     let mut start = 0.0;
     let mut threads = std::thread::available_parallelism().map_or(1, usize::from);
-    let mut gpu = "auto".to_string();
     let mut gain = 0.0;
     let mut title = None;
     let mut force = false;
@@ -55,7 +53,6 @@ fn args() -> Result<Option<Args>, String> {
                     threads = value.parse().map_err(|_| "Invalid thread count")?;
                 }
             }
-            "--gpu" => gpu = next()?,
             "--gain-db" => gain = next()?.parse::<f64>().map_err(|_| "Invalid gain")?,
             "--title" => title = Some(next()?),
             "--force" => force = true,
@@ -72,16 +69,12 @@ fn args() -> Result<Option<Args>, String> {
     if threads == 0 || !start.is_finite() || start < 0.0 || !gain.is_finite() {
         return Err("Invalid thread count, start or gain".into());
     }
-    if !["auto", "off", "on"].contains(&gpu.as_str()) {
-        return Err("--gpu must be auto, off or on".into());
-    }
     Ok(Some(Args {
         input,
         output,
         duration,
         start,
         threads,
-        gpu,
         gain,
         title,
         force,
@@ -121,10 +114,6 @@ impl Drop for DecoderChild {
     }
 }
 fn run(args: Args) -> Result<(), String> {
-    #[cfg(not(feature = "gpu"))]
-    if args.gpu == "on" {
-        eprintln!("GPU support is disabled in this build; using the CPU. Build with --features gpu to enable compute shaders.");
-    }
     if args.output.exists() && !args.force {
         return Err(format!(
             "Output already exists: {}; use --force to replace it",
@@ -272,13 +261,6 @@ fn run(args: Args) -> Result<(), String> {
     });
     let mut encoder = Encoder::new(count, pcm, title)?;
     let mut quantizer = Quantizer::new(args.threads)?;
-    #[cfg(feature = "gpu")]
-    if args.gpu == "on" {
-        match quantizer.enable_gpu() {
-            Ok(()) => eprintln!("GPU search hints enabled; exact CPU refinement retained."),
-            Err(error) => eprintln!("GPU unavailable; using exact CPU search: {error}"),
-        }
-    }
     let filter = format!("tpad=stop_mode=clone:stop_duration={seconds},fps={},scale={active_w}:{active_h}:flags=lanczos,setsar=1,pad=360:200:{left}:{top}:black,format=rgb24", content_fps());
     let mut child = DecoderChild(
         Command::new("ffmpeg")

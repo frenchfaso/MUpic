@@ -6,7 +6,7 @@ Movie night, Commodore style. MUpic turns video into 16-color pictures and stere
 
 **[Watch the demo](https://frenchfaso.github.io/MUpic/)** · **[Convert a video](https://frenchfaso.github.io/MUpic/convert.html)** · **[Download the player](releases/MUPIC.PRG)**
 
-The SD canvas is 360×200 with up to 356×200 active picture, preserved aspect ratio and about 16.7 fps. Native CPU threads, browser workers and optional GPU hints accelerate conversion. Browser processing stays local; its preview reconstructs the encoded file.
+The SD canvas is 360×200 with up to 356×200 active picture, preserved aspect ratio and about 16.7 fps. Native CPU threads and browser workers share the same exact color search, distributing distinct colors without duplicate work. Browser processing stays local; its preview reconstructs the encoded file.
 
 ## Convert and play
 
@@ -17,7 +17,7 @@ cargo build --locked --release --manifest-path encoder/Cargo.toml
 encoder/target/release/mupic-encoder input.mp4 -o movie.mup
 ```
 
-Use `--help` for options. Native GPU hints require a build with `--features gpu` and conversion with `--gpu on`; CPU is the default and fallback.
+Use `--help` for options and `--threads N` to set the native CPU thread count. The browser selects its worker count automatically.
 
 Copy `movie.mup` and `MUPIC.PRG` to a FAT32 USB stick. Use PAL, 64 MHz, HDMI SD output with 4:3 shape, 16 MB REU with preload disabled, command interface enabled, and UltimateAudio at `$DF20–DFFF`. Set sampler L/R volume to 0 dB and pan left/right; see the [reference configuration](releases/ultimate-pal.cfg).
 
@@ -42,7 +42,6 @@ The two demo movies are compressed Git LFS inputs. Install Git LFS and mtools, t
 
 ```sh
 cargo test --locked --manifest-path encoder/Cargo.toml
-cargo check --locked --manifest-path encoder/Cargo.toml --features gpu
 node --test tests/*.test.mjs
 python3 -m unittest discover -s tests -p 'test_*.py'
 node encoder/tests/wasm-abi.cjs site/assets/encoder.wasm

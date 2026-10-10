@@ -29,17 +29,13 @@ export class EncoderCore {
       throw new Error(message || 'The Rust encoder failed.');
     }
   }
-  quantize(rgb,seeds) {
-    const pointer = this.allocate(rgb); let seedPointer = 0;
+  quantize(rgb) {
+    const pointer = this.allocate(rgb);
     try {
-      if (seeds && this.exports.mup_quantize_seeded) {
-        const raw = new Uint8Array(seeds.buffer,seeds.byteOffset,seeds.byteLength);
-        seedPointer = this.allocate(raw);
-        this.check(this.exports.mup_quantize_seeded(pointer,rgb.byteLength,seedPointer,seeds.byteLength));
-      } else this.check(this.exports.mup_quantize(pointer,rgb.byteLength));
+      this.check(this.exports.mup_quantize(pointer,rgb.byteLength));
       const e=this.exports;
       return this.bytes(e.mup_result_ptr(),e.mup_result_len()).slice();
-    } finally { if(seedPointer) this.free(seedPointer,seeds.byteLength); this.free(pointer,rgb.byteLength); }
+    } finally { this.free(pointer,rgb.byteLength); }
   }
   prepareKeys(rgb) {
     const pointer=this.allocate(rgb);
@@ -49,15 +45,13 @@ export class EncoderCore {
       return new Uint32Array(this.bytes(e.mup_result_ptr(),e.mup_result_len()).slice().buffer);
     } finally {this.free(pointer,rgb.byteLength);}
   }
-  planKeys(keys,seeds) {
+  planKeys(keys) {
     const raw=new Uint8Array(keys.buffer,keys.byteOffset,keys.byteLength),pointer=this.allocate(raw);
-    let seedPointer=0;
     try {
-      if(seeds)seedPointer=this.allocate(new Uint8Array(seeds.buffer,seeds.byteOffset,seeds.byteLength));
-      this.check(this.exports.mup_plan_keys(pointer,raw.byteLength,seedPointer,seeds?.byteLength||0));
+      this.check(this.exports.mup_plan_keys(pointer,raw.byteLength));
       const e=this.exports;
       return new Uint32Array(this.bytes(e.mup_result_ptr(),e.mup_result_len()).slice().buffer);
-    } finally {if(seedPointer)this.free(seedPointer,seeds.byteLength);this.free(pointer,raw.byteLength);}
+    } finally {this.free(pointer,raw.byteLength);}
   }
   importPlans(keys,plans) {
     const rawKeys=new Uint8Array(keys.buffer,keys.byteOffset,keys.byteLength);
@@ -67,12 +61,6 @@ export class EncoderCore {
       planPointer=this.allocate(rawPlans);
       this.check(this.exports.mup_import_plans(keyPointer,rawKeys.byteLength,planPointer,rawPlans.byteLength));
     } finally {if(planPointer)this.free(planPointer,rawPlans.byteLength);this.free(keyPointer,rawKeys.byteLength);}
-  }
-  searchData() {
-    const e=this.exports;
-    if (!e.mup_gpu_search_ptr || !e.mup_gpu_search_len) return null;
-    const pointer=e.mup_gpu_search_ptr(), length=e.mup_gpu_search_len();
-    return this.bytes(pointer,length).slice().buffer;
   }
   begin(frameCount,pcm,title) {
     const titleBytes=new TextEncoder().encode(title), pcmPointer=this.allocate(pcm), titlePointer=this.allocate(titleBytes);

@@ -122,72 +122,37 @@ impl SearchTree {
         id
     }
 
-    #[cfg(test)]
     fn nearest(&self, candidates: &[Candidate], query: [f64; 3]) -> usize {
-        self.nearest_seeded(candidates, query, None)
-    }
-
-    fn nearest_seeded(
-        &self,
-        candidates: &[Candidate],
-        query: [f64; 3],
-        hint: Option<(usize, usize)>,
-    ) -> usize {
         assert_ne!(self.root, NONE);
         // Start with a close leaf instead of an arbitrary point in the root.
         // The following exact search still visits every admissible branch.
         let query_chroma = query[1].hypot(query[2]);
-        let exact_hint_leaf = hint.and_then(|(candidate, leaf)| {
-            self.nodes
-                .get(leaf)
-                .filter(|n| {
-                    n.children[0] == NONE && self.indices[n.start..n.end].contains(&candidate)
-                })
-                .map(|_| leaf)
-        });
-        let (mut best, visited_leaf) =
-            if let Some((seed, _)) = hint.filter(|_| exact_hint_leaf.is_none()) {
-                (
-                    (
-                        ciede2000_precomputed(
-                            query,
-                            candidates[seed].lab,
-                            query_chroma,
-                            candidates[seed].chroma,
-                        ),
-                        seed,
-                    ),
-                    NONE,
-                )
+        let mut id = self.root;
+        while self.nodes[id].children[0] != NONE {
+            let [a, b] = self.nodes[id].children;
+            id = if self.nodes[a].lower_bound(query, query_chroma)
+                <= self.nodes[b].lower_bound(query, query_chroma)
+            {
+                a
             } else {
-                let mut id = exact_hint_leaf.unwrap_or(self.root);
-                while self.nodes[id].children[0] != NONE {
-                    let [a, b] = self.nodes[id].children;
-                    id = if self.nodes[a].lower_bound(query, query_chroma)
-                        <= self.nodes[b].lower_bound(query, query_chroma)
-                    {
-                        a
-                    } else {
-                        b
-                    };
-                }
-                let mut best = (f64::INFINITY, NONE);
-                for &index in &self.indices[self.nodes[id].start..self.nodes[id].end] {
-                    let c = &candidates[index];
-                    let cost = ciede2000_precomputed(query, c.lab, query_chroma, c.chroma);
-                    if cost < best.0 || (cost == best.0 && index < best.1) {
-                        best = (cost, index);
-                    }
-                }
-                (best, id)
+                b
             };
+        }
+        let mut best = (f64::INFINITY, NONE);
+        for &index in &self.indices[self.nodes[id].start..self.nodes[id].end] {
+            let c = &candidates[index];
+            let cost = ciede2000_precomputed(query, c.lab, query_chroma, c.chroma);
+            if cost < best.0 || (cost == best.0 && index < best.1) {
+                best = (cost, index);
+            }
+        }
         self.search(
             candidates,
             query,
             query_chroma,
             self.root,
             self.nodes[self.root].lower_bound(query, query_chroma),
-            visited_leaf,
+            id,
             &mut best,
         );
         best.1
@@ -381,10 +346,6 @@ impl AuthorDither {
     }
 
     fn uncached_plan(&self, rgb: [u8; 3]) -> usize {
-        self.uncached_plan_seeded(rgb, None)
-    }
-
-    fn uncached_plan_seeded(&self, rgb: [u8; 3], hint: Option<u32>) -> usize {
         let target = comparison_lab(rgb.map(|v| f64::from(v) / 255.0));
         let neutral =
             self.neutral_guard && rgb.iter().max().unwrap() - rgb.iter().min().unwrap() <= 8;
@@ -393,27 +354,7 @@ impl AuthorDither {
         } else {
             &self.tree
         };
-        // Packed GPU hints contain a 17-bit candidate and 15-bit global leaf.
-        // The CPU verifies membership and evaluates that complete leaf before
-        // excluding already checked plans from the remaining exact search.
-        let hint = hint
-            .map(|h| {
-                let candidate = (h & 0x1ffff) as usize;
-                let global_leaf = (h >> 17) as usize;
-                let leaf = if neutral {
-                    global_leaf
-                        .checked_sub(self.tree.nodes.len())
-                        .unwrap_or(NONE)
-                } else {
-                    global_leaf
-                };
-                (candidate, leaf)
-            })
-            .filter(|&(candidate, _)| {
-                candidate < self.candidates.len()
-                    && (!neutral || self.candidates[candidate].neutral)
-            });
-        tree.nearest_seeded(&self.candidates, target, hint)
+        tree.nearest(&self.candidates, target)
     }
 
     pub fn missing_rgb_keys(&self, pixels: &[u8]) -> Vec<u32> {
@@ -440,60 +381,25 @@ impl AuthorDither {
 
     pub fn preplan_rgb(&mut self, pixels: &[u8]) {
         let missing = self.missing_rgb_keys(pixels);
-        self.preplan_keys(&missing, None);
-    }
-
-    /// GPU results are candidate hints, never final colour decisions. An exact
-    /// f64 CPU search refines every uncached RGB, retaining deterministic ties.
-    pub fn preplan_rgb_seeded(&mut self, pixels: &[u8], seeds: &[u32]) -> Result<(), String> {
-        if pixels.len() % 3 != 0 || seeds.len() != pixels.len() / 3 {
-            return Err("GPU seed count must match RGB pixel count".into());
-        }
-        let mut hints = HashMap::new();
-        for (p, &seed) in pixels.chunks_exact(3).zip(seeds) {
-            let key = rgb_key([p[0], p[1], p[2]]);
-            if !self.cache.contains_key(&key) {
-                hints.entry(key).or_insert(seed);
-            }
-        }
-        let mut keys: Vec<_> = hints.keys().copied().collect();
-        keys.sort_unstable();
-        let seeds: Vec<_> = keys.iter().map(|k| hints[k]).collect();
-        self.preplan_keys(&keys, Some(&seeds));
-        Ok(())
-    }
-
-    pub fn preplan_keys_seeded(&mut self, keys: &[u32], seeds: &[u32]) -> Result<(), String> {
-        if keys.len() != seeds.len() || keys.iter().any(|&k| k > 0xffffff) {
-            return Err("Invalid GPU RGB key or seed count".into());
-        }
-        self.preplan_keys(keys, Some(seeds));
-        Ok(())
-    }
-
-    fn preplan_keys(&mut self, keys: &[u32], seeds: Option<&[u32]>) {
         let plans = self
-            .plan_keys(keys, seeds)
-            .expect("Collected RGB keys and seed counts are valid");
-        self.import_plans(keys, &plans)
+            .plan_keys(&missing)
+            .expect("Collected RGB keys are valid");
+        self.import_plans(&missing, &plans)
             .expect("Exact search returns valid candidate ids");
     }
 
     /// Compute exact plans independently of memoization. Work can be divided
     /// among native threads or browser instances, then imported by one owner.
-    pub fn plan_keys(&self, keys: &[u32], seeds: Option<&[u32]>) -> Result<Vec<u32>, String> {
-        if keys.iter().any(|&key| key > 0xffffff)
-            || seeds.is_some_and(|hints| hints.len() != keys.len())
-        {
-            return Err("Invalid RGB key or seed count".into());
+    pub fn plan_keys(&self, keys: &[u32]) -> Result<Vec<u32>, String> {
+        if keys.iter().any(|&key| key > 0xffffff) {
+            return Err("Invalid RGB key".into());
         }
         let calculate = |index: usize| {
             let rgb = key_rgb(keys[index]);
             self.palette
                 .iter()
                 .position(|&p| p == rgb)
-                .unwrap_or_else(|| self.uncached_plan_seeded(rgb, seeds.map(|s| s[index])))
-                as u32
+                .unwrap_or_else(|| self.uncached_plan(rgb)) as u32
         };
         let workers = self.threads.min(keys.len().div_ceil(RGB_WORK_BATCH));
         // Portable WASM runs this same search on worker-sized key batches.
@@ -556,64 +462,6 @@ impl AuthorDither {
             return Err("Invalid RGB key, candidate id or plan count".into());
         }
         Ok(())
-    }
-
-    /// Shared native/browser WGSL ABI: header[8], nodes[12], candidate Lab[4],
-    /// then leaf indices. Float values are IEEE754 f32 bits in a u32 buffer.
-    pub fn gpu_search_data(&self) -> Vec<u32> {
-        let node_count = self.tree.nodes.len() + self.neutral_tree.nodes.len();
-        // The current C64 palette fits this compact hint ABI. Other palettes
-        // may admit more multisets; let GPU callers retain their CPU path.
-        if node_count >= 32768 || self.candidates.len() >= 131072 {
-            return Vec::new();
-        }
-        let candidate_offset = 8 + node_count * 12;
-        let index_offset = candidate_offset + self.candidates.len() * 4;
-        let mut data = vec![
-            node_count as u32,
-            self.candidates.len() as u32,
-            self.tree.root as u32,
-            (self.tree.nodes.len() + self.neutral_tree.root) as u32,
-            index_offset as u32,
-            candidate_offset as u32,
-            8,
-            u32::from(self.neutral_guard),
-        ];
-        for (tree, node_base, index_base) in [
-            (&self.tree, 0, 0),
-            (
-                &self.neutral_tree,
-                self.tree.nodes.len(),
-                self.tree.indices.len(),
-            ),
-        ] {
-            for node in &tree.nodes {
-                data.extend(node.lo.map(|v| (v as f32).to_bits()));
-                data.push((index_base + node.start) as u32);
-                data.extend(node.hi.map(|v| (v as f32).to_bits()));
-                data.push((index_base + node.end) as u32);
-                data.extend(node.children.map(|c| {
-                    if c == NONE {
-                        u32::MAX
-                    } else {
-                        (node_base + c) as u32
-                    }
-                }));
-                data.extend([(node.max_chroma as f32).to_bits(), 0]);
-            }
-        }
-        for c in &self.candidates {
-            data.extend(c.lab.map(|v| (v as f32).to_bits()));
-            data.push(u32::from(c.neutral));
-        }
-        data.extend(
-            self.tree
-                .indices
-                .iter()
-                .chain(&self.neutral_tree.indices)
-                .map(|&v| v as u32),
-        );
-        data
     }
 
     pub fn frame_plans(&mut self, frame: &[u8]) -> Vec<usize> {
@@ -1036,23 +884,18 @@ mod tests {
         let mut worker = AuthorDither::new(&PALETTE, true).unwrap();
         worker.set_threads(4);
         for batch in keys.chunks(137).rev() {
-            let plans = worker.plan_keys(batch, None).unwrap();
+            let plans = worker.plan_keys(batch).unwrap();
             owner.import_plans(batch, &plans).unwrap();
         }
         assert_eq!(owner.frame_plans(&source), expected);
         assert_eq!(worker.cached_rgb_count(), 0);
-        let bad_hints = vec![u32::MAX; keys.len()];
-        assert_eq!(
-            worker.plan_keys(&keys, Some(&bad_hints)).unwrap(),
-            expected.iter().map(|&id| id as u32).collect::<Vec<_>>()
-        );
     }
 
     #[test]
     fn invalid_key_work_and_import_cannot_partially_update_cache() {
         let mut d = AuthorDither::new(&PALETTE, true).unwrap();
         let key = rgb_key([131, 79, 36]);
-        let plans = d.plan_keys(&[key], None).unwrap();
+        let plans = d.plan_keys(&[key]).unwrap();
         d.import_plans(&[key], &plans).unwrap();
         let before = d.cache.clone();
         for (keys, plans) in [
@@ -1063,35 +906,8 @@ mod tests {
             assert!(d.import_plans(&keys, &plans).is_err());
             assert_eq!(d.cache, before);
         }
-        assert!(d.plan_keys(&[0x1000000], None).is_err());
-        assert!(d.plan_keys(&[key], Some(&[])).is_err());
-        assert_eq!(d.plan_keys(&[], None).unwrap(), Vec::<u32>::new());
+        assert!(d.plan_keys(&[0x1000000]).is_err());
+        assert_eq!(d.plan_keys(&[]).unwrap(), Vec::<u32>::new());
         assert!(d.import_plans(&[], &[]).is_ok());
-    }
-
-    #[test]
-    fn arbitrary_gpu_hints_cannot_change_exact_plans() {
-        let mut source = Vec::new();
-        for i in 0..257u32 {
-            source.extend(key_rgb(i.wrapping_mul(7919) & 0xffffff));
-        }
-        source.extend([80, 80, 80, 124, 129, 124]);
-        let mut cpu = AuthorDither::new(&PALETTE, true).unwrap();
-        cpu.set_threads(1);
-        let expected = cpu.frame_plans(&source);
-        for bad_hint in [0u32, 42, u32::MAX] {
-            let mut gpu = AuthorDither::new(&PALETTE, true).unwrap();
-            gpu.set_threads(1);
-            gpu.preplan_rgb_seeded(&source, &vec![bad_hint; source.len() / 3])
-                .unwrap();
-            assert_eq!(gpu.frame_plans(&source), expected);
-        }
-        assert!(cpu.preplan_rgb_seeded(&source, &[]).is_err());
-        let tree = cpu.gpu_search_data();
-        assert_eq!(tree[1] as usize, cpu.candidates.len());
-        assert!(tree[2] < tree[0] && tree[3] < tree[0]);
-        assert_eq!(tree[5], 8 + tree[0] * 12);
-        assert_eq!(tree[4], tree[5] + tree[1] * 4);
-        assert!(tree[tree[4] as usize..].iter().all(|&i| i < tree[1]));
     }
 }

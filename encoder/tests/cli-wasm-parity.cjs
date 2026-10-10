@@ -14,7 +14,7 @@ try {
   const output = path.join(temporary, 'fixture.mup');
   const run = (args) => execFileSync('ffmpeg', ['-v', 'error', '-nostdin', ...args], { maxBuffer: 8 * 1024 * 1024 });
   run(['-f','lavfi','-i','testsrc2=size=640x360:rate=30','-f','lavfi','-i','sine=frequency=440:sample_rate=48000','-t','0.48','-c:v','libx264','-pix_fmt','yuv420p','-c:a','aac','-shortest','-y',video]);
-  execFileSync(binary, [video, '-o', output, '--threads', '4', '--gpu', 'off', '--title', 'CLI WASM parity'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  execFileSync(binary, [video, '-o', output, '--threads', '4', '--title', 'CLI WASM parity'], { stdio: ['ignore', 'pipe', 'inherit'] });
   const native = fs.readFileSync(output);
   const count = native.readUInt32LE(68);
   const fps = 985248 / (63 * 312 * 3);

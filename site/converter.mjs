@@ -1,7 +1,6 @@
 import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
 import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent} from './media.mjs?v=4b5fa7b3ec416362';
-import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=2ce0eec53470a004';
-import {createGpuPlanner} from './gpu-planner.js?v=ef76c7df2a9b703b';
+import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=d0f95ba62665f6ce';
 import {ConversionProgress} from './conversion-progress.mjs';
 const $=id=>document.getElementById(id);
 const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-preview');
@@ -15,7 +14,7 @@ function assetUrl(name) {
 }
 const wasmUrl=assetUrl('./assets/encoder.wasm').href;
 let selected=null,plan=null,inputUrl=null,outputUrl=null,busy=false,loadSerial=0,abortController=null;
-let pool=null,encoder=null,gpu=null,preview=null,previewSerial=0,paintRequested=-1,painting=false;
+let pool=null,encoder=null,preview=null,previewSerial=0,paintRequested=-1,painting=false;
 let audioContext=null,audioBuffer=null,audioSource=null,audioLoading=null;
 function status(message,{error=false}={}) {
   $('conversion-status').hidden=!message;$('conversion-status').textContent=message;$('conversion-status').classList.toggle('error',error);
@@ -68,7 +67,7 @@ drop.addEventListener('drop',event=>{
   selectFile(event.dataTransfer.files[0]);
 });
 $('cancel').addEventListener('click',()=>{
-  abortController?.abort();pool?.close();encoder?.close();gpu?.destroy();
+  abortController?.abort();pool?.close();encoder?.close();
   status('Cancelling…');
 });
 $('convert').addEventListener('click',async()=>{
@@ -96,11 +95,6 @@ $('convert').addEventListener('click',async()=>{
     status('Preparing…');
     await Promise.all([pool.init(wasmUrl),encoder.call('init',{url:wasmUrl})]);checkAbort(signal);
     await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name)},[pcm.buffer]);
-    if(navigator.gpu) {
-      status('Preparing…');
-      const search=await pool.workers[0].call('search');checkAbort(signal);
-      if(search) gpu=await createGpuPlanner(new Uint32Array(search),{shaderUrl:assetUrl('./assets/author-seed.wgsl').href});
-    }
     updateProgress(progress.start());
     const pending=[];
     const addChunks=chunks=>{for(const chunk of chunks)parts.push(new Blob([chunk]));};
@@ -121,7 +115,7 @@ $('convert').addEventListener('click',async()=>{
       // Capture overlaps color planning; final codec writes retain frame order.
       pending.push((async()=>{
         try {
-          const result=await pool.batch(frames,gpu);
+          const result=await pool.batch(frames);
           checkAbort(signal);
           for(let index=first;index<last;index++)updateProgress(progress.quantizedFrame(index));
           return {result};
@@ -145,7 +139,7 @@ $('convert').addEventListener('click',async()=>{
     if(error.name==='AbortError'||signal.aborted)status('Cancelled.');
     else status(error.message,{error:true});
   } finally {
-    pool?.close();encoder?.close();gpu?.destroy();pool=null;encoder=null;gpu=null;abortController=null;setBusy(false);
+    pool?.close();encoder?.close();pool=null;encoder=null;abortController=null;setBusy(false);
   }
 });
 async function paintFrame(index) {
@@ -189,5 +183,5 @@ function playbackFrame() {
   if(preview)paintFrame(Math.floor(original.currentTime*CONTENT_FPS));
   if(!original.paused&&!original.ended)requestAnimationFrame(playbackFrame);
 }
-window.addEventListener('pagehide',()=>{abortController?.abort();pool?.close();encoder?.close();gpu?.destroy();stopAudio();audioContext?.close();});
+window.addEventListener('pagehide',()=>{abortController?.abort();pool?.close();encoder?.close();stopAudio();audioContext?.close();});
 status($('conversion-status').textContent);

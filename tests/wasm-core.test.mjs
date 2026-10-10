@@ -61,10 +61,9 @@ test('split color searches reproduce sequential quantization and retain shared c
   assert.throws(()=>owner.importPlans(missing,Uint32Array.of(0xffffffff)),/Invalid/);
   assert.deepEqual(owner.prepareKeys(new Uint8Array(216000).fill(33)),missing);
   assert.throws(()=>owner.planKeys(Uint32Array.of(0x1000000)),/Invalid/);
-  assert.throws(()=>owner.planKeys(Uint32Array.of(0),new Uint32Array(2)),/count/);
   assert.deepEqual(owner.planKeys(new Uint32Array()),new Uint32Array());
-  assert.throws(()=>owner.check(owner.exports.mup_plan_keys(0,4,0,0)),/live mup_alloc/);
+  assert.throws(()=>owner.check(owner.exports.mup_plan_keys(0,4)),/live mup_alloc/);
   const pointer=owner.allocate(Uint8Array.of(0,0,0));
-  try {assert.throws(()=>owner.check(owner.exports.mup_plan_keys(pointer,3,0,0)),/whole u32/);}
+  try {assert.throws(()=>owner.check(owner.exports.mup_plan_keys(pointer,3)),/whole u32/);}
   finally {owner.free(pointer,3);}
 });

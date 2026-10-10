@@ -12,7 +12,6 @@ struct Runtime {
     encoder: Option<Encoder>,
     result: Vec<u8>,
     error: Vec<u8>,
-    gpu_search: Vec<u32>,
 }
 impl Runtime {
     fn input(&self, pointer: usize, length: usize) -> Result<&[u8], String> {
@@ -26,7 +25,7 @@ impl Runtime {
     }
     fn input_u32(&self, pointer: usize, length: usize) -> Result<Vec<u32>, String> {
         if !length.is_multiple_of(4) {
-            return Err("RGB keys, seeds and plans must contain whole u32 values".into());
+            return Err("RGB keys and plans must contain whole u32 values".into());
         }
         Ok(self
             .input(pointer, length)?
@@ -115,23 +114,13 @@ pub extern "C" fn mup_prepare_keys(pointer: usize, length: usize) -> i32 {
     })
 }
 #[no_mangle]
-pub extern "C" fn mup_plan_keys(
-    keys: usize,
-    keys_length: usize,
-    seeds: usize,
-    seeds_length: usize,
-) -> i32 {
+pub extern "C" fn mup_plan_keys(keys: usize, keys_length: usize) -> i32 {
     operation(|r| {
         let keys = r.input_u32(keys, keys_length)?;
-        let seeds = if seeds_length == 0 {
-            None
-        } else {
-            Some(r.input_u32(seeds, seeds_length)?)
-        };
         r.result = r
             .quantizer()?
             .author_mut()
-            .plan_keys(&keys, seeds.as_deref())?
+            .plan_keys(&keys)?
             .into_iter()
             .flat_map(u32::to_le_bytes)
             .collect();
@@ -150,43 +139,6 @@ pub extern "C" fn mup_import_plans(
         let plans = r.input_u32(plans, plans_length)?;
         r.quantizer()?.import_plans(&keys, &plans)
     })
-}
-#[no_mangle]
-pub extern "C" fn mup_quantize_seeded(
-    pointer: usize,
-    length: usize,
-    seeds: usize,
-    seeds_length: usize,
-) -> i32 {
-    operation(|r| {
-        let rgb = r.input(pointer, length)?.to_vec();
-        if rgb.len() != RGB_BYTES || seeds_length != VIDEO_WIDTH * VIDEO_HEIGHT * 4 {
-            return Err("GPU seed array must contain one u32 per pixel".into());
-        }
-        let seeds = r.input_u32(seeds, seeds_length)?;
-        let q = r.quantizer()?;
-        q.prepare_keys(&rgb)?;
-        q.author_mut().preplan_rgb_seeded(&rgb, &seeds)?;
-        r.result = q.pack_plans(&rgb);
-        Ok(())
-    })
-}
-#[no_mangle]
-pub extern "C" fn mup_gpu_search_ptr() -> usize {
-    let status = operation(|r| {
-        if r.gpu_search.is_empty() {
-            r.gpu_search = r.quantizer()?.author_mut().gpu_search_data();
-        }
-        Ok(())
-    });
-    if status != 0 {
-        return 0;
-    }
-    RUNTIME.with(|r| r.borrow().gpu_search.as_ptr() as usize)
-}
-#[no_mangle]
-pub extern "C" fn mup_gpu_search_len() -> usize {
-    RUNTIME.with(|r| r.borrow().gpu_search.len() * 4)
 }
 #[no_mangle]
 pub extern "C" fn mup_encode_packed(pointer: usize, length: usize) -> i32 {

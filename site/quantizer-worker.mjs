@@ -1,11 +1,10 @@
-import {EncoderCore} from './wasm-core.mjs?v=a402dff20670e152';
+import {EncoderCore} from './wasm-core.mjs?v=65be04c379a52579';
 let core,frames=[];
 self.onmessage = async ({data}) => {
   const {id,method,args={}}=data;
   try {
     let result,transfer=[];
     if(method==='init') { core=await EncoderCore.load(args.url); result={ready:true}; }
-    else if(method==='search') { result=core.searchData(); if(result) transfer=[result]; }
     else if(method==='prepare') {
       frames=args.frames.map(buffer=>new Uint8Array(buffer));
       if(frames.length<1||frames.length>3||frames.some(frame=>frame.length!==216000))
@@ -15,7 +14,7 @@ self.onmessage = async ({data}) => {
       result=core.prepareKeys(rgb).buffer;transfer=[result];
     }
     else if(method==='plan') {
-      result=core.planKeys(new Uint32Array(args.keys),args.seeds?new Uint32Array(args.seeds):null).buffer;
+      result=core.planKeys(new Uint32Array(args.keys)).buffer;
       transfer=[result];
     }
     else if(method==='pack') {
@@ -23,7 +22,7 @@ self.onmessage = async ({data}) => {
       result=frames.map(frame=>core.quantize(frame).buffer);frames=[];transfer=result;
     }
     else if(method==='quantize') {
-      result=core.quantize(new Uint8Array(args.rgb),args.seeds?new Uint32Array(args.seeds):null).buffer;
+      result=core.quantize(new Uint8Array(args.rgb)).buffer;
       transfer=[result];
     } else throw new Error('Unknown quantizer request.');
     self.postMessage({id,result},transfer);

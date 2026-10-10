@@ -18,7 +18,6 @@ RUSTFLAGS = " ".join([
 ])
 REQUIRED = {
     "memory", "mup_alloc", "mup_free", "mup_begin", "mup_quantize",
-    "mup_quantize_seeded", "mup_gpu_search_ptr", "mup_gpu_search_len",
     "mup_encode_packed", "mup_finish", "mup_result_ptr", "mup_result_len",
     "mup_output_ptr", "mup_output_len", "mup_output_clear",
     "mup_preview_ptr", "mup_preview_len", "mup_error_ptr", "mup_error_len",
@@ -45,10 +44,7 @@ def main() -> None:
     common = ["--manifest-path", str(ROOT / "encoder/Cargo.toml"), "--locked"]
     offline = ["--offline"] if args.offline else []
     destination = ROOT / "site/assets/encoder.wasm"
-    shader_source = ROOT / "encoder/shaders/author-seed.wgsl"
-    shader_destination = ROOT / "site/assets/author-seed.wgsl"
     temporary: Path | None = None
-    shader_temporary: Path | None = None
     try:
         subprocess.run(["cargo", "build", "--release", "--lib", "--target", "wasm32-unknown-unknown", *common, *offline], cwd=ROOT, env=env, check=True)
         metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps", *common, *offline], cwd=ROOT, env=env))
@@ -66,31 +62,19 @@ if(WebAssembly.Module.imports(m).length)throw Error('The encoder must not import
 const names=new Set(WebAssembly.Module.exports(m).map(e=>e.name));
 for(const name of JSON.parse(process.argv[2]))if(!names.has(name))throw Error('Missing raw ABI export: '+name);"""
         subprocess.run([node, "-e", verifier, str(temporary), json.dumps(sorted(REQUIRED))], check=True)
-        shader = shader_source.read_bytes()
-        shader_matched = shader_destination.exists() and shader_destination.read_bytes() == shader
         matched = destination.exists() and destination.read_bytes() == payload
-        if args.check and not shader_matched:
-            raise SystemExit("Checked-in author-seed.wgsl differs from the native shader; rerun without --check")
         if args.check and not matched:
             raise SystemExit("Checked-in encoder.wasm differs from this optimized build; rerun without --check")
         if not args.check:
-            with tempfile.NamedTemporaryFile(prefix=".author-seed.", suffix=".wgsl", dir=destination.parent, delete=False) as handle:
-                shader_temporary = Path(handle.name)
-                handle.write(shader)
             temporary.chmod(0o644)
-            shader_temporary.chmod(0o644)
             os.replace(temporary, destination)
             temporary = None
-            os.replace(shader_temporary, shader_destination)
-            shader_temporary = None
-        print(json.dumps({"artifact": str(destination), "bytes": len(payload), "unoptimized_bytes": unoptimized_bytes, "sha256": hashlib.sha256(payload).hexdigest(), "byte_identical_before_staging": matched, "checked": args.check, "shader_sha256": hashlib.sha256(shader).hexdigest(), "shader_byte_identical_before_staging": shader_matched}, indent=2))
+        print(json.dumps({"artifact": str(destination), "bytes": len(payload), "unoptimized_bytes": unoptimized_bytes, "sha256": hashlib.sha256(payload).hexdigest(), "byte_identical_before_staging": matched, "checked": args.check}, indent=2))
     except (OSError, subprocess.CalledProcessError, ValueError) as error:
         raise SystemExit(f"Encoder build failed: {error}") from error
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-        if shader_temporary is not None:
-            shader_temporary.unlink(missing_ok=True)
 
 if __name__ == "__main__":
     main()

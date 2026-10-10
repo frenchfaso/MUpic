@@ -26,13 +26,14 @@ test('a failed transfer rejects the call without retaining an RPC entry',async()
 });
 test('color work is disjoint, dynamically balanced and imported before packing',async()=>{
   const pool=new QuantizerPool(3,'quantizer-worker.mjs'),keys=Uint32Array.from({length:5200},(_,i)=>i);
-  const searched=[],workers=new Set(),gpuCalls=[];
+  const searched=[],workers=new Set();
   for(const [index,client] of pool.workers.entries())client.worker.handle=message=>{
     const {id,method,args}=message;
     if(method==='prepare')queueMicrotask(()=>client.worker.onmessage({data:{id,result:keys.slice().buffer}}));
     if(method==='plan') {
-      const batch=new Uint32Array(args.keys),seeds=new Uint32Array(args.seeds);
-      workers.add(index);searched.push(...batch);assert.deepEqual(seeds,batch.map(key=>key+7));
+      const batch=new Uint32Array(args.keys);
+      workers.add(index);searched.push(...batch);
+      assert.deepEqual(Object.keys(args),['keys']);
       setTimeout(()=>client.worker.onmessage({data:{id,result:batch.map(key=>key+1).buffer}}),index===0?5:0);
     }
     if(method==='pack') {
@@ -41,28 +42,25 @@ test('color work is disjoint, dynamically balanced and imported before packing',
       queueMicrotask(()=>client.worker.onmessage({data:{id,result:[Uint8Array.of(1).buffer,Uint8Array.of(2).buffer]}}));
     }
   };
-  const gpu={async seeds(input){gpuCalls.push(input.slice());return input.map(key=>key+7);},destroy(){}};
-  const result=await pool.batch([new Uint8Array(6),new Uint8Array(6)],gpu);
+  const result=await pool.batch([new Uint8Array(6),new Uint8Array(6)]);
   assert.deepEqual(searched.sort((a,b)=>a-b),Array.from(keys));assert.equal(workers.size,3);
-  assert.equal(gpuCalls.length,1);assert.deepEqual(gpuCalls[0],keys);
   assert.deepEqual(result.map(buffer=>new Uint8Array(buffer)[0]),[1,2]);pool.close();
 });
-test('queued batches retain one cache owner and a failed GPU falls back once',async()=>{
-  const pool=new QuantizerPool(2,'quantizer-worker.mjs');let active=0,peak=0,gpuCalls=0,destroyed=0,marker=0;
+test('queued batches retain one cache owner and preserve frame order',async()=>{
+  const pool=new QuantizerPool(2,'quantizer-worker.mjs');let active=0,peak=0,marker=0;
   pool.workers[0].worker.handle=message=>{
     const {id,method,args}=message;
     if(method==='prepare') {
       active++;peak=Math.max(peak,active);marker=new Uint8Array(args.frames[0])[0];
       queueMicrotask(()=>pool.workers[0].worker.onmessage({data:{id,result:Uint32Array.of(marker).buffer}}));
     } else if(method==='plan') {
-      assert.equal(args.seeds,undefined);
+      assert.deepEqual(Object.keys(args),['keys']);
       setTimeout(()=>pool.workers[0].worker.onmessage({data:{id,result:Uint32Array.of(0).buffer}}),1);
     } else if(method==='pack') {
       active--;queueMicrotask(()=>pool.workers[0].worker.onmessage({data:{id,result:[Uint8Array.of(marker).buffer]}}));
     }
   };
-  const gpu={async seeds(){gpuCalls++;throw Error('Device lost');},destroy(){destroyed++;}};
-  const results=await Promise.all([pool.batch([Uint8Array.of(3)],gpu),pool.batch([Uint8Array.of(9)],gpu)]);
-  assert.equal(peak,1);assert.equal(gpuCalls,1);assert.equal(destroyed,1);
+  const results=await Promise.all([pool.batch([Uint8Array.of(3)]),pool.batch([Uint8Array.of(9)])]);
+  assert.equal(peak,1);
   assert.deepEqual(results.map(batch=>new Uint8Array(batch[0])[0]),[3,9]);pool.close();
 });

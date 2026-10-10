@@ -54,8 +54,6 @@ pub fn frame_count(seconds: f64) -> Result<usize, String> {
 /// Bayer positions are physical canvas positions and never depend on time.
 pub struct Quantizer {
     author: AuthorDither,
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    gpu: Option<crate::gpu::GpuPlanner>,
 }
 impl Quantizer {
     pub fn new(threads: usize) -> Result<Self, String> {
@@ -64,16 +62,7 @@ impl Quantizer {
         }
         let mut author = AuthorDither::new(&PALETTE, true)?;
         author.set_threads(threads);
-        Ok(Self {
-            author,
-            #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-            gpu: None,
-        })
-    }
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    pub fn enable_gpu(&mut self) -> Result<(), String> {
-        self.gpu = Some(crate::gpu::GpuPlanner::new(&self.author)?);
-        Ok(())
+        Ok(Self { author })
     }
     fn cache_limit() -> usize {
         if cfg!(target_arch = "wasm32") {
@@ -113,17 +102,7 @@ impl Quantizer {
     }
     pub fn preplan(&mut self, rgb: &[u8]) -> Result<(), String> {
         let missing = self.prepare_keys(rgb)?;
-        #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-        if let Some(gpu) = &self.gpu {
-            match gpu.preplan_keys(&mut self.author, &missing) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    eprintln!("GPU planning failed; using exact CPU search: {error}");
-                    self.gpu = None;
-                }
-            }
-        }
-        let plans = self.author.plan_keys(&missing, None)?;
+        let plans = self.author.plan_keys(&missing)?;
         self.import_plans(&missing, &plans)
     }
     pub fn quantize(&mut self, rgb: &[u8]) -> Result<Vec<u8>, String> {
