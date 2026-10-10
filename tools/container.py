@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Package DICT4 profile13 assets into one self-contained MUP9 file.
 
-Envelope layout is documented in container_format.json.  The codec8 cache
+Envelope layout is documented in docs/container-format.json. The codec8 cache
 stream is copied exactly; only its startup metadata and initial frame move
 into this envelope.  Audit reads bounded blocks and independently replays the
 video, including when streaming encodes retain hashes instead of full oracles.
@@ -79,7 +79,7 @@ def sha256_file(path: Path) -> str:
 
 
 def _validate_abi() -> None:
-    schema = json.loads(Path(__file__).with_name("container_format.json").read_text())
+    schema = json.loads((Path(__file__).resolve().parent.parent / "docs/container-format.json").read_text())
     documented = {field["name"]: (field["offset"], field["bytes"]) for field in schema["fields"]}
     require(schema["header_bytes"] == HEADER_BYTES and all(documented[k] == v for k, v in FIELDS.items()),
             "container implementation differs from canonical ABI")
