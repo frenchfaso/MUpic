@@ -9,7 +9,7 @@ def version_converter_entrypoint(site):
     """A refreshed HTML page must not reuse a cached previous converter."""
     version = sha256_file(site/'converter.mjs')[:16]
     page = site/'convert.html'
-    text, count = re.subn(r'(src="\./converter\.mjs)(?:\?[^" ]*)?(")',
+    text, count = re.subn(r'(src="(?:\./)?converter\.mjs)(?:\?[^" ]*)?(")',
                          lambda match: match[1]+'?v='+version+match[2], page.read_text())
     if count != 1:
         raise ValueError('Expected one converter module entrypoint')
