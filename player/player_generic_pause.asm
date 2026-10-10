@@ -12,18 +12,12 @@ playback_control:
 !current_block:
     lda #1
     sta playback_paused
-    inc pause_count
-    bne !clear+
-    inc pause_count+1
     jmp !clear+
 !resume:
     lda #0
     sta playback_paused
     lda #1
     sta audio_pending_start
-    inc resume_count
-    bne !clear+
-    inc resume_count+1
 !clear:
     lda #0
     sta pause_request

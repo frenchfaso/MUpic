@@ -24,7 +24,7 @@ fn run_program(m: &mut Machine, code: &[u8], instrs: u64) {
 #[test]
 fn reverse_step_rolls_back_ram_and_regs_byte_exact() {
     let mut m = Machine::new();
-    // Ensure the ring is armed regardless of ambient env (the bench toggles it off).
+    // Ensure the ring is armed regardless of ambient environment.
     m.delta_ring.set_enabled(true);
     m.cpu_history.set_enabled(true);
 

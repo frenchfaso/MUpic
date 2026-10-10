@@ -1,5 +1,7 @@
 import "./wasm.js";
 const { instantiateUE2 } = globalThis.UE2Wasm;
+const wasmUrl = new URL("./ue2_web.wasm", import.meta.url);
+wasmUrl.search = new URL(import.meta.url).search;
 // Rust owns oscillator/envelope/filter/resampling and PCM mixing. JS transports
 // opaque timestamped records and delivers stereo samples to AudioWorklet.
 let module, cpuPort, audioPort, control, samples;
@@ -18,12 +20,12 @@ async function start(options) {
     audioPort.start();
   }
   module = await instantiateUE2({
+    wasmUrl,
     print: () => {}, printErr: (message) => postMessage({ type: "log", message: String(message) }),
   });
   if (module._ue2_sid_init(options.sampleRate || 48000) !== 0) throw new Error("Unable to initialize reSID Rust.");
   cpuPort.onmessage = ({ data }) => {
     if (data.type !== "events") return;
-    const begin = performance.now();
     try {
       if (!data.byteLength || data.byteLength % 16 || data.byteLength > data.buffer.byteLength) throw new Error("Invalid SID batch.");
       const ptr = module._ue2_sid_alloc(data.byteLength);
@@ -42,7 +44,7 @@ async function start(options) {
       const transfers = [data.buffer];
       if (data.sampler) transfers.push(data.sampler);
       cpuPort.postMessage({ type: "batch-return", buffer: data.buffer, sampler: data.sampler,
-        samplerSamples: data.samplerSamples, audioFramesSent, cpuMs: performance.now() - begin }, transfers);
+        samplerSamples: data.samplerSamples, audioFramesSent }, transfers);
     } catch (error) {
       cpuPort.postMessage({ type: "error", message: String(error?.message || error) }); report(error);
     }
@@ -56,7 +58,7 @@ function publishPcm(pcm) {
     let write = Atomics.load(control, 1);
     const frames = Math.floor(pcm.length / 2), free = capacity - 1 - ((write - read + capacity) % capacity);
     // Only the consumer changes its reader index; producer never races a drop.
-    if (frames > free) { Atomics.add(control, 3, frames); return 0; }
+    if (frames > free) return 0;
     for (let frame = 0; frame < frames; frame++) {
       samples[write * 2] = pcm[frame * 2] / 32768; samples[write * 2 + 1] = pcm[frame * 2 + 1] / 32768;
       write = (write + 1) % capacity;

@@ -66,10 +66,7 @@ export class EncoderCore {
   finish() {
     this.check(this.exports.mup_finish()); const chunks=this.drain(),e=this.exports;
     const prefix=this.bytes(e.mup_result_ptr(),e.mup_result_len()).slice().buffer;
-    let stats={peakSlots:e.mup_peak_slots?.(),adaptedFrames:e.mup_adapted_frames?.(),receivedFrames:e.mup_received_frames?.()};
-    if(e.mup_stats_ptr && e.mup_stats_len) {
-      try { stats=JSON.parse(new TextDecoder().decode(this.bytes(e.mup_stats_ptr(),e.mup_stats_len()))); } catch {}
-    }
+    const stats={peakSlots:e.mup_peak_slots?.(),adaptedFrames:e.mup_adapted_frames?.(),receivedFrames:e.mup_received_frames?.()};
     return {prefix,chunks,stats};
   }
 }

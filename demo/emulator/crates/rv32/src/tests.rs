@@ -4,7 +4,6 @@
 
 use super::csr::*;
 use super::{mul_div, Bus, Cpu, Exit};
-use std::time::Instant;
 
 const RAM_LEN: usize = 1 << 16;
 
@@ -46,11 +45,6 @@ const RA: u32 = 1;
 const T0: u32 = 5;
 const T1: u32 = 6;
 const T2: u32 = 7;
-const S0: u32 = 8;
-const S1: u32 = 9;
-const A0: u32 = 10;
-const T3: u32 = 28;
-const T4: u32 = 29;
 
 const ECALL: u32 = 0x0000_0073;
 const EBREAK: u32 = 0x0010_0073;
@@ -84,21 +78,11 @@ fn jalr(rd: u32, rs1: u32, imm: i32) -> u32 {
     i_type(0x67, 0, rd, rs1, imm)
 }
 
-fn jal(rd: u32, off: i32) -> u32 {
-    let m = off as u32;
-    (m >> 20 & 1) << 31 | (m >> 1 & 0x3ff) << 21 | (m >> 11 & 1) << 20 | (m >> 12 & 0xff) << 12 | rd << 7 | 0x6f
-}
-
 fn branch(f3: u32, rs1: u32, rs2: u32, off: i32) -> u32 {
     let m = off as u32;
     (m >> 12 & 1) << 31 | (m >> 5 & 0x3f) << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | (m >> 1 & 0xf) << 8
         | (m >> 11 & 1) << 7
         | 0x63
-}
-
-fn sw(rs2: u32, rs1: u32, off: i32) -> u32 {
-    let m = off as u32;
-    (m >> 5 & 0x7f) << 25 | rs2 << 20 | rs1 << 15 | 2 << 12 | (m & 0x1f) << 7 | 0x23
 }
 
 /// CSR instruction; `src` is rs1 for the register forms and the 5-bit immediate for the `i` forms.
@@ -370,46 +354,4 @@ fn m_extension_results() {
     ] {
         assert_eq!(mul_div(f3, a, b), want, "funct3 {f3} a {a:#x} b {b:#x}");
     }
-}
-
-/// Reports interpreter speed. Target: >= 150 MIPS in a release build on Apple Silicon (spec S01).
-#[test]
-#[ignore = "timing probe: cargo test --release -p rv32 -- --ignored --nocapture mips"]
-fn mips() {
-    // Checksum loop over a 256-word buffer at 0x1000: load, add, shift, xor, mul, store, call/return, branch.
-    let prog = [
-        lui(S0, 1),
-        addi(S1, 0, 256),
-        addi(A0, 0, 1),
-        addi(T0, S0, 0), // 0x0c outer
-        addi(T1, S1, 0),
-        i_type(0x03, 2, T2, T0, 0), // 0x14 inner: lw t2, 0(t0)
-        r_type(0, 0, T2, T2, A0),
-        i_type(0x13, 1, T3, T2, 5),
-        r_type(0, 4, T2, T2, T3),
-        r_type(1, 0, T3, T2, S1),
-        sw(T2, T0, 0),
-        jal(RA, 20),
-        addi(T0, T0, 4),
-        addi(T1, T1, -1),
-        branch(1, T1, 0, -36),
-        jal(0, -48),
-        i_type(0x13, 5, T4, T2, 3), // 0x40 fn: srli t4, t2, 3
-        r_type(0, 0, A0, A0, T4),
-        jalr(0, RA, 0),
-    ];
-    const INSNS: u64 = 200_000_000;
-    let mut ram = Ram::with_program(&prog);
-    let mut cpu = Cpu::new(0);
-    let mut other = 0u64;
-    let start = Instant::now();
-    for _ in 0..INSNS {
-        other += (cpu.step(&mut ram) != Exit::Stepped) as u64;
-    }
-    let secs = start.elapsed().as_secs_f64();
-    assert_eq!((other, cpu.insns), (0, INSNS));
-    assert!(cpu.pc < 0x4c && cpu.x[A0 as usize] != 0);
-    let mips = INSNS as f64 / secs / 1e6;
-    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
-    println!("rv32 interpreter: {mips:.1} MIPS ({INSNS} instructions in {secs:.2} s, {profile} build)");
 }

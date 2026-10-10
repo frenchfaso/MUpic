@@ -3,7 +3,7 @@
 import argparse, hashlib, json, re, subprocess
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent.parent
-PREFIXES={'assets','demo','docs','encoder','media','player','releases','site','tests','tools','.github','reports'}
+PREFIXES={'demo','encoder','media','player','releases','site','tests','tools','.github'}
 ROOT_FILES={'.gitignore','.gitattributes','README.md','CREDITS.md','LICENSE'}
 FORBIDDEN={'target','cache','__pycache__','node_modules','.env','.DS_Store','usb-work'}
 SECRETS=[re.compile(rb'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----'),
@@ -16,6 +16,8 @@ def main():
     parser.add_argument('--output',type=Path,default=ROOT/'build'/'publication-audit.json')
     args=parser.parse_args()
     names=sorted(set(run('git','ls-files','-z','--cached','--others','--exclude-standard').decode().split('\0'))-{''})
+    deleted=set(run('git','ls-files','-z','--deleted').decode().split('\0'))
+    names=[name for name in names if name not in deleted]
     specs=json.loads((ROOT/'media'/'checksums.json').read_text())['files']
     entries=[];git_bytes=0;lfs_bytes=0
     for name in names:

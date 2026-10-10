@@ -21,7 +21,6 @@ use trx64_core::iec_device::{IecLines, IecOut};
 use trx64_core::{BusKind, Machine, NullSink, Observer};
 
 const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
-const SAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples");
 const FRAME: u64 = 19_656;
 
 fn roms_present() -> bool {
@@ -518,63 +517,4 @@ fn detach_hands_the_device_back() {
     assert_eq!(IecOut { clk: false, data: false }.slot_byte(), 0xc0);
     assert_eq!(IecOut { clk: true, data: true }.slot_byte(), 0x00);
     assert_eq!(IecLines::RELEASED.with(IecOut { clk: true, data: false }), IecLines { atn: true, clk: false, data: true });
-}
-
-// ── §12.13 — characterisation: cost ─────────────────────────────────────────────────
-
-fn timed(what: &str) -> f64 {
-    use std::time::Instant;
-    let mut m = Machine::new();
-    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
-    let dir = std::env::temp_dir().join(format!("trx64-874-cost-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let big: Vec<u8> = [0x00, 0xc0].into_iter().chain((0..30_000u32).map(|i| ((i * 31 + 10) % 256) as u8)).collect();
-    std::fs::write(dir.join("big.prg"), &big).unwrap();
-    let src = std::sync::Arc::new(trx64_core::folder_device::HostFolder::new(&dir).unwrap());
-    match what {
-        "folder" | "serving" => m.attach_folder(9, src, Default::default()).unwrap(),
-        "probe" => m.attach_iec_device(4, Box::new({
-            let mut p = ProbeListener::new("probe", None);
-            p.record = false;
-            p
-        })).unwrap(),
-        _ => {}
-    }
-    frames(&mut m, 130);
-    let bytes = std::fs::read(format!("{SAMPLES}/scramble_infinity.d64")).expect("scramble sample");
-    m.drive8.attach_disk(trx64_core::drive::DiskImage { kind: trx64_core::drive::DiskKind::D64, bytes, backing_path: None, read_only: false });
-    frames(&mut m, 40);
-    let keys: &[u8] = if what == "serving" { b"LOAD\"BIG\",9,1\r" } else { b"LOAD\"*\",8,1\r" };
-    for (i, b) in keys.iter().enumerate() {
-        m.poke(0x0277 + i as u16, &[*b]);
-    }
-    m.poke(0x00c6, &[keys.len() as u8]);
-    let n = 1500u32;
-    let t0 = Instant::now();
-    frames(&mut m, n);
-    let ms = t0.elapsed().as_secs_f64() * 1000.0 / n as f64;
-    let _ = std::fs::remove_dir_all(&dir);
-    ms
-}
-
-#[test]
-#[ignore = "characterisation §12.13; run with --ignored --nocapture (release)"]
-fn characterise_the_cost_of_a_device() {
-    need_roms!();
-    let mut best = [f64::MAX; 4];
-    for _ in 0..3 {
-        for (i, w) in ["none", "folder", "probe", "serving"].iter().enumerate() {
-            best[i] = best[i].min(timed(w));
-        }
-    }
-    eprintln!(
-        "\nframe time, 1500 frames, best of 3 (873: 4.949 / 5.125 / 3.368):\n  no device, LOAD\"*\",8,1 of scramble: {:.3} ms/frame\n  idle folder at 9, same load: {:.3} ms/frame (x{:.3})\n  idle probe at slot 4, same load: {:.3} ms/frame (x{:.3})\n  folder at 9 serving LOAD\"BIG\",9,1: {:.3} ms/frame",
-        best[0],
-        best[1],
-        best[1] / best[0],
-        best[2],
-        best[2] / best[0],
-        best[3]
-    );
 }

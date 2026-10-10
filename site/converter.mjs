@@ -8,14 +8,17 @@ const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-previ
 const context=canvas.getContext('2d',{alpha:false});
 const capture=document.createElement('canvas');capture.width=360;capture.height=200;
 const captureContext=capture.getContext('2d',{alpha:false,willReadFrequently:true});
-const wasmUrl=new URL('./assets/encoder.wasm',import.meta.url).href;
+function assetUrl(name) {
+  const url=new URL(name,import.meta.url);
+  url.search=new URL(import.meta.url).search;
+  return url;
+}
+const wasmUrl=assetUrl('./assets/encoder.wasm').href;
 let selected=null,plan=null,inputUrl=null,outputUrl=null,busy=false,loadSerial=0,abortController=null;
 let pool=null,encoder=null,gpu=null,preview=null,previewSerial=0,paintRequested=-1,painting=false;
 let audioContext=null,audioBuffer=null,audioSource=null,audioLoading=null;
-let proof={state:'empty',frames:0,totalFrames:0,gpu:false,gpuAvailable:Boolean(navigator.gpu),gpuAttempted:false,gpuUsed:false,gpuSeededFrames:0,workers:0};
-function status(message,{error=false,update={}}={}) {
+function status(message,{error=false}={}) {
   $('conversion-status').hidden=!message;$('conversion-status').textContent=message;$('conversion-status').classList.toggle('error',error);
-  proof={...proof,...update};$('conversion-status').dataset.proof=JSON.stringify(proof);
 }
 const sizeLabel=bytes=>`${(bytes/1048576).toFixed(1)} MiB`;
 const timeLabel=seconds=>`${Math.floor(seconds/60)}:${String(Math.floor(seconds%60)).padStart(2,'0')}`;
@@ -37,16 +40,16 @@ async function selectFile(file) {
   if(inputUrl) URL.revokeObjectURL(inputUrl);inputUrl=URL.createObjectURL(file);
   original.src=inputUrl;decoder.src=inputUrl;original.load();decoder.load();
   $('comparison').hidden=true;$('file-details').hidden=false;$('file-details').textContent=`${file.name} · ${sizeLabel(file.size)}`;
-  status('Reading the video…',{update:{state:'loading',frames:0,totalFrames:0,error:null}});
+  status('Reading the video…');
   try {
     await waitEvent(decoder,'loadedmetadata');if(serial!==loadSerial)return;
     plan=videoPlan(decoder.duration,decoder.videoWidth,decoder.videoHeight);selected=file;
     $('comparison').hidden=false;
     $('file-details').textContent=`${file.name} · ${timeLabel(decoder.duration)} · ${sizeLabel(file.size)}`;
-    status('',{update:{state:'ready',totalFrames:plan.frameCount}});setBusy(false);
+    status('');setBusy(false);
   } catch(error) {
     if(serial!==loadSerial)return;
-    status(error.message,{error:true,update:{state:'error',error:error.message}});setBusy(false);
+    status(error.message,{error:true});setBusy(false);
   }
 }
 $('choose-video').addEventListener('click',()=>$('video-file').click());
@@ -66,41 +69,37 @@ drop.addEventListener('drop',event=>{
 });
 $('cancel').addEventListener('click',()=>{
   abortController?.abort();pool?.close();encoder?.close();gpu?.destroy();
-  status('Cancelling…',{update:{state:'cancelling'}});
+  status('Cancelling…');
 });
 $('convert').addEventListener('click',async()=>{
   if(busy||!selected||!plan)return;
   clearOutput();original.pause();setBusy(true);abortController=new AbortController();
-  const signal=abortController.signal,parts=[],started=performance.now();
-  let gpuEnabled=false,gpuUsed=false,gpuSeededFrames=0;
+  const signal=abortController.signal,parts=[];
   const progress=new ConversionProgress(plan.frameCount);
   function updateProgress(snapshot=progress.snapshot()) {
     if(signal.aborted)return;
     const bar=$('conversion-progress');
     if(snapshot.value===null)bar.removeAttribute('value');else bar.value=snapshot.value;
-    const elapsed=(performance.now()-started)/1000;
     const message=snapshot.phase==='finishing'?'Finishing…':
       snapshot.quantizedFrames===snapshot.totalFrames?`Writing ${snapshot.encodedFrames} / ${snapshot.totalFrames} frames`:
       `Processing ${snapshot.quantizedFrames} / ${snapshot.totalFrames} frames`;
-    status(message,{update:{state:snapshot.phase,frames:snapshot.encodedFrames,quantizedFrames:snapshot.quantizedFrames,
-      encodedFrames:snapshot.encodedFrames,progress:snapshot.value,gpu:gpuEnabled,gpuUsed,gpuSeededFrames,elapsedSeconds:elapsed}});
+    status(message);
   }
   const workers=Math.max(1,Math.min(4,(navigator.hardwareConcurrency||2)-1));
   $('conversion-progress').hidden=false;$('conversion-progress').removeAttribute('value');
-  status('Preparing audio…',{update:{state:'audio',frames:0,quantizedFrames:0,encodedFrames:0,progress:null,totalFrames:plan.frameCount,workers,gpu:false,gpuAvailable:Boolean(navigator.gpu),gpuAttempted:false,gpuUsed:false,gpuSeededFrames:0,error:null}});
+  status('Preparing audio…');
   try {
     const pcm=await decodePcm(selected,plan.duration,{silent:$('silent-source').checked,gainDb:Number($('audio-gain').value),signal});
     checkAbort(signal);
-    pool=new QuantizerPool(workers,new URL('./quantizer-worker.mjs',import.meta.url));
-    encoder=new WorkerClient(new URL('./encoder-worker.mjs',import.meta.url));
-    status('Preparing…',{update:{state:'initializing'}});
+    pool=new QuantizerPool(workers,assetUrl('./quantizer-worker.mjs'));
+    encoder=new WorkerClient(assetUrl('./encoder-worker.mjs'));
+    status('Preparing…');
     await Promise.all([pool.init(wasmUrl),encoder.call('init',{url:wasmUrl})]);checkAbort(signal);
     await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name)},[pcm.buffer]);
     if(navigator.gpu) {
-      status('Preparing…',{update:{gpuAttempted:true}});
+      status('Preparing…');
       const search=await pool.workers[0].call('search');checkAbort(signal);
-      if(search) gpu=await createGpuPlanner(new Uint32Array(search),{shaderUrl:new URL('./assets/author-seed.wgsl',import.meta.url).href});
-      gpuEnabled=Boolean(gpu);
+      if(search) gpu=await createGpuPlanner(new Uint32Array(search),{shaderUrl:assetUrl('./assets/author-seed.wgsl').href});
     }
     updateProgress(progress.start());
     const pending=[];
@@ -118,13 +117,12 @@ $('convert').addEventListener('click',async()=>{
         try {
           let seeds;
           if(gpu) {
-            try{seeds=await gpu.seeds(rgb);}catch(error){gpu?.destroy();gpu=null;gpuEnabled=false;console.info(error.message);}
+            try{seeds=await gpu.seeds(rgb);}catch(error){gpu?.destroy();gpu=null;console.info(error.message);}
           }
           checkAbort(signal);
           const transfer=[rgb.buffer];if(seeds)transfer.push(seeds.buffer);
           const result=await worker.call('quantize',{rgb:rgb.buffer,seeds:seeds?.buffer},transfer);
           checkAbort(signal);
-          if(seeds){gpuUsed=true;gpuSeededFrames++;}
           updateProgress(progress.quantizedFrame(index));
           return {result};
         } catch(error){return {error};}
@@ -142,12 +140,10 @@ $('convert').addEventListener('click',async()=>{
     original.currentTime=0;original.muted=true;$('preview-audio').value='mup';
     await paintFrame(0);
     $('conversion-progress').value=progress.complete().value;
-    const elapsed=(performance.now()-started)/1000;
-    status(`Done · ${sizeLabel(movie.size)}`,
-      {update:{state:'complete',progress:1,quantizedFrames:progress.quantized.size,encodedFrames:progress.encodedFrames,bytes:movie.size,duration:preview.header.duration,elapsedSeconds:elapsed,stats:finished.stats,gpu:gpuEnabled,gpuUsed,gpuSeededFrames,preview:'decoded-MUP9'}});
+    status(`Done · ${sizeLabel(movie.size)}`);
   } catch(error) {
-    if(error.name==='AbortError'||signal.aborted)status('Cancelled.',{update:{state:'cancelled'}});
-    else status(error.message,{error:true,update:{state:'error',error:error.message}});
+    if(error.name==='AbortError'||signal.aborted)status('Cancelled.');
+    else status(error.message,{error:true});
   } finally {
     pool?.close();encoder?.close();gpu?.destroy();pool=null;encoder=null;gpu=null;abortController=null;setBusy(false);
   }

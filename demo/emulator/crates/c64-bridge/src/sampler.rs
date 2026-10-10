@@ -257,21 +257,6 @@ impl Default for Sampler {
 }
 
 impl Sampler {
-    /// Read-only verification state. Sampling and queue consumption are unchanged.
-    pub(crate) fn audio_debug_state(&self) -> [u32; 19] {
-        let v = &self.voices[0];
-        let enabled = self.voices.iter().enumerate().fold(0u32, |bits, (i, v)| {
-            bits | (u32::from(v.enabled()) << i)
-        });
-        [(self.queue.lock().len() / 2) as u32, (QUEUE_CAP / 2) as u32,
-            self.now as u32, (self.now >> 32) as u32,
-            self.avail as u32, (self.avail >> 32) as u32, self.frac as u32,
-            self.per_sample as u32, (self.per_sample >> 32) as u32,
-            enabled, u32::from(v.volume), u32::from(v.pan), v.start, v.length,
-            u32::from(v.rate), v.position, v.phase as u32, (v.phase >> 32) as u32,
-            i32::from(v.sample) as u32]
-    }
-
     pub fn new() -> Self {
         let mut s = Sampler {
             voices: [Voice::default(); VOICES],

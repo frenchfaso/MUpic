@@ -29,15 +29,15 @@ async function read(f,offset,length) {
   await f.disk.settle();assert.equal(f.disk.read(offset,length,19,f.memory),0);
   return new Uint8Array(f.memory.buffer,19,length).slice();
 }
-test('genuine gzip chunks inflate byte-exactly while stats count compressed wire bytes',async()=>{
+test('genuine gzip chunks inflate byte-exactly including the short disk tail',async()=>{
   const f=fixture();assert.deepEqual(await read(f,CHUNK,CHUNK),payload(1));
-  assert.equal(f.calls[0].url,'/immutable/block-0001.bin.gz');assert.equal(f.disk.stats.downloadedBytes,f.storedBytes[1]);
-  assert.ok(f.disk.stats.downloadedBytes<CHUNK);assert.deepEqual(await read(f,BYTES-512,512),payload(9));
-  assert.equal(f.disk.stats.downloadedBytes,f.storedBytes[1]+f.storedBytes[9]);f.disk.close();
+  assert.equal(f.calls[0].url,'/immutable/block-0001.bin.gz');assert.equal(f.calls.length,1);
+  assert.ok(f.storedBytes[1]<CHUNK);assert.deepEqual(await read(f,BYTES-512,512),payload(9));
+  assert.deepEqual(f.calls.map(call=>call.index),[1,9]);f.disk.close();
 });
 test('compressed zero blocks require no fetch or decompression',async()=>{
   const f=fixture();assert.deepEqual(await read(f,0,CHUNK),new Uint8Array(CHUNK));
-  assert.equal(f.calls.length,0);assert.equal(f.disk.stats.downloadedBytes,0);f.disk.close();
+  assert.equal(f.calls.length,0);f.disk.close();
 });
 test('an unaligned read crosses zero and gzip chunks without changing guest bytes',async()=>{
   const f=fixture();assert.deepEqual(await read(f,CHUNK-37,200),new Uint8Array([...new Uint8Array(37),...payload(1).subarray(0,163)]));f.disk.close();

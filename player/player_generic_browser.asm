@@ -465,7 +465,6 @@ browser_read_directory:
 browser_open_selected:
     lda #0
     sta fatal_error
-    sta uci_error_count
     lda #2
     sta $df1d
     sta $df1d
@@ -496,9 +495,6 @@ browser_open_selected:
     bcs !done+
     lda #1
     sta file_open
-    inc uci_open_count
-    bne !done+
-    inc uci_open_count+1
 !done:
     rts
 

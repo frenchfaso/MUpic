@@ -11,7 +11,6 @@
 //! booted from drive 9 (§7.8), and the frame time with B off and on (§7.9).
 
 use std::path::Path;
-use std::time::Instant;
 
 
 use trx64_core::drive::{DiskImage, DiskKind, DrivePosition};
@@ -22,7 +21,6 @@ use trx64_core::{Machine, NullSink};
 
 const ROM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/resources/roms");
 const SAMPLES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../C64ReverseEngineeringMCP/samples");
-const TRACES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../traces");
 const DOS_ROM: &str = "dos1541-325302-01+901229-05.bin";
 const FRAME: u64 = 19_656;
 
@@ -459,16 +457,6 @@ fn the_same_unit_twice_is_refused_naming_the_other() {
 
 // ── §7.8 — characterisation: the seven games booted from 9 ──────────────────────
 
-const GAMES: &[(&str, &str)] = &[
-    ("scramble", "scramble_infinity.d64"),
-    ("polarbear", "POLARBEAR.d64"),
-    ("motm", "motm.g64"),
-    ("greenberet", "green_beret[ocean_1986](!).g64"),
-    ("impossible2", "impossible_mission_ii[epyx_1987](!).g64"),
-    ("lastninja", "last_ninja_remix_s1[system3_1991].g64"),
-    ("maniac", "maniac_mansion_s1[activision_1987](german)(manual)(!).g64"),
-];
-
 fn in_game_ram(pc: u16) -> bool {
     // The seven-game gate's `game_running`: RAM outside the stack page's neighbourhood
     // of the KERNAL's own buffers.
@@ -476,7 +464,6 @@ fn in_game_ram(pc: u16) -> bool {
 }
 
 struct BootFrom9 {
-    name: &'static str,
     kernal_stage: String,
     fast_stage: String,
     stop: String,
@@ -493,7 +480,7 @@ fn distinct_colours(rgba: &[u8]) -> usize {
 /// way the seven-game gate judges (game code sustained in RAM, or a title of ≥ 8
 /// colours), with drive 9's own evidence beside it: did code run in its RAM (a
 /// fastloader's drive half uploaded), and did its head move.
-fn boot_from_nine(name: &'static str, file: &str, early_out: bool) -> Option<BootFrom9> {
+fn boot_from_nine(file: &str) -> Option<BootFrom9> {
     let path = format!("{SAMPLES}/{file}");
     let bytes = std::fs::read(&path).ok()?;
     let kind = if file.ends_with(".g64") { DiskKind::G64 } else { DiskKind::D64 };
@@ -539,7 +526,7 @@ fn boot_from_nine(name: &'static str, file: &str, early_out: bool) -> Option<Boo
     let mut drive_ram_code = false;
     let mut head_moves = 0u32;
     let mut last_ht = m.drive_b.half_track();
-    let mut best = (0usize, Vec::new());
+    let mut best = 0usize;
     let mut total = 0u64;
     while total < 100_000_000 {
         m.run_for_full(100_000, &mut sink, |_, _, _, _, _, _, _| {});
@@ -560,26 +547,20 @@ fn boot_from_nine(name: &'static str, file: &str, early_out: bool) -> Option<Boo
         if total % 1_000_000 == 0 {
             let (_, _, rgba) = m.render_canvas_rgba();
             let c = distinct_colours(&rgba);
-            if c > best.0 {
-                best = (c, rgba);
-            }
+            best = best.max(c);
         }
         // The gate's own early-out: game live and a coherent picture.
-        if early_out && live && best.0 > 4 && total >= 12_000_000 {
+        if live && best > 4 && total >= 12_000_000 {
             break;
         }
     }
-    let (w, h, rgba) = m.render_canvas_rgba();
-    if distinct_colours(&rgba) > best.0 {
-        best = (distinct_colours(&rgba), rgba);
-    }
-    let png = format!("{TRACES}/gate_{name}_from9.png");
-    let _ = std::fs::write(&png, encode_png_rgba(w as u32, h as u32, &best.1));
-    let verdict = if live && best.0 >= 8 {
+    let (_, _, rgba) = m.render_canvas_rgba();
+    best = best.max(distinct_colours(&rgba));
+    let verdict = if live && best >= 8 {
         "game live + title rendered"
     } else if live {
         "game code live in RAM"
-    } else if best.0 >= 8 {
+    } else if best >= 8 {
         "title rendered"
     } else {
         "no"
@@ -587,7 +568,7 @@ fn boot_from_nine(name: &'static str, file: &str, early_out: bool) -> Option<Boo
     let fast_stage = format!(
         "{verdict} — drive 9 ran code in its RAM: {}, head moved {head_moves}×, best frame {} colours",
         if drive_ram_code { "yes" } else { "no" },
-        best.0
+        best
     );
     let text: String = screen(&m).lines().filter(|l| !l.trim().is_empty()).take(2).collect::<Vec<_>>().join(" / ");
     let stop = format!(
@@ -597,23 +578,8 @@ fn boot_from_nine(name: &'static str, file: &str, early_out: bool) -> Option<Boo
         m.drive_b.half_track(),
         if text.trim().is_empty() { "-".to_string() } else { text }
     );
-    let passes = (live || best.0 >= 8) && head_moves > 0;
-    Some(BootFrom9 { name, kernal_stage, fast_stage, stop, passes })
-}
-
-#[test]
-#[ignore = "characterisation §7.8; run with --ignored --nocapture"]
-fn characterise_the_seven_games_from_nine() {
-    need_roms!();
-    let rows: Vec<BootFrom9> = std::thread::scope(|s| {
-        let hs: Vec<_> = GAMES.iter().map(|(n, f)| s.spawn(move || boot_from_nine(n, f, false))).collect();
-        hs.into_iter().filter_map(|h| h.join().unwrap()).collect()
-    });
-    eprintln!("\n| game | KERNAL stage | fastloader stage | where it stops |");
-    eprintln!("|---|---|---|---|");
-    for r in &rows {
-        eprintln!("| {} | {} | {} | {} |", r.name, r.kernal_stage, r.fast_stage, r.stop);
-    }
+    let passes = (live || best >= 8) && head_moves > 0;
+    Some(BootFrom9 { kernal_stage, fast_stage, stop, passes })
 }
 
 // ── §7.8 — the games that boot from 9: regression tests ─────────────────────────
@@ -625,7 +591,7 @@ fn characterise_the_seven_games_from_nine() {
 
 fn boots_from_nine(name: &'static str, file: &str) {
     need_roms!();
-    let Some(r) = boot_from_nine(name, file, true) else {
+    let Some(r) = boot_from_nine(file) else {
         eprintln!("[skip] {name}: sample absent");
         return;
     };
@@ -655,130 +621,4 @@ fn from_nine_greenberet() {
 #[ignore = "behavioral boot from drive 9; run with --ignored --nocapture"]
 fn from_nine_lastninja() {
     boots_from_nine("lastninja", "last_ninja_remix_s1[system3_1991].g64");
-}
-
-// ── §7.9 — characterisation: cost ───────────────────────────────────────────────
-
-fn timed_load(b_on: bool) -> (f64, u64) {
-    let bytes = std::fs::read(format!("{SAMPLES}/scramble_infinity.d64")).expect("scramble sample");
-    let mut m = Machine::new();
-    m.boot_from_dir(Path::new(ROM_DIR)).expect("boot ROMs");
-    if b_on {
-        m.drive_b.attach_disk(disk(D64::new(b"IDLE").bytes));
-        m.set_drive_power(DrivePosition::B, true).unwrap();
-    }
-    frames(&mut m, 130);
-    m.drive8.attach_disk(disk(bytes));
-    frames(&mut m, 40);
-    type_in(&mut m, b"LOAD\"*\",8,1\r");
-    let n = 1500u32;
-    let t0 = Instant::now();
-    frames(&mut m, n);
-    (t0.elapsed().as_secs_f64() * 1000.0 / n as f64, m.drive_b.drive_clk)
-}
-
-#[test]
-#[ignore = "characterisation §7.9; run with --ignored --nocapture (release)"]
-fn characterise_the_cost_of_a_second_drive() {
-    need_roms!();
-    // Interleaved, best of three each: the same LOAD"*",8,1 workload, 1500 frames.
-    let mut off = f64::MAX;
-    let mut on = f64::MAX;
-    let mut b_clk = (0, 0);
-    for _ in 0..3 {
-        let (t, c) = timed_load(false);
-        off = off.min(t);
-        b_clk.0 = c;
-        let (t, c) = timed_load(true);
-        on = on.min(t);
-        b_clk.1 = c;
-    }
-    eprintln!(
-        "\nframe time, LOAD\"*\",8,1 of scramble, 1500 frames, best of 3:\n  B off: {off:.3} ms/frame (B drive clk {})\n  B on at 9, idle with a disk: {on:.3} ms/frame (B drive clk {})\n  ratio {:.2}",
-        b_clk.0,
-        b_clk.1,
-        on / off
-    );
-    assert_eq!(b_clk.0, 0, "B off runs no cycle");
-}
-
-// ── a PNG for the characterisation frames (the seven-game gate's encoder) ──────
-
-fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.push(8);
-    ihdr.push(6);
-    ihdr.push(0);
-    ihdr.push(0);
-    ihdr.push(0);
-    write_chunk(&mut out, b"IHDR", &ihdr);
-    let mut raw = Vec::with_capacity((width as usize * 4 + 1) * height as usize);
-    let stride = width as usize * 4;
-    for y in 0..height as usize {
-        raw.push(0u8);
-        raw.extend_from_slice(&rgba[y * stride..y * stride + stride]);
-    }
-    let mut zlib = Vec::new();
-    zlib.push(0x78);
-    zlib.push(0x01);
-    deflate_stored(&mut zlib, &raw);
-    zlib.extend_from_slice(&adler32(&raw).to_be_bytes());
-    write_chunk(&mut out, b"IDAT", &zlib);
-    write_chunk(&mut out, b"IEND", &[]);
-    out
-}
-
-fn deflate_stored(out: &mut Vec<u8>, data: &[u8]) {
-    let mut off = 0usize;
-    while off < data.len() {
-        let block = std::cmp::min(0xffff, data.len() - off);
-        let last = if off + block >= data.len() { 1u8 } else { 0u8 };
-        out.push(last);
-        let len = block as u16;
-        out.extend_from_slice(&len.to_le_bytes());
-        out.extend_from_slice(&(!len).to_le_bytes());
-        out.extend_from_slice(&data[off..off + block]);
-        off += block;
-    }
-    if data.is_empty() {
-        out.push(1);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0xffffu16.to_le_bytes());
-    }
-}
-
-fn adler32(data: &[u8]) -> u32 {
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    (b << 16) | a
-}
-
-fn write_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    let mut crc_in = Vec::with_capacity(4 + data.len());
-    crc_in.extend_from_slice(kind);
-    crc_in.extend_from_slice(data);
-    out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xffff_ffff;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
 }

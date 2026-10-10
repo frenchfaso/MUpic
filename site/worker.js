@@ -1,27 +1,23 @@
 import "./wasm.js";
-import { readWolfRelease, verifyWolfAsset } from "./wolf-release.js";
 import { RemoteDisk } from "./remote-disk.js";
 import { fetchBytes } from "./fetch-bytes.mjs";
 const { instantiateUE2 } = globalThis.UE2Wasm;
+const wasmUrl = new URL("./ue2_web.wasm", import.meta.url);
+wasmUrl.search = new URL(import.meta.url).search;
 // CPU, VIC and CIA share bus timing. A separate SID worker replays timestamped
 // Rust events; no mutable chip state is shared concurrently across threads.
 let module, sidPort;
 let running = false, initialized = false, audioEnabled = false;
 let remoteDisk = null, ioWaiting = false;
-let mupicInspect = null;
-let preset = 0, timer = null, emuMs = 0, hostEpoch = 0, emuEpoch = 0;
-let lastTick = 0, lastVideoEmu = -Infinity, lastVideoFrame = -1, activeWallMs = 0;
-let lastStatsHost = 0, lastStatsEmu = 0, lastStatsWall = 0;
-let frames = 0, skippedFrames = 0, stepCpuMs = 0, videoCpuMs = 0, audioCpuMs = 0, sidCpuMs = 0;
-let missedVicFrames = 0, videoBackpressureDrops = 0;
-let tickQueued = false, sidPending = 0, framePending = 0, speedPercent = 100;
+let timer = null, emuMs = 0, hostEpoch = 0, emuEpoch = 0;
+let lastTick = 0, lastVideoEmu = -Infinity, lastVideoFrame = -1;
+let tickQueued = false, sidPending = 0, framePending = 0;
 let lastEmuProgressHost = 0, lastSidEmu = 0;
 let audioControl = null, audioClockPort = null, audioRate = 48000;
 let audioConsumed = 0, audioConsumedEpoch = 0, audioEpochEmu = 0;
 let pendingAudioFrames = 0;
 let fallbackQueuedFrames = 0;
 let fallbackReceivedFrames = 0, fallbackReceivedBase = null, sentAudioFrames = 0;
-let maxAudioReservedMs = 0;
 let consumedCounterLast = 0, consumedCounterTotal = 0;
 let publishedCounterLast = 0, publishedCounterTotal = 0;
 const framePool = [], eventPool = [], samplerPool = [];
@@ -62,11 +58,9 @@ function releaseJoysticks() {
   if (!initialized) return;
   module._ue2_joystick(1, 0xff);
   module._ue2_joystick(2, 0xff);
-  module._ue2_paddles(0, 0, 0, 0, 0);
 }
 async function start(options) {
   if (module || initialized) throw new Error("Restart with a new worker.");
-  preset = options.preset === 2 ? 2 : options.preset === 1 ? 1 : 0;
   audioEnabled = Boolean(options.audioEnabled);
   audioRate = options.sampleRate || 48000;
   if (options.ring) {
@@ -95,7 +89,6 @@ async function start(options) {
       sentAudioFrames += data.audioFramesSent || 0;
       if (data.buffer?.byteLength) eventPool.push(data.buffer);
       if (data.sampler?.byteLength) samplerPool.push(data.sampler);
-      sidCpuMs += data.cpuMs || 0;
       if (running && sidPending < MAX_SID_PENDING) scheduleTick();
     } else if (data.type === "error") fault(data.message);
   };
@@ -104,21 +97,13 @@ async function start(options) {
   const response = await fetch("manifest.json", { cache: "no-store" });
   if (!response.ok) throw new Error(`manifest.json: HTTP ${response.status}`);
   const manifest = await response.json();
-  const build = await fetch("build.json", { cache: "no-store" }).then((result) => result.ok ? result.json() : null).catch(() => null);
-  if (!Array.isArray(manifest.core)) throw new Error("Invalid file manifest.");
-  if (preset === 2) {
-    if (!manifest.mupic?.disk) throw new Error("MUpic disk manifest is missing.");
-    remoteDisk = new RemoteDisk(manifest.mupic.disk, {
-      onStats: (stats) => send("storage-stats", { stats }),
-    });
-    mupicInspect = manifest.mupic.inspect;
-  }
-  const wolfRelease = preset === 1 ? await readWolfRelease(manifest.wolf) : null;
-  if (wolfRelease) send("wolf-release", { release: wolfRelease });
+  if (!Array.isArray(manifest.core) || !Array.isArray(manifest.mupic?.assets)) throw new Error("Invalid file manifest.");
+  if (!manifest.mupic.disk) throw new Error("MUpic disk manifest is missing.");
+  remoteDisk = new RemoteDisk(manifest.mupic.disk);
   module = await instantiateUE2({
     wasmModule: options.wasmModule,
-    remoteRead: remoteDisk ? (...args) => remoteDisk.read(...args) : undefined,
-    print: (message) => send("log", { message: String(message) }),
+    wasmUrl,
+    remoteRead: (...args) => remoteDisk.read(...args),
     printErr: (message) => send("log", { message: String(message), level: "error" }),
   });
   const shaderPtr = module._ue2_crt_shader(), paramsPtr = module._ue2_crt_params();
@@ -126,50 +111,45 @@ async function start(options) {
     shader: new TextDecoder().decode(module.HEAPU8.subarray(shaderPtr, shaderPtr + module._ue2_crt_shader_len())),
     params: Array.from(module.HEAPF32.subarray(paramsPtr >>> 2, (paramsPtr >>> 2) + module._ue2_crt_params_len())),
   });
-  const entries = [...manifest.core, ...(wolfRelease ? wolfRelease.wolf : []),
-    ...(preset === 2 ? manifest.mupic.assets : [])];
-  let downloaded = 0;
+  const entries = [...manifest.core, ...manifest.mupic.assets];
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i];
-    if (typeof entry.url !== "string" || typeof entry.path !== "string" || !entry.path.startsWith("/") || entry.path.split("/").includes("..")) throw new Error("Invalid file path in the manifest.");
+    if (typeof entry.url !== "string" || (entry.aliases !== undefined && !Array.isArray(entry.aliases))) throw new Error("Invalid file manifest entry.");
+    const paths = [entry.path, ...(entry.aliases || [])];
+    if (paths.some(path => typeof path !== "string" || !path.startsWith("/") || path.split("/").includes(".."))) throw new Error("Invalid file path in the manifest.");
     const bytes = await fetchBytes(entry.url, (loaded, total) => send("download", {
-      file: entry.path, index: i + 1, count: entries.length, loaded, total, downloaded: downloaded + loaded,
+      file: entry.path, index: i + 1, count: entries.length, loaded, total,
     }));
-    if (wolfRelease && i >= manifest.core.length) await verifyWolfAsset(entry, bytes);
-    if (preset === 2) {
-      if (bytes.length !== entry.bytes) throw new Error(`${entry.path}: size mismatch.`);
-      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-      if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== entry.sha256)
-        throw new Error(`${entry.path}: SHA-256 mismatch.`);
-    }
-    module.registerFile(entry.path, bytes); downloaded += bytes.length;
+    if (bytes.length !== entry.bytes) throw new Error(`${entry.path}: size mismatch.`);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== entry.sha256)
+      throw new Error(`${entry.path}: SHA-256 mismatch.`);
+    for (const path of paths) module.registerFile(path, bytes);
   }
   send("state", { state: "booting", message: "Booting firmware…" });
-  if (remoteDisk && (!module._ue2_remote_disk || module._ue2_remote_disk(remoteDisk.bytes) !== 0))
+  if (!module._ue2_remote_disk || module._ue2_remote_disk(remoteDisk.bytes) !== 0)
     throw new Error(errorText());
-  if (module._ue2_init(preset, options.sampleRate || 48000) !== 0) throw new Error(errorText());
+  if (module._ue2_init(options.sampleRate || 48000) !== 0) throw new Error(errorText());
   initialized = true;
   if (!module._ue2_render()) throw new Error(errorText());
   const width = module._ue2_width(), height = module._ue2_height();
   if (width <= 0 || height <= 0 || width > 4096 || height > 4096) throw new Error("Invalid screen dimensions.");
-  send("ready", { width, height, preset, build: build || manifest.build || null, wolfRelease,
-    threading: options.sidParallel ? "CPU/VIC/CIA + one worker per SID + AudioWorklet" : "CPU/VIC/CIA + SID + AudioWorklet",
-    audioLeadMs: AUDIO_LEAD_MS });
+  send("ready");
   publishVideo();
   resume();
 }
 function resume() {
   if (!initialized || running) return;
   running = true;
-  hostEpoch = lastTick = lastStatsHost = performance.now(); lastEmuProgressHost = hostEpoch;
-  emuEpoch = lastStatsEmu = emuMs; lastStatsWall = activeWallMs;
+  hostEpoch = lastTick = lastEmuProgressHost = performance.now();
+  emuEpoch = emuMs;
   anchorAudioClock();
   send("state", { state: "running" }); scheduleTick();
 }
 function pause() {
   releaseJoysticks();
   if (!running) return;
-  activeWallMs += performance.now() - lastTick; running = false;
+  running = false;
   publishSid(true);
   if (timer !== null) clearTimeout(timer);
   timer = null; send("state", { state: "paused" });
@@ -233,7 +213,7 @@ function pacingTarget(now) {
 }
 function publishSid(force = false) {
   if (!force && emuMs - lastSidEmu < SID_BATCH_MS) return;
-  const begin = performance.now(), ptr = module._ue2_sid_events();
+  const ptr = module._ue2_sid_events();
   const byteLength = module._ue2_sid_events_bytes();
   if (!byteLength) return;
   if (!ptr || byteLength % 16 !== 0) throw new Error("Invalid Rust SID batch.");
@@ -253,7 +233,6 @@ function publishSid(force = false) {
   sidPending++; lastSidEmu = emuMs;
   pendingAudioFrames += samplerSamples / 2;
   sidPort.postMessage({ type: "events", buffer, byteLength, sampler, samplerSamples }, transfers);
-  audioCpuMs += performance.now() - begin;
 }
 function publishVideo() {
   const frameId = module._ue2_frame_id();
@@ -262,15 +241,9 @@ function publishVideo() {
   // Native firmware refreshes at 50 Hz before the VIC starts counting.
   // A live counter retains the 40 ms safeguard so PAL phases are not repeated.
   if (!changed && emuMs - lastVideoEmu < (frameId === 0 ? 20 : 40)) return;
-  if (lastVideoFrame >= 0 && frameId > lastVideoFrame + 1) {
-    const missed = frameId - lastVideoFrame - 1;
-    missedVicFrames += missed; skippedFrames += missed;
-  }
   lastVideoFrame = frameId; lastVideoEmu = emuMs;
-  if (framePending >= MAX_VIDEO_PENDING) {
-    videoBackpressureDrops++; skippedFrames++; return;
-  }
-  const videoBegin = performance.now(), ptr = module._ue2_render();
+  if (framePending >= MAX_VIDEO_PENDING) return;
+  const ptr = module._ue2_render();
   if (!ptr) throw new Error(errorText());
   const width = module._ue2_width(), height = module._ue2_height(), byteLength = width * height * 4;
   let buffer = framePool.pop();
@@ -279,14 +252,13 @@ function publishVideo() {
   const frameEmuMs = module._ue2_frame_time();
   if (!Number.isFinite(frameEmuMs) || frameEmuMs < 0) throw new Error("Invalid video timestamp.");
   framePending++; send("frame", { width, height, buffer, frameId, emuMs: frameEmuMs }, [buffer]);
-  videoCpuMs += performance.now() - videoBegin; frames++;
 }
 async function tick() {
   timer = null;
   if (!running || ioWaiting) return;
   try {
     const begin = performance.now(), gap = begin - lastTick;
-    activeWallMs += gap; lastTick = begin;
+    lastTick = begin;
     if (gap > 100) {
       // Muted emulation can recenter after a suspended tab. Audio follows its
       // hardware consumer, so a stall never grants a second prefill reserve.
@@ -296,10 +268,8 @@ async function tick() {
     const target = pacingTarget(begin);
     while (emuMs < target && sidPending < MAX_SID_PENDING && performance.now() - begin < 8) {
       const reserved = audioClockActive() ? audioReservedMs() : 0;
-      maxAudioReservedMs = Math.max(maxAudioReservedMs, reserved);
       if (audioClockActive() && reserved >= AUDIO_LIMIT_MS - 5) break;
-      const stepBegin = performance.now(), next = module._ue2_step(audioClockActive() ? AUDIO_STEP_INSTRUCTIONS : 25000);
-      stepCpuMs += performance.now() - stepBegin;
+      const next = module._ue2_step(audioClockActive() ? AUDIO_STEP_INSTRUCTIONS : 25000);
       if (!Number.isFinite(next) || next < 0) throw new Error(errorText());
       if (next < emuMs) throw new Error("Emulator time moved backwards.");
       if (next > emuMs) lastEmuProgressHost = performance.now();
@@ -313,7 +283,6 @@ async function tick() {
         module._ue2_remote_resume();
         if (module._ue2_remote_waiting()) throw new Error("Remote disk did not resume.");
         ioWaiting = false;
-        activeWallMs += performance.now() - lastTick;
         // Network time grants no catch-up budget to the CPU. Audio keeps its
         // existing FIFO and is re-anchored without dropping or stretching PCM.
         hostEpoch = lastTick = lastEmuProgressHost = performance.now();
@@ -325,26 +294,6 @@ async function tick() {
     }
     const now = performance.now();
     if (now - lastEmuProgressHost > 5000 && (!audioClockActive() || audioReservedMs() < 20)) throw new Error("Emulator time has not advanced for 5 seconds.");
-    if (now - lastStatsHost >= 1000) {
-      if (mupicInspect) {
-        const values = {};
-        for (const [name, field] of Object.entries(mupicInspect)) {
-          let value = 0;
-          for (let i = 0; i < field.bytes; i++) value += module._ue2_peek(field.address + i) * 256 ** i;
-          values[name] = value;
-        }
-        send("mupic-status", { values });
-      }
-      const wall = activeWallMs + now - lastTick, elapsed = wall - lastStatsWall;
-      speedPercent = elapsed > 0 ? (emuMs - lastStatsEmu) / elapsed * 100 : 0;
-      send("stats", { emuMs, wallMs: wall, speedPercent, speedWindowMs: elapsed,
-        bootPercent: preset === 1 || preset === 2 ? Math.min(100, emuMs / 6000 * 100) : null,
-        frames, skippedFrames, missedVicFrames, videoBackpressureDrops,
-        videoPending: framePending, vicFrameId: lastVideoFrame,
-        stepCpuMs, videoCpuMs, audioCpuMs, sidCpuMs, sidPending,
-        audioReservedMs: audioReservedMs(), maxAudioReservedMs });
-      lastStatsHost = now; lastStatsEmu = emuMs; lastStatsWall = wall;
-    }
     const ahead = emuMs - pacingTarget(now);
     const reserveBlocked = audioClockActive() && audioReservedMs() >= AUDIO_LIMIT_MS - 5;
     const waitingForConsumer = audioClockActive() && ahead === 0;
@@ -372,9 +321,6 @@ self.onmessage = ({ data }) => {
           anchorAudioClock();
         }
         break;
-      case "benchmark-start":
-        send("benchmark-baseline", { emuMs, frames, missedVicFrames, videoBackpressureDrops });
-        break;
       case "key": if (Number.isInteger(data.index) && data.index >= 0 && data.index < 64) module._ue2_key(data.index, data.down ? 1 : 0); break;
       case "joystick":
         if (Number.isInteger(data.port) && data.port >= 1 && data.port <= 2 &&
@@ -383,29 +329,11 @@ self.onmessage = ({ data }) => {
           module._ue2_joystick(data.port, running ? data.lines : 0xff);
         }
         break;
-      case "paddles": {
-        const values = data.values;
-        if (values === null) module._ue2_paddles(0, 0, 0, 0, 0);
-        else if (Array.isArray(values) && values.length === 2 &&
-            values.every((pair) => Array.isArray(pair) && pair.length === 2 &&
-              pair.every((value) => Number.isInteger(value) && value >= 0 && value <= 255))) {
-          if (running) module._ue2_paddles(1, ...values[0], ...values[1]);
-          else module._ue2_paddles(0, 0, 0, 0, 0);
-        }
-        break;
-      }
       case "menu": module._ue2_menu(data.down ? 1 : 0); break;
       case "restore": module._ue2_restore(data.down ? 1 : 0); break;
-      case "load-prg": {
-        const bytes = new Uint8Array(data.buffer);
-        if (bytes.length < 3 || bytes.length > 65538) throw new Error("The PRG file must contain a valid load address and data.");
-        module.registerFile("/load.prg", bytes);
-        if (module._ue2_load_prg(0) !== 0) throw new Error(errorText());
-        send("prg-loaded", { name: data.name }); break;
-      }
+
     }
   } catch (error) {
-    if (data.type === "load-prg") send("log", { level: "error", message: `PRG: ${error.message || error}` });
-    else fault(error);
+    fault(error);
   }
 };

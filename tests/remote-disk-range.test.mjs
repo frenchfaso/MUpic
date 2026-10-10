@@ -1,5 +1,5 @@
 // Behavioral checks for the production USB Range cache; no complete disk is
-// registered in WASM. Run: node tests/remote-disk.mjs
+// registered in WASM. Run: node --test tests/remote-disk-range.test.mjs
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { RemoteDisk } from '../site/remote-disk.js';
@@ -71,12 +71,11 @@ function server({ bytes = BYTES, change = () => {}, before = async () => {} } = 
 }
 
 function fixture(options = {}, backend = server()) {
-  const snapshots = [];
   const disk = new RemoteDisk({ url: '/movies.img', bytes: BYTES,
     chunkBytes: CHUNK, cacheBytes: 8 * CHUNK, ...options },
-  { fetcher: backend.fetcher, onStats: snapshot => snapshots.push(snapshot) });
+  { fetcher: backend.fetcher });
   const memory = new WebAssembly.Memory({ initial: 1, maximum: 2 });
-  return { disk, memory, backend, snapshots };
+  return { disk, memory, backend };
 }
 
 async function read(f, offset, length = 512, destination = 123) {
@@ -89,6 +88,7 @@ async function read(f, offset, length = 512, destination = 123) {
     await f.disk.settle();
     assert.equal(f.disk.read(offset, length, destination, f.memory), 0);
   }
+  assert.ok(f.disk.cache.size <= f.disk.capacity, "settled reads stay within the cache bound");
   const current = new Uint8Array(f.memory.buffer);
   assert.deepEqual(current.slice(destination, destination + length), image(offset, length));
   assert.ok(current.subarray(0, destination).every(byte => byte === 0xa5));
@@ -139,8 +139,7 @@ await test('long nonsequential browsing stays within the cache limit and evicts 
   assert.equal(f.backend.calls.length, 12, 'recent sector remains cached');
   await read(f, 0);
   assert.equal(f.backend.calls.length, 13, 'evicted oldest sector is fetched again');
-  assert.ok(f.snapshots.every(s => s.cachedBytes <= s.cacheLimitBytes));
-  assert.ok(f.disk.stats.evictions > 0);
+  assert.ok(f.disk.cache.size <= f.disk.capacity);
   f.disk.close();
 });
 
@@ -153,7 +152,7 @@ await test('a file header and repeated header probe never start movie read-ahead
   await read(f, 32 * CHUNK, 256);
   await drain(f);
   assert.equal(f.backend.calls.length, 2);
-  assert.equal(f.disk.stats.downloadedBytes, 2 * CHUNK);
+  assert.equal(f.disk.cache.size, 2);
   f.disk.close();
 });
 
@@ -168,7 +167,7 @@ await test('sequential playback reads ahead but remains within the movie region'
   await read(f, 2 * CHUNK);
   await drain(f);
   assert.equal(f.backend.calls.length, 4, 'read-ahead data is reused');
-  assert.ok(f.snapshots.every(s => s.cachedBytes <= s.cacheLimitBytes));
+  assert.ok(f.disk.cache.size <= f.disk.capacity);
   f.disk.close();
 });
 
@@ -181,7 +180,7 @@ await test('demand spanning several chunks survives concurrent cache eviction', 
   await Promise.all([demand, ...other]);
   assert.equal(f.disk.read(8 * CHUNK, 4 * CHUNK, 0, f.memory), 0);
   assert.deepEqual(new Uint8Array(f.memory.buffer, 0, 4 * CHUNK), image(8 * CHUNK, 4 * CHUNK));
-  assert.ok(f.snapshots.every(s => s.cachedBytes <= s.cacheLimitBytes));
+  assert.ok(f.disk.cache.size <= f.disk.capacity);
   f.disk.close();
 });
 
@@ -203,7 +202,7 @@ for (const [name, change, expected] of invalidHeaders) {
     assert.equal(f.disk.read(0, 512, 0, f.memory), 1);
     await assert.rejects(f.disk.settle(), expected);
     assert.equal(f.backend.observations.readers, 0);
-    assert.equal(f.disk.stats.downloadedBytes, 0);
+    assert.equal(f.disk.cache.size, 0);
     assert.equal(f.disk.read(0, 512, 0, f.memory), -1);
     assert.ok(f.backend.calls[0].signal.aborted);
     f.disk.close();
@@ -246,7 +245,8 @@ for (const missing of [false, true]) {
 await test('an absent Content-Length works when the streamed range length is exact', async () => {
   const f = fixture({}, server({ change(reply) { delete reply.headers['Content-Length']; } }));
   await read(f, 0);
-  assert.equal(f.disk.stats.downloadedBytes, CHUNK);
+  assert.equal(f.backend.calls.length, 1);
+  assert.equal(f.disk.cache.size, 1);
   f.disk.close();
 });
 

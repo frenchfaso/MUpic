@@ -428,7 +428,7 @@ impl DeltaRing {
         self.enabled
     }
 
-    /// Force the armed state (test hook + perf-bench toggle, like Phase 1a).
+    /// Force the armed state for functional regression tests.
     #[inline]
     pub fn set_enabled(&mut self, on: bool) {
         self.enabled = on;

@@ -3,7 +3,7 @@
 export class RemoteDisk {
   constructor({ url, bytes, regions = [], chunkBytes = 262144, cacheBytes = 16777216,
     transport = "range", chunks = null, compression = "none", storedBytes = null },
-    { fetcher = globalThis.fetch.bind(globalThis), onStats = () => {} } = {}) {
+    { fetcher = globalThis.fetch.bind(globalThis) } = {}) {
     if (typeof url !== "string" || !url || !Number.isSafeInteger(bytes) || bytes < 512 || bytes > 0xffffffff || bytes % 512)
       throw new Error("Invalid remote USB disk.");
     if (!Number.isSafeInteger(chunkBytes) || chunkBytes < 512 || chunkBytes % 512 ||
@@ -26,19 +26,10 @@ export class RemoteDisk {
     this.capacity = cacheBytes / chunkBytes;
     this.regions = regions.filter(r => Number.isSafeInteger(r.start) && Number.isSafeInteger(r.end) &&
       r.start >= 0 && r.end > r.start && r.end <= bytes);
-    this.fetcher = fetcher; this.onStats = onStats;
+    this.fetcher = fetcher;
     this.cache = new Map(); this.inflight = new Map(); this.controllers = new Set();
     this.demand = null; this.failure = null; this.etag = null; this.closed = false;
     this.lastChunk = new Map();
-    this.stats = { diskBytes: bytes, chunkBytes, cacheLimitBytes: cacheBytes,
-      downloadedBytes: 0, requests: 0, hits: 0, misses: 0, waits: 0, waitMs: 0,
-      evictions: 0, cachedBytes: 0, peakCachedBytes: 0, pending: false };
-  }
-  report() {
-    this.stats.cachedBytes = [...this.cache.values()].reduce((n, b) => n + b.length, 0);
-    this.stats.peakCachedBytes = Math.max(this.stats.peakCachedBytes, this.stats.cachedBytes);
-    this.stats.pending = Boolean(this.demand);
-    this.onStats({ ...this.stats });
   }
   indices(offset, length) {
     const first = Math.floor(offset / this.chunkBytes), last = Math.floor((offset + length - 1) / this.chunkBytes);
@@ -56,7 +47,7 @@ export class RemoteDisk {
     }
     const indices = this.indices(offset, length);
     if (indices.some(i => !this.cache.has(i))) {
-      this.demand = { offset, length, indices }; this.stats.misses++; return 1;
+      this.demand = { offset, length, indices }; return 1;
     }
     const heap = new Uint8Array(memory.buffer);
     let at = offset, dst = destination, remaining = length;
@@ -67,9 +58,7 @@ export class RemoteDisk {
       this.cache.delete(index); this.cache.set(index, data);
       at += count; dst += count; remaining -= count;
     }
-    const resumed = Boolean(this.demand);
-    this.demand = null; this.stats.hits++;
-    if (resumed) this.report();
+    this.demand = null;
     this.prefetch(indices.at(-1), offset);
     return 0;
   }
@@ -77,7 +66,7 @@ export class RemoteDisk {
     const pinned = new Set(this.demand?.indices || []);
     for (const index of this.cache.keys()) {
       if (this.cache.size <= this.capacity) break;
-      if (!pinned.has(index)) { this.cache.delete(index); this.stats.evictions++; }
+      if (!pinned.has(index)) this.cache.delete(index);
     }
   }
   async chunk(index) {
@@ -90,13 +79,12 @@ export class RemoteDisk {
   async fetchChunk(index) {
     const start = index * this.chunkBytes, end = Math.min(start + this.chunkBytes, this.bytes) - 1;
     if (this.transport === "chunks" && this.chunks[index] === null) {
-      this.cache.set(index, new Uint8Array(end - start + 1)); this.trim(); this.report(); return;
+      this.cache.set(index, new Uint8Array(end - start + 1)); this.trim(); return;
     }
     const controller = new AbortController(); this.controllers.add(controller);
     const timeout = setTimeout(() => controller.abort(), 20000);
     let response;
     try {
-      this.stats.requests++;
       const headers = this.transport === "range" ? { Range: `bytes=${start}-${end}` } : {};
       if (this.etag) headers["If-Range"] = this.etag;
       const url = this.transport === "chunks" ? `${this.url}${String(index).padStart(4, "0")}.bin${this.compression === "gzip" ? ".gz" : ""}` : this.url;
@@ -129,7 +117,7 @@ export class RemoteDisk {
       if (compressed) {
         // Explicit .gz assets must reach JavaScript as gzip bytes. A server
         // Content-Encoding would transparently inflate fetch's body, defeating
-        // the manifest's separate compressed-input bound and wire-byte count.
+        // the manifest's separate compressed-input bound.
         const encoding = response.headers.get("Content-Encoding");
         if (encoding && encoding.toLowerCase() !== "identity")
           throw new Error("Compressed disk assets must be served without Content-Encoding; use the project Pages build.");
@@ -146,7 +134,6 @@ export class RemoteDisk {
                 if (received !== expected) throw new Error("Compressed disk chunk was truncated.");
                 stream.close(); return;
               }
-              this.stats.downloadedBytes += value.length;
               if (received + value.length > expected) {
                 await network.cancel(); throw new Error("Compressed disk chunk is too large.");
               }
@@ -163,7 +150,6 @@ export class RemoteDisk {
           if (done) break;
           if (at + value.length > data.length) { await reader.cancel(); throw new Error("Remote disk range is too large."); }
           data.set(value, at); at += value.length;
-          if (!compressed) this.stats.downloadedBytes += value.length;
         }
       } catch (error) {
         await reader.cancel(error).catch(() => {});
@@ -175,7 +161,7 @@ export class RemoteDisk {
         const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", data))].map(x => x.toString(16).padStart(2, "0")).join("");
         if (hash !== this.chunks[index]) throw new Error("Disk chunk failed its SHA-256 check.");
       }
-      this.cache.set(index, data); this.trim(); this.report();
+      this.cache.set(index, data); this.trim();
     } catch (error) {
       controller.abort();
       if (response?.body && !response.body.locked) await response.body.cancel().catch(() => {});
@@ -185,10 +171,8 @@ export class RemoteDisk {
   async settle() {
     if (this.failure) throw this.failure;
     if (!this.demand) throw new Error("USB is waiting without a remote read.");
-    const begin = performance.now(); this.stats.waits++; this.report();
     try { await Promise.all(this.demand.indices.map(i => this.chunk(i))); }
     catch (error) { this.failure = error; throw error; }
-    finally { this.stats.waitMs += performance.now() - begin; this.report(); }
   }
   prefetch(index, offset) {
     const region = this.regions.find(r => offset >= r.start && offset < r.end);

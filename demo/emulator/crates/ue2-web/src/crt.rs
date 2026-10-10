@@ -1,7 +1,7 @@
 //! Native Commodore 1702 Guest PAL shader contract. The exact native preset is
 //! cross-compiled ahead of time to WebGPU WGSL; no shader compiler ships in WASM.
 //! The compiled assets are hashed by this Rust-owned contract.
-pub const SHADER: &str = include_str!("../../../web/crt/contract.json");
+pub const SHADER: &str = include_str!("../../../../../site/crt/contract.json");
 
 /// Retained eight-float transport ABI for the browser worker. Native CRT
 /// parameters and per-pass uniforms now come from the reflected manifest.

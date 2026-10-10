@@ -1,8 +1,12 @@
 import { CrtPresenter } from "./gpu.js";
 import { GamepadInput } from "./gamepad.js";
+function assetUrl(name) {
+  const url = new URL(name, import.meta.url);
+  url.search = new URL(import.meta.url).search;
+  return url;
+}
 const $ = (id) => document.getElementById(id);
 const canvas = $("screen");
-const mupicPage = document.body.dataset.preset === "mupic";
 const controls = {
   c64: $("start-c64"), audio: $("audio"), fullscreen: $("fullscreen"),
 };
@@ -27,93 +31,22 @@ const audioReadyWaiters = new Map();
 // Prepare worker endpoints before boot; output starts in a real user gesture.
 let workerAudioTransport = null;
 let generation = 0;
-const logLines = [];
 const gamepadInput = new GamepadInput();
-const state = {
-  state: "idle", preset: null, workerReady: false, emuMs: 0, wallMs: 0,
-  speedPercent: null, frames: 0, width: 384, height: 272, lastFrameAt: null,
-  audioState: "off", audioQueuedMs: 0, audioUnderflows: 0, audioDroppedFrames: 0,
-  download: null, error: null, bootPercent: null,
-  stepCpuMs: 0, videoCpuMs: 0, audioCpuMs: 0,
-  sidCpuMs: 0, sidPending: 0, skippedFrames: 0, presentedFrames: 0,
-  missedVicFrames: 0, videoBackpressureDrops: 0, videoPending: 0,
-  presentedVicFrameId: null, presentedFrameEmuMs: null,
-  lastCapturedFrameId: null, presentationSkippedFrames: 0, maxVideoQueue: 0,
-  capturedFrameEmuMs: null, capturedFrames: 0,
-  renderer: "WebGPU", gpuReady: false, crtEnabled: true, gpuSubmitCpuMs: 0,
-  gpuCompletedFrames: 0, gpuInFlight: 0,
-  threading: null, crossOriginIsolated: window.crossOriginIsolated, audioTransport: null,
-  speedWindowMs: 0, speedHistory: [], benchmark: null, build: null,
-  audioReservedMs: 0, maxAudioReservedMs: 0,
-  wolfRelease: null, storage: null, mupic: null,
-  gamepads: 0, sidSampling: "interpolate", sidParallel: false, sidWorkers: 0, activeSids: 0,
-};
-Object.defineProperty(window, "__ue2Status", {
-  configurable: false,
-  get: () => Object.freeze({
-    ...state,
-    download: state.download ? Object.freeze({ ...state.download }) : null,
-    storage: state.storage ? Object.freeze({ ...state.storage }) : null,
-    logs: Object.freeze(logLines.slice()),
-    speedHistory: Object.freeze(state.speedHistory.slice()),
-  }),
-});
-Object.defineProperty(window, "__ue2Debug", {
-  value: Object.freeze({ measureRealtime: startBenchmark, audioTiming: () => ({
-    state: audioContext?.state || "off", sampleRate: audioContext?.sampleRate || null,
-    // These are browser estimates of the output path, distinct from our PCM FIFO.
-    baseLatencyMs: typeof audioContext?.baseLatency === "number" ? audioContext.baseLatency * 1000 : null,
-    outputLatencyMs: typeof audioContext?.outputLatency === "number" ? audioContext.outputLatency * 1000 : null,
-    queuedMs: state.audioQueuedMs, reservedMs: state.audioReservedMs,
-    sidPending: state.sidPending, underflows: state.audioUnderflows,
-  }) }), configurable: false,
-});
-
-function log(message, level = "info") {
-  const text = `${new Date().toLocaleTimeString("en-GB")} ${level === "error" ? "! " : ""}${message}`;
-  logLines.push(text);
-  if (logLines.length > 160) logLines.splice(0, logLines.length - 160);
-  if (level === "error") console.error(text);
-}
+const state = { state: "idle", workerReady: false, download: null, error: null };
 
 function updateUI(message) {
   const loading = ["loading", "booting"].includes(state.state);
   controls.c64.disabled = loading;
-  controls.c64.textContent = mupicPage ? "PLAYER" : "BASIC";
-  const wolfRelease = state.wolfRelease;
-  controls.audio.textContent = "AUDIO";
   controls.audio.setAttribute("aria-pressed", String(audioEnabled));
   controls.audio.setAttribute("aria-label", `Audio ${audioEnabled ? "on" : "off"}`);
   controls.audio.title = audioEnabled ? "Turn audio off" : "Turn audio on";
   const status = {
     idle: "Ready.", loading: "Loading files…", booting: "Booting firmware…",
-    running: state.preset === 2
-      ? state.bootPercent !== null && state.bootPercent < 100
-        ? `Starting MUpic Player… ${Math.floor(state.bootPercent)}%` : "MUpic Player running."
-      : state.preset === 1 && state.bootPercent !== null && state.bootPercent < 100
-        ? `Starting WOLF64U… ${Math.floor(state.bootPercent)}%` : state.preset === 1 ? "WOLF64U running." : "C64 BASIC running.",
-    paused: "Emulation paused.", error: state.error || "Emulator error.",
+    running: "MUpic Player running.", paused: "Emulation paused.",
+    error: state.error || "Emulator error.",
   };
   $("runtime-status").textContent = message || status[state.state] || state.state;
   canvas.dataset.state = state.state;
-  canvas.dataset.wolfRevision = wolfRelease?.revision || "snapshot";
-  canvas.dataset.sidSampling = state.sidSampling;
-  canvas.dataset.speed = state.speedPercent?.toFixed(3) || "";
-  if (mupicPage) canvas.dataset.mupicProof = JSON.stringify({
-    state: state.state, error: state.error, emuMs: state.emuMs, wallMs: state.wallMs,
-    speedPercent: state.speedPercent, speedWindowMs: state.speedWindowMs,
-    recentSpeedWindows: state.speedHistory.slice(-65),
-    storage: state.storage, player: state.mupic || null,
-    audioEnabled, audioState: state.audioState, audioUnderflows: state.audioUnderflows,
-    audioQueuedMs: state.audioQueuedMs, audioReservedMs: state.audioReservedMs,
-    capturedFrames: state.capturedFrames, presentedFrames: state.presentedFrames,
-    gpuCompletedFrames: state.gpuCompletedFrames, missedVicFrames: state.missedVicFrames,
-    videoBackpressureDrops: state.videoBackpressureDrops,
-    presentationSkippedFrames: state.presentationSkippedFrames,
-    audioDroppedFrames: state.audioDroppedFrames, gpuReady: state.gpuReady,
-    crtEnabled: state.crtEnabled, pageHidden: document.hidden,
-    sourceRaster: [state.width, state.height],
-  });
   $("download-progress").hidden = !loading || !state.download;
 }
 
@@ -182,7 +115,6 @@ async function syncAudioTransport() {
 
 function clearAudio() {
   audioNode?.port.postMessage({ type: "clear" });
-  state.audioQueuedMs = 0;
 }
 
 async function ensureAudio() {
@@ -190,10 +122,6 @@ async function ensureAudio() {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     if (!AudioContextClass) throw new Error("Web Audio is not available in this browser.");
     audioContext = new AudioContextClass({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
-    audioContext.onstatechange = () => {
-      state.audioState = audioContext.state;
-      if (audioContext.state !== "running") invalidateBenchmark(`audio-${audioContext.state}`);
-    };
   }
   if (audioContext.sampleRate !== AUDIO_SAMPLE_RATE) throw new Error("This browser cannot create the required 48 kHz audio output.");
   // Create and resume within the user gesture, before the first await.
@@ -201,16 +129,13 @@ async function ensureAudio() {
   if (!audioSetup) {
     const setup = (async () => {
       if (!audioContext.audioWorklet) throw new Error("AudioWorklet is not available; use localhost or HTTPS.");
-      await audioContext.audioWorklet.addModule("audio-worklet.js");
+      await audioContext.audioWorklet.addModule(assetUrl("audio-worklet.js"));
       const node = new AudioWorkletNode(audioContext, "ue2-audio", {
         outputChannelCount: [2], numberOfInputs: 0, numberOfOutputs: 1, processorOptions: { ring: audioRing },
       });
       node.port.onmessage = ({ data }) => {
         if (audioNode !== node) return;
-        if (receiveAudioReady(data)) return;
-        state.audioQueuedMs = data.queuedMs;
-        state.audioUnderflows = data.underflows;
-        state.audioDroppedFrames = data.droppedFrames;
+        receiveAudioReady(data);
       };
       try { node.connect(audioContext.destination); }
       catch (error) { node.disconnect(); node.port.close(); throw error; }
@@ -221,7 +146,6 @@ async function ensureAudio() {
   }
   await Promise.all([resumed, audioSetup]);
   attachAudioTransport();
-  state.audioState = audioContext.state;
 }
 
 async function setAudio(enabled) {
@@ -238,11 +162,8 @@ async function setAudio(enabled) {
     } catch (error) {
       if (request !== audioRequest) return;
       audioEnabled = false;
-      state.audioState = "unavailable";
-      log(error.message || error, "error");
+      console.error(error.message || error);
     }
-  } else {
-    invalidateBenchmark("audio-muted");
   }
   await syncAudioTransport();
   updateUI();
@@ -276,7 +197,7 @@ function stopSidWorker(instance) {
   return sidShutdown;
 }
 
-async function start(preset) {
+async function start() {
   const token = ++generation;
   cancelAudioActivation();
   releaseAllKeys();
@@ -292,23 +213,10 @@ async function start(preset) {
   audioNode?.port.postMessage({ type: "enabled", enabled: false });
   pendingFrames.length = 0;
   clearAudio();
-  Object.assign(state, {
-    state: "loading", preset, workerReady: false, emuMs: 0, wallMs: 0,
-    speedPercent: null, frames: 0, lastFrameAt: null, error: null, download: null,
-    bootPercent: preset === 1 || preset === 2 ? 0 : null,
-    stepCpuMs: 0, videoCpuMs: 0, audioCpuMs: 0, sidCpuMs: 0, sidPending: 0,
-    skippedFrames: 0, presentedFrames: 0, missedVicFrames: 0,
-    videoBackpressureDrops: 0, videoPending: 0,
-    presentedVicFrameId: null, presentedFrameEmuMs: null,
-    lastCapturedFrameId: null, presentationSkippedFrames: 0, maxVideoQueue: 0,
-    capturedFrameEmuMs: null, capturedFrames: 0,
-    speedHistory: [], benchmark: null, build: null,
-    wolfRelease: null, storage: null, mupic: null, sidParallel: false, sidWorkers: 0, activeSids: 0,
-  });
+  Object.assign(state, { state: "loading", workerReady: false, error: null, download: null });
   $("screen-hint").hidden = false;
   $("screen-hint").querySelector("p").textContent = "Loading emulator…";
   updateUI();
-  log(`Starting ${preset === 2 ? "MUpic Player" : preset === 1 ? "WOLF64U" : "C64 BASIC"}.`);
   try {
     if (!presenter) presenter = await CrtPresenter.create(canvas, showError);
     if (token !== generation) return;
@@ -317,7 +225,7 @@ async function start(preset) {
     attachAudioTransport();
     let compiledWasmModule = null;
     const sidParallelAvailable = window.crossOriginIsolated && typeof SharedArrayBuffer === "function";
-    const currentSidWorker = new Worker(sidParallelAvailable ? "sid-pool-worker.js" : "sid-worker.js", { type: "module" });
+    const currentSidWorker = new Worker(assetUrl(sidParallelAvailable ? "sid-pool-worker.js" : "sid-worker.js"), { type: "module" });
     currentSidWorker.sidPool = sidParallelAvailable;
     sidWorker = currentSidWorker;
     const sidReady = new Promise((resolve, reject) => {
@@ -328,16 +236,12 @@ async function start(preset) {
         if (receiveAudioReady(data)) return;
         if (data.type === "ready") {
           ready = true; compiledWasmModule = data.wasmModule;
-          clearTimeout(timeout); state.audioTransport = data.transport; state.sidSampling = data.sampling || "interpolate";
-          state.sidParallel = data.sidParallel === true; resolve();
-          log(`Independent reSID Rust · ${data.transport}.`);
-        } else if (data.type === "pool-state") {
-          state.sidWorkers = data.sidWorkers; state.activeSids = data.activeSids;
+          clearTimeout(timeout); resolve();
         } else if (data.type === "error") {
           clearTimeout(timeout);
           if (ready) showError(data.message); else reject(new Error(data.message));
         }
-        else if (data.type === "log") log(data.message);
+        else if (data.type === "log") console.error(data.message);
       };
       currentSidWorker.onerror = (event) => {
         if (sidWorker !== currentSidWorker) return;
@@ -352,7 +256,7 @@ async function start(preset) {
       ring: audioRing, sampleRate: AUDIO_SAMPLE_RATE, audioEnabled: false }, sidTransfers);
     await sidReady;
     if (token !== generation) return;
-    const currentWorker = new Worker("worker.js", { type: "module" });
+    const currentWorker = new Worker(assetUrl("worker.js"), { type: "module" });
     worker = currentWorker;
     currentWorker.onmessage = (event) => {
       if (worker === currentWorker) onWorkerMessage(event.data);
@@ -362,16 +266,15 @@ async function start(preset) {
     };
     const cpuTransfers = [link.port1];
     if (clockLink) cpuTransfers.push(clockLink.port1);
-    currentWorker.postMessage({ type: "start", preset, sampleRate: AUDIO_SAMPLE_RATE,
+    currentWorker.postMessage({ type: "start", sampleRate: AUDIO_SAMPLE_RATE,
       audioEnabled: false, sidPort: link.port1, ring: audioRing, audioClockPort: clockLink?.port1,
-      wasmModule: compiledWasmModule, sidParallel: state.sidParallel }, cpuTransfers);
+      wasmModule: compiledWasmModule }, cpuTransfers);
   } catch (error) {
     if (token === generation) showError(error.message || error);
   }
 }
 
 function showError(message) {
-  invalidateBenchmark("emulator-or-gpu-error");
   releaseAllKeys();
   releaseGamepad();
   worker?.terminate();
@@ -382,7 +285,7 @@ function showError(message) {
   clearAudio();
   state.state = "error";
   state.error = String(message);
-  log(message, "error");
+  console.error(message);
   updateUI();
   $("screen-hint").hidden = false;
   $("screen-hint").querySelector("p").textContent = String(message);
@@ -397,13 +300,7 @@ function schedulePaint() {
     if (!presenter?.ready) { schedulePaint(); return; }
     const frame = pendingFrames[0];
     try {
-      presenter.enabled = state.crtEnabled;
       if (presenter.draw(frame)) {
-        state.presentedFrames++;
-        state.presentedVicFrameId = frame.frameId;
-        state.presentedFrameEmuMs = frame.emuMs;
-        state.gpuSubmitCpuMs = presenter.submitCpuMs;
-        state.lastFrameAt = performance.now();
         $("screen-hint").hidden = true;
       } else {
         schedulePaint();
@@ -416,144 +313,12 @@ function schedulePaint() {
   });
 }
 
-function invalidateBenchmark(reason) {
-  const measure = state.benchmark;
-  if (measure?.running && !measure.invalidReasons.includes(reason)) measure.invalidReasons.push(reason);
-}
-
-function startBenchmark() {
-  if (state.state !== "running" || state.benchmark?.running) return;
-  state.benchmark = {
-    running: true, startedAt: null, initialEmuMs: null,
-    initialUnderflows: state.audioUnderflows, initialDropped: state.audioDroppedFrames,
-    initialPresented: state.presentedFrames, initialGpuCompleted: presenter.completedFrames,
-    previousGpuCompleted: presenter.completedFrames, invalidReasons: [], samples: [],
-    initialCaptured: state.capturedFrames, initialMissedVic: state.missedVicFrames,
-    initialVideoDrops: state.videoBackpressureDrops,
-    initialPresentationDrops: state.presentationSkippedFrames,
-    maxVideoQueue: pendingFrames.length,
-  };
-  if (!audioEnabled || state.audioState !== "running") invalidateBenchmark("audio-not-active-at-start");
-  if (!state.crtEnabled || !state.gpuReady) invalidateBenchmark("crt-not-active-at-start");
-  if (document.hidden) invalidateBenchmark("page-hidden");
-  log("Realtime measurement started: 60 seconds, one-second speed window.");
-  worker.postMessage({ type: "benchmark-start" });
-  updateUI();
-}
-
-function sampleBenchmark() {
-  const measure = state.benchmark;
-  if (!measure?.running || measure.startedAt === null) return;
-  const elapsedMs = performance.now() - measure.startedAt;
-  const completedFrames = presenter.completedFrames;
-  const completedInWindow = completedFrames - measure.previousGpuCompleted;
-  measure.previousGpuCompleted = completedFrames;
-  measure.samples.push({
-    elapsedMs: Math.round(elapsedMs), emuMs: state.emuMs, speedPercent: +state.speedPercent.toFixed(3),
-    windowMs: +state.speedWindowMs.toFixed(1), audioEnabled, audioState: state.audioState,
-    crtEnabled: state.crtEnabled, gpuReady: state.gpuReady, audioQueuedMs: +state.audioQueuedMs.toFixed(2),
-    underflows: state.audioUnderflows, droppedFrames: state.audioDroppedFrames, sidPending: state.sidPending,
-    stepCpuMs: +state.stepCpuMs.toFixed(2), sidCpuMs: +state.sidCpuMs.toFixed(2),
-    videoCpuMs: +state.videoCpuMs.toFixed(2), audioCpuMs: +state.audioCpuMs.toFixed(2),
-    presentedFrames: state.presentedFrames, skippedFrames: state.skippedFrames,
-    lastCapturedFrameId: state.lastCapturedFrameId, lastPresentedFrameId: state.presentedVicFrameId,
-    capturedFrameEmuMs: state.capturedFrameEmuMs, presentedFrameEmuMs: state.presentedFrameEmuMs,
-    capturedFrames: state.capturedFrames, missedVicFrames: state.missedVicFrames,
-    videoBackpressureDrops: state.videoBackpressureDrops, presentationSkippedFrames: state.presentationSkippedFrames,
-    videoQueue: pendingFrames.length, maxVideoQueue: state.maxVideoQueue,
-    audioReservedMs: +state.audioReservedMs.toFixed(2),
-    gpuCompletedFrames: completedFrames, gpuCompletedInWindow: completedInWindow, gpuInFlight: presenter.inFlight,
-    gpuSubmitCpuMs: +state.gpuSubmitCpuMs.toFixed(2),
-    pageHidden: document.hidden,
-  });
-  if (elapsedMs < 60000) return;
-  measure.running = false;
-  const endEmuMs = state.emuMs;
-  const active = measure.invalidReasons.length === 0 && measure.samples.every((item) => item.audioEnabled && item.audioState === "running" && item.crtEnabled && item.gpuReady && !item.pageHidden);
-  const report = {
-    schema: "ue2-webrust-realtime-v1", timestamp: new Date().toISOString(), build: state.build, wolfRelease: state.wolfRelease,
-    preset: state.preset === 2 ? "mupic" : state.preset === 1 ? "wolf64" : "c64", workload: state.preset === 1 && measure.initialEmuMs >= 40000 ? "wolf-post40s" : "boot-or-menu",
-    userAgent: navigator.userAgent,
-    crossOriginIsolated: state.crossOriginIsolated, threading: state.threading, audioTransport: state.audioTransport,
-    sidParallel: state.sidParallel, sidWorkers: state.sidWorkers, activeSids: state.activeSids,
-    sampleRate: audioContext?.sampleRate || null, renderer: state.renderer, sourceSize: [state.width, state.height],
-    outputSize: [canvas.width, canvas.height], elapsedMs: +elapsedMs.toFixed(1), emulatedMs: endEmuMs - measure.initialEmuMs,
-    averageSpeedPercent: +((endEmuMs - measure.initialEmuMs) / elapsedMs * 100).toFixed(3),
-    minimumWindowSpeedPercent: Math.min(...measure.samples.map((item) => item.speedPercent)),
-    audioCrtActiveThroughout: active, underflows: state.audioUnderflows - measure.initialUnderflows,
-    droppedFrames: state.audioDroppedFrames - measure.initialDropped,
-    presentedFrames: state.presentedFrames - measure.initialPresented,
-    gpuCompletedFrames: completedFrames - measure.initialGpuCompleted, maxGpuFrameGapMs: +presenter.measurementGapMs().toFixed(2),
-    minimumGpuWindowFrames: Math.min(...measure.samples.slice(1).map((item) => item.gpuCompletedInWindow)),
-    maxGpuInFlight: presenter.measurement.maxInFlight, invalidReasons: measure.invalidReasons,
-    audioQueueMaxMs: Math.max(...measure.samples.map((item) => item.audioQueuedMs)), samples: measure.samples,
-    audioReservedMaxMs: Math.max(...measure.samples.map((item) => item.audioReservedMs)),
-    videoCadence: {
-      capturedFrames: state.capturedFrames - measure.initialCaptured,
-      capturedFramesPerSecond: +((state.capturedFrames - measure.initialCaptured) * 1000 / elapsedMs).toFixed(3),
-      completedFramesPerSecond: +((completedFrames - measure.initialGpuCompleted) * 1000 / elapsedMs).toFixed(3),
-      missedVicFrames: state.missedVicFrames - measure.initialMissedVic,
-      videoBackpressureDrops: state.videoBackpressureDrops - measure.initialVideoDrops,
-      presentationSkippedFrames: state.presentationSkippedFrames - measure.initialPresentationDrops,
-      lastCapturedFrameId: state.lastCapturedFrameId, lastPresentedFrameId: state.presentedVicFrameId,
-      maxVideoQueue: measure.maxVideoQueue,
-    },
-  };
-  // Tolerate clock/sample-window rounding by 0.5%; audio underruns and disabled
-  // effects still make the full realtime+audio+CRT result fail.
-  report.passed = active && report.averageSpeedPercent >= 99.5 && report.underflows === 0 && report.droppedFrames === 0
-    && report.gpuCompletedFrames >= 600 && report.minimumGpuWindowFrames >= 10
-    && report.maxGpuFrameGapMs <= 250 && report.audioQueueMaxMs <= 150
-    && report.videoCadence.capturedFramesPerSecond >= 49 && report.videoCadence.completedFramesPerSecond >= 49
-    && report.videoCadence.missedVicFrames === 0 && report.videoCadence.videoBackpressureDrops === 0
-    && report.videoCadence.presentationSkippedFrames === 0;
-  presenter.measurement = null;
-  const completedBenchmark = { ...measure, report };
-  state.benchmark = completedBenchmark;
-  const result = `${report.averageSpeedPercent.toFixed(1)}% average · ${report.underflows} audio underruns · ${(report.gpuCompletedFrames / (elapsedMs / 1000)).toFixed(1)} GPU frames/s · ${report.passed ? "passed" : "failed"}`;
-  log(`Realtime measurement: ${result}.`);
-  fetch("benchmark-report", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(report) })
-    .then(async (response) => {
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const metadata = await response.json();
-      completedBenchmark.saved = metadata;
-      log(`Report saved: ${metadata.path || metadata.file || "benchmark-report"}.`);
-    }).catch((error) => log(`Report available in window.__ue2Status; save error: ${error.message || error}.`));
-  updateUI();
-}
-
 function onWorkerMessage(data) {
   switch (data.type) {
-    case "mupic-status":
-      state.mupic = { ...data.values };
-      break;
-    case "log": log(data.message, data.level); break;
+    case "log": console.error(data.message); break;
     case "error": showError(data.message); break;
-    case "storage-stats": state.storage = { ...data.stats }; break;
-    case "wolf-release":
-      state.wolfRelease = data.release;
-      log(data.release.source === "published" ? `WOLF64U build ${data.release.revision} selected.` : "WOLF64U initial snapshot selected; no published build yet.");
-      updateUI();
-      break;
-    case "benchmark-baseline":
-      if (state.benchmark?.running && state.benchmark.startedAt === null) {
-        state.benchmark.startedAt = performance.now();
-        state.benchmark.initialEmuMs = data.emuMs;
-        state.benchmark.initialGpuCompleted = presenter.completedFrames;
-        state.benchmark.initialPresented = state.presentedFrames;
-        state.benchmark.previousGpuCompleted = presenter.completedFrames;
-        state.benchmark.initialCaptured = data.frames;
-        state.benchmark.initialMissedVic = data.missedVicFrames;
-        state.benchmark.initialVideoDrops = data.videoBackpressureDrops;
-        state.benchmark.initialPresentationDrops = state.presentationSkippedFrames;
-        state.benchmark.maxVideoQueue = pendingFrames.length;
-        presenter.beginMeasurement();
-      }
-      break;
     case "video-config":
-      presenter.configure(data.shader, data.params).then(() => {
-        state.gpuReady = true; log("WebGPU CRT ready · shader and parameters compiled from Rust."); updateUI();
-      }).catch(showError);
+      presenter.configure(data.shader, data.params).catch(showError);
       break;
     case "state":
       state.state = data.state;
@@ -563,7 +328,7 @@ function onWorkerMessage(data) {
       updateUI(data.message);
       break;
     case "download": {
-      state.download = { ...data };
+      state.download = data;
       const progress = $("download-progress");
       progress.hidden = false;
       progress.max = data.count;
@@ -573,47 +338,16 @@ function onWorkerMessage(data) {
     }
     case "ready":
       state.workerReady = true;
-      state.width = data.width;
-      state.height = data.height;
-      state.threading = data.threading;
-      state.build = data.build || null;
-      state.wolfRelease = data.wolfRelease || null;
       // Toggles during asset download arrive before Rust initialization. Apply
       // the latest choice again once this worker can accept audio commands.
       syncAudioTransport();
-      log(`WebAssembly ready · ${data.width} × ${data.height} · audio ${audioContext?.sampleRate || 48000} Hz.`);
       updateUI();
       break;
     case "frame":
       // Preserve each A/B colour-mixing phase in arrival order. The worker
       // bounds outstanding transfers; replacing a pending frame loses phases.
       pendingFrames.push(data);
-      state.lastCapturedFrameId = data.frameId;
-      state.capturedFrameEmuMs = data.emuMs;
-      state.capturedFrames++;
-      state.maxVideoQueue = Math.max(state.maxVideoQueue, pendingFrames.length);
-      if (state.benchmark?.running) state.benchmark.maxVideoQueue = Math.max(state.benchmark.maxVideoQueue, pendingFrames.length);
       schedulePaint();
-      state.width = data.width;
-      state.height = data.height;
-      break;
-    case "stats":
-      Object.assign(state, { emuMs: data.emuMs, wallMs: data.wallMs, speedPercent: data.speedPercent,
-        frames: data.frames, bootPercent: data.bootPercent, stepCpuMs: data.stepCpuMs,
-        videoCpuMs: data.videoCpuMs, audioCpuMs: data.audioCpuMs, sidCpuMs: data.sidCpuMs,
-        sidPending: data.sidPending, skippedFrames: data.skippedFrames, speedWindowMs: data.speedWindowMs,
-        missedVicFrames: data.missedVicFrames, videoBackpressureDrops: data.videoBackpressureDrops,
-        videoPending: data.videoPending,
-        audioReservedMs: data.audioReservedMs, maxAudioReservedMs: data.maxAudioReservedMs });
-      state.gpuCompletedFrames = presenter.completedFrames;
-      state.gpuInFlight = presenter.inFlight;
-      state.speedHistory.push({ at: performance.now(), emuMs: data.emuMs, speedPercent: data.speedPercent, windowMs: data.speedWindowMs });
-      if (state.speedHistory.length > 120) state.speedHistory.shift();
-      sampleBenchmark();
-      updateUI();
-      break;
-    case "prg-loaded":
-      log(`PRG loaded: ${data.name}.`);
       break;
   }
 }
@@ -670,20 +404,8 @@ function releaseAllKeys() {
   for (const source of [...held.keys()]) release(source);
 }
 
-function releaseKeyboardKeys() {
-  for (const source of [...held.keys()]) {
-    if (!source.startsWith("gamepad-key-")) release(source);
-  }
-}
-
 function sendGamepadEvents(events) {
-  for (const event of events) {
-    if (event.type === "key") {
-      const source = `gamepad-key-${event.index}`;
-      if (event.down) press(source, [event.index]);
-      else release(source);
-    } else worker?.postMessage(event);
-  }
+  for (const event of events) worker?.postMessage(event);
 }
 function releaseGamepad() {
   sendGamepadEvents(gamepadInput.reset());
@@ -697,12 +419,7 @@ function pollGamepads() {
     gamepadReadFailed = true;
   }
   const focused = state.workerReady && state.state === "running" && !document.hidden && document.hasFocus();
-  sendGamepadEvents(gamepadInput.update(pads, { wolf: state.preset === 1, focused }));
-  const connected = Array.from(pads).filter((pad) => pad?.connected && pad.mapping === "standard").length;
-  if (connected !== state.gamepads) {
-    state.gamepads = connected;
-    canvas.dataset.gamepads = String(connected);
-  }
+  sendGamepadEvents(gamepadInput.update(pads, { focused }));
   requestAnimationFrame(pollGamepads);
 }
 
@@ -722,20 +439,19 @@ window.addEventListener("keyup", (event) => {
   release(event.code);
 });
 window.addEventListener("blur", () => { releaseAllKeys(); releaseGamepad(); });
-canvas.addEventListener("blur", releaseKeyboardKeys);
+canvas.addEventListener("blur", releaseAllKeys);
 canvas.addEventListener("pointerdown", () => canvas.focus({ preventScroll: true }));
 canvas.addEventListener("click", activateAudioFromInput);
 function onVisibilityChange() {
   if (document.hidden) {
     videoWasHidden = true;
-    releaseAllKeys(); releaseGamepad(); invalidateBenchmark("page-hidden");
+    releaseAllKeys(); releaseGamepad();
     return;
   }
   if (!videoWasHidden) return;
   videoWasHidden = false;
   // Animation callbacks pause in a hidden tab while emulation/audio can keep
   // advancing. Recycle the old FIFO instead of showing its stale phases.
-  state.presentationSkippedFrames += pendingFrames.length;
   for (const frame of pendingFrames.splice(0)) {
     if (worker && frame.buffer.byteLength) worker.postMessage({ type: "frame-return", buffer: frame.buffer }, [frame.buffer]);
   }
@@ -744,7 +460,7 @@ function onVisibilityChange() {
 document.addEventListener("visibilitychange", onVisibilityChange);
 controls.c64.addEventListener("click", () => {
   canvas.focus({ preventScroll: true });
-  start(mupicPage ? 2 : 0);
+  start();
 });
 controls.audio.addEventListener("click", () => setAudio(!audioEnabled));
 controls.fullscreen.addEventListener("click", async () => {
@@ -765,6 +481,5 @@ document.addEventListener("fullscreenchange", () => {
 });
 updateUI();
 requestAnimationFrame(pollGamepads);
-// The standalone MUpic page selects its player; the emulator page starts Wolf.
-if (mupicPage) canvas.focus({ preventScroll: true });
-start(mupicPage ? 2 : 1);
+canvas.focus({ preventScroll: true });
+start();

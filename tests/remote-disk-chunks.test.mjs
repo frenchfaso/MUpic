@@ -25,7 +25,7 @@ async function read(f,offset,length,destination=17) {
 }
 test('zero chunks synthesize exact disk bytes without any HTTP request',async()=>{
   const f=fixture();assert.deepEqual(await read(f,0,CHUNK),new Uint8Array(CHUNK));
-  assert.equal(f.calls.length,0);assert.equal(f.disk.stats.requests,0);assert.equal(f.disk.stats.downloadedBytes,0);f.disk.close();
+  assert.equal(f.calls.length,0);f.disk.close();
 });
 test('hash-authenticated chunks preserve unaligned zero/data boundary and short disk tail',async()=>{
   const f=fixture();const boundary=await read(f,CHUNK-73,200);
@@ -33,7 +33,7 @@ test('hash-authenticated chunks preserve unaligned zero/data boundary and short 
   assert.equal(f.calls.length,1);assert.equal(f.calls[0].url,'/immutable/disk-0001.bin');
   assert.deepEqual(f.calls[0].options.headers,{});assert.equal(f.calls[0].options.cache,'force-cache');
   const tail=await read(f,BYTES-512,512);assert.deepEqual(tail,payload(10));
-  assert.equal(f.disk.stats.downloadedBytes,1536);f.disk.close();
+  assert.deepEqual(f.calls.map(call=>call.index),[1,10]);f.disk.close();
 });
 for(const [label,change,expected] of [
   ['SHA-256 mismatch',reply=>{reply.data=reply.data.slice();reply.data[100]^=1;},/SHA-256/],

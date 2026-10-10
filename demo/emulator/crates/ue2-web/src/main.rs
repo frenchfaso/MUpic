@@ -11,8 +11,6 @@ use ue2_core::{Machine, MachineConfig, RunExit};
 use ue2_core::{devices::{board::Board, c64::C64Port}, host::HostInput, render::Renderer};
 
 const STOP: u32 = 0x1004_0001;
-const REU_BASE: usize = 0x0100_0000;
-const REU_BYTES: usize = 16 << 20;
 const AUDIO_LIMIT: usize = 2 * 96_000;
 const MAX_ASSET_BYTES: u32 = 64 << 20;
 
@@ -23,11 +21,9 @@ extern "C" {
     fn browser_log(ptr: *const u8, len: usize);
 }
 
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 fn host_log(bytes: &[u8]) {
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     unsafe { browser_log(bytes.as_ptr(), bytes.len()); }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    print!("{}", String::from_utf8_lossy(bytes));
 }
 
 fn install_panic_hook() {
@@ -58,39 +54,30 @@ struct Browser {
     frame_time: f64,
     audio: BrowserAudio,
     audio_out: Vec<i16>,
-    wolf_pending: bool,
     mupic_pending: bool,
     remote_disk: bool,
     sid_events: Vec<SidEvent>,
     #[cfg(target_endian = "big")]
     sid_event_bytes: Vec<u8>,
-    state_words: Vec<u32>,
 }
 
 impl Browser {
-    fn new(preset: u32, rate: u32) -> Result<Self> {
-        ensure!(preset <= 2, "Unknown browser preset");
-        // Rate zero is reserved for headless profiling of the machine without
-        // the audio synthesizer. Browser playback always supplies its real rate.
-        ensure!(rate == 0 || (8_000..=96_000).contains(&rate), "Invalid audio sample rate");
+    fn new(rate: u32) -> Result<Self> {
+        ensure!((8_000..=96_000).contains(&rate), "Invalid audio sample rate");
         let mut cfg = MachineConfig::new("/firmware.ue2".into(), "/roms".into());
         cfg.flash_image = Some(PathBuf::from("/flash.bin"));
         cfg.board = Board::C64U;
-        cfg.settings.push(match preset { 1 => "/wolf.cfg", 2 => "/mupic.cfg", _ => "/base.cfg" }.into());
-        if preset == 2 {
-            cfg.usb.storage_slots = 1;
-            cfg.capabilities |= ue2_core::devices::usb::CAPAB_USB_HOST2;
-        }
+        cfg.settings.push("/mupic.cfg".into());
+        cfg.usb.storage_slots = 1;
+        cfg.capabilities |= ue2_core::devices::usb::CAPAB_USB_HOST2;
         let mut machine = Machine::new(cfg)?;
-        if preset == 2 {
-            machine.usb_attach_storage(1, remote::backend()?).map_err(anyhow::Error::msg)?;
-        }
+        machine.usb_attach_storage(1, remote::backend()?).map_err(anyhow::Error::msg)?;
         let audio = BrowserAudio(Rc::new(RefCell::new(Vec::new())));
         let mut backend = Trx64Backend::new(&machine.cfg.rom_dir);
         backend.set_sid_socket1(false);
         // The machine keeps digital SID readback and the RAM-coupled sampler.
         // Analogue SID synthesis runs in a separate WASM worker.
-        if rate != 0 { backend.set_audio_external(rate, Box::new(audio.clone())); }
+        backend.set_audio_external(rate, Box::new(audio.clone()));
         machine.attach_c64(Box::new(backend));
         if let Some(itu) = machine.bus.io.get_mut::<ue2_core::devices::itu::Itu>() {
             itu.capabilities |= c64_bridge::CAPAB_EEPROM
@@ -99,11 +86,10 @@ impl Browser {
         let font = ue2_host::fs::read("/roms/chars.bin").context("reading overlay font")?;
         Ok(Self { machine, renderer: Renderer::new(&font), pixels: Vec::new(),
             rgba: Vec::new(), width: 0, height: 0, frame_time: 0.0, audio, audio_out: Vec::new(),
-            wolf_pending: preset == 1, mupic_pending: preset == 2, remote_disk: preset == 2,
+            mupic_pending: true, remote_disk: true,
             sid_events: Vec::with_capacity(1024),
             #[cfg(target_endian = "big")]
-            sid_event_bytes: Vec::new(),
-            state_words: Vec::new() })
+            sid_event_bytes: Vec::new() })
     }
 
     fn load_prg(&mut self, path: &str, entry: u32) -> Result<()> {
@@ -138,24 +124,12 @@ impl Browser {
         if let RunExit::Halted(message) = exit {
             anyhow::bail!("Firmware halted: {message}");
         }
-        if self.wolf_pending && self.machine.now_ms() >= 6_000 {
-            // Same DDR store as firmware REU preload; no duplicate emulated REU.
-            let reu = ue2_host::fs::read("/wolf.reu").context("reading Wolf64 REU")?;
-            ensure!(!reu.is_empty() && reu.len() <= REU_BYTES, "Wolf64 REU image exceeds 16 MiB");
-            // The native preload also leaves unused bytes in the 16 MiB device
-            // zeroed: the packed asset file may omit its unused trailing space.
-            self.machine.bus.ram[REU_BASE..REU_BASE + REU_BYTES].fill(0);
-            self.machine.bus.ram[REU_BASE..REU_BASE + reu.len()].copy_from_slice(&reu);
-            self.load_prg("/wolf.prg", 0x080e)?;
-            self.wolf_pending = false;
-        }
         if self.mupic_pending && !remote::waiting() && self.machine.now_ms() >= 6_000 {
             self.load_prg("/mupic.prg", 0x080e)?;
             self.mupic_pending = false;
         }
         // Avoid an unbounded firmware console buffer when no terminal is attached.
-        let console = self.machine.drain_console();
-        if !console.is_empty() { host_log(&console); }
+        self.machine.drain_console();
         Ok(self.machine.now_ms())
     }
 
@@ -242,14 +216,14 @@ fn with_browser<T>(operation: impl FnOnce(&mut Browser) -> T) -> Option<T> {
 }
 
 #[no_mangle]
-pub extern "C" fn ue2_init(preset: u32, rate: u32) -> i32 {
+pub extern "C" fn ue2_init(rate: u32) -> i32 {
     install_panic_hook();
-    match Browser::new(preset, rate) {
+    match Browser::new(rate) {
         Ok(browser) => { BROWSER.with(|value| *value.borrow_mut() = Some(browser)); 0 }
         Err(error) => fail(format!("{error:#}")),
     }
 }
-/// Configure the read-only remote image before initializing MUpic preset 2.
+/// Configure the read-only remote image before initializing MUpic.
 #[no_mangle]
 pub extern "C" fn ue2_remote_disk(bytes: u32) -> i32 {
     match remote::configure(bytes) { Ok(()) => 0, Err(error) => fail(error) }
@@ -302,39 +276,11 @@ pub extern "C" fn ue2_joystick(port: u32, lines: u32) {
     }
 }
 #[no_mangle]
-pub extern "C" fn ue2_paddles(active: u32, p1x: u32, p1y: u32, p2x: u32, p2y: u32) {
-    let values = match active {
-        0 => None,
-        1 if [p1x, p1y, p2x, p2y].iter().all(|value| *value <= u8::MAX as u32) =>
-            Some([[p1x as u8, p1y as u8], [p2x as u8, p2y as u8]]),
-        _ => return,
-    };
-    with_browser(|b| b.machine.input(HostInput::Paddles { values }));
-}
-#[no_mangle]
 pub extern "C" fn ue2_menu(down: u32) { with_browser(|b| b.machine.input(HostInput::MenuButton(down != 0))); }
 #[no_mangle]
 pub extern "C" fn ue2_restore(down: u32) { with_browser(|b| b.machine.input(HostInput::Restore(down != 0))); }
 #[no_mangle]
-pub extern "C" fn ue2_load_prg(entry: u32) -> i32 {
-    match with_browser(|b| b.load_prg("/load.prg", entry)) {
-        Some(Ok(())) => 0,
-        Some(Err(error)) => fail(format!("{error:#}")),
-        None => fail("Emulator is not initialized"),
-    }
-}
-#[no_mangle]
 pub extern "C" fn ue2_error() -> *const std::ffi::c_char { ERROR.with(|value| value.borrow().as_ptr()) }
-/// Verification tools read C64 RAM without changing CPU registers or I/O state.
-#[no_mangle]
-pub extern "C" fn ue2_peek(address: u32) -> i32 {
-    if address > 0xffff { return -1; }
-    with_browser(|browser| {
-        browser.machine.bus.io.get_mut::<C64Port>().and_then(C64Port::backend_mut)
-            .map(|backend| i32::from(backend.dma_read(address as u16, true))).unwrap_or(-1)
-    }).unwrap_or(-1)
-}
-
 /// Allocate zeroed browser staging bytes. Every nonzero allocation must be
 /// released using its original length; registration copies the bytes.
 #[no_mangle]
@@ -392,10 +338,10 @@ pub extern "C" fn ue2_file_register(path_ptr: *const u8, path_len: u32, data_ptr
 pub extern "C" fn ue2_sid_events() -> *const u8 { with_browser(Browser::drain_sid).unwrap_or(std::ptr::null()) }
 #[no_mangle]
 pub extern "C" fn ue2_sid_events_bytes() -> u32 { with_browser(|b| (b.sid_events.len() * std::mem::size_of::<SidEvent>()) as u32).unwrap_or(0) }
-fn initialize_sid(rate: u32, fast: bool) -> i32 {
+fn initialize_sid(rate: u32) -> i32 {
     install_panic_hook();
     if !(8_000..=96_000).contains(&rate) { return fail("Invalid SID rate"); }
-    let renderer = if fast { SidRenderer::new_fast(rate) } else { SidRenderer::new(rate) };
+    let renderer = SidRenderer::new_fast(rate);
     SID.with(|slot| *slot.borrow_mut() = Some(BrowserSid { renderer,
         events: Vec::new(), pcm: Vec::new(), sampler: Vec::new(),
         #[cfg(feature = "sid-partition")] partition: None,
@@ -407,10 +353,7 @@ fn initialize_sid(rate: u32, fast: bool) -> i32 {
     0
 }
 #[no_mangle]
-pub extern "C" fn ue2_sid_init(rate: u32) -> i32 { initialize_sid(rate, true) }
-/// Preserve accurate sampling for the C++/Rust SID quality oracle.
-#[no_mangle]
-pub extern "C" fn ue2_sid_init_reference(rate: u32) -> i32 { initialize_sid(rate, false) }
+pub extern "C" fn ue2_sid_init(rate: u32) -> i32 { initialize_sid(rate) }
 /// Experimental one-SID worker. All timestamp boundaries must be broadcast;
 /// only this receiver is synthesized. Output is raw i32 stereo mixer units.
 #[no_mangle]
@@ -422,7 +365,7 @@ pub extern "C" fn ue2_sid_partition_init(rate: u32, receiver_mask: u32) -> i32 {
     let partition = match SidPartitionRenderer::new_fast(rate, receiver_mask as u16) {
         Ok(partition) => partition, Err(error) => return fail(error),
     };
-    if initialize_sid(rate, true) != 0 { return -1; }
+    if initialize_sid(rate) != 0 { return -1; }
     SID.with(|slot| slot.borrow_mut().as_mut().unwrap().partition = Some(partition));
     0
 }
@@ -432,7 +375,7 @@ pub extern "C" fn ue2_sid_partition_control_init(rate: u32) -> i32 {
     let partition = match SidPartitionRenderer::new_metadata(rate) {
         Ok(partition) => partition, Err(error) => return fail(error),
     };
-    if initialize_sid(rate, true) != 0 { return -1; }
+    if initialize_sid(rate) != 0 { return -1; }
     SID.with(|slot| slot.borrow_mut().as_mut().unwrap().partition = Some(partition));
     0
 }
@@ -485,7 +428,7 @@ pub extern "C" fn ue2_sid_partition_snapshot_import(bytes: u32) -> i32 {
 /// A mixer instance has no active reSID engines or analog tables.
 #[no_mangle]
 #[cfg(feature = "sid-partition")]
-pub extern "C" fn ue2_sid_mixer_init(rate: u32) -> i32 { initialize_sid(rate, true) }
+pub extern "C" fn ue2_sid_mixer_init(rate: u32) -> i32 { initialize_sid(rate) }
 #[no_mangle]
 pub extern "C" fn ue2_sid_alloc(bytes: u32) -> *mut u32 {
     if bytes > 1_048_576 || bytes % 16 != 0 { fail("Invalid SID event buffer size"); return std::ptr::null_mut(); }
@@ -611,62 +554,6 @@ pub extern "C" fn ue2_sid_audio() -> *const i16 { SID.with(|s| s.borrow().as_ref
 #[no_mangle]
 pub extern "C" fn ue2_sid_audio_samples() -> u32 { SID.with(|s| s.borrow().as_ref().map(|s| s.pcm.len() as u32).unwrap_or(0)) }
 
-/// Verification controls: compare the optimized turbo batching with the
-/// colour-store boundary reference on the exact same frozen ROM/PRG/REU input.
-#[no_mangle]
-pub extern "C" fn ue2_verify_color_batch(enabled: u32) {
-    with_browser(|b| {
-        if let Some(trx) = b.machine.bus.io.get_mut::<C64Port>().and_then(C64Port::backend_mut)
-            .and_then(|b| b.as_any_mut()).and_then(|a| a.downcast_mut::<Trx64Backend>()) {
-            trx.trx64().turbo_color_batch = enabled != 0;
-        }
-    });
-}
-#[no_mangle]
-pub extern "C" fn ue2_verify_ram_fast(enabled: u32) {
-    with_browser(|b| {
-        if let Some(trx) = b.machine.bus.io.get_mut::<C64Port>().and_then(C64Port::backend_mut)
-            .and_then(|b| b.as_any_mut()).and_then(|a| a.downcast_mut::<Trx64Backend>()) {
-            trx.trx64().ram_read_fast_path = enabled != 0;
-        }
-    });
-}
-
-#[no_mangle]
-pub extern "C" fn ue2_verify_ram() -> *const u8 {
-    with_browser(|b| b.machine.bus.io.get_mut::<C64Port>().and_then(C64Port::backend_mut)
-        .and_then(|b| b.as_any_mut()).and_then(|a| a.downcast_mut::<Trx64Backend>())
-        .map(|t| t.trx64().ram.as_ptr()).unwrap_or(std::ptr::null())).unwrap_or(std::ptr::null())
-}
-#[no_mangle]
-pub extern "C" fn ue2_verify_state() -> *const u32 {
-    with_browser(|b| {
-        b.state_words.clear();
-        if let Some(trx) = b.machine.bus.io.get_mut::<C64Port>().and_then(C64Port::backend_mut)
-            .and_then(|b| b.as_any_mut()).and_then(|a| a.downcast_mut::<Trx64Backend>()) {
-            let m = trx.trx64(); let c = &m.c64_core;
-            b.state_words.extend([u32::from(c.reg_pc), u32::from(c.reg_a), u32::from(c.reg_x),
-                u32::from(c.reg_y), u32::from(c.reg_sp), u32::from(c.status()), c.clk as u32,
-                (c.clk >> 32) as u32, c.turbo_phase, c.turbo_div, m.c64_int.global_pending_int]);
-        }
-        b.state_words.as_ptr()
-    }).unwrap_or(std::ptr::null())
-}
-
-/// Read-only sampler queue/voice diagnostics. See Sampler::audio_debug_state
-/// for the 19-word layout; no queue is drained and no emulated clock advances.
-#[no_mangle]
-pub extern "C" fn ue2_verify_audio_state() -> *const u32 {
-    with_browser(|b| {
-        b.state_words.clear();
-        if let Some(trx) = b.machine.bus.io.get_mut::<C64Port>().and_then(C64Port::backend_mut)
-            .and_then(|backend| backend.as_any_mut()).and_then(|any| any.downcast_mut::<Trx64Backend>()) {
-            b.state_words.extend(trx.audio_debug_state());
-        }
-        b.state_words.as_ptr()
-    }).unwrap_or(std::ptr::null())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -681,10 +568,9 @@ mod tests {
         Browser {
             machine, renderer: Renderer::new(&[0; 2048]), pixels: Vec::new(), rgba: Vec::new(),
             width: 0, height: 0, frame_time: 0.0, audio: BrowserAudio(Rc::new(RefCell::new(Vec::new()))),
-            audio_out: Vec::new(), wolf_pending: false, mupic_pending: false, remote_disk: false, sid_events: Vec::new(),
+            audio_out: Vec::new(), mupic_pending: false, remote_disk: false, sid_events: Vec::new(),
             #[cfg(target_endian = "big")]
             sid_event_bytes: Vec::new(),
-            state_words: Vec::new(),
         }
     }
 
@@ -706,10 +592,6 @@ mod tests {
         assert_eq!(ue2_remote_waiting(), 0);
         assert!(ue2_step(100_000) > 0.0);
         assert!(with_browser(|b| b.machine.cpu.insns).unwrap() > before.2);
-        with_browser(|b| b.machine.bus.io.get_mut::<C64Port>().unwrap().backend_mut().unwrap()
-            .dma_write(0x4000, 0x42, true)).unwrap();
-        assert_eq!(ue2_peek(0x4000), 0x42);
-        assert_eq!(ue2_peek(65536), -1);
         BROWSER.with(|value| *value.borrow_mut() = None);
     }
 
@@ -849,9 +731,9 @@ mod tests {
                 assert!(!joystick.up && !joystick.down && !joystick.left && !joystick.right && !joystick.fire);
             }
         }).unwrap();
-        ue2_paddles(1, 171, 0xa5, 22, 30);
-        ue2_paddles(2, 0, 0, 0, 0);
-        ue2_paddles(1, 256, 0, 0, 0);
+        with_browser(|browser| browser.machine.input(HostInput::Paddles {
+            values: Some([[171, 0xa5], [22, 30]]),
+        }));
         with_browser(|browser| {
             let backend = browser.machine.bus.io.get_mut::<C64Port>().unwrap().backend_mut().unwrap();
             backend.core_config_write(0x34, 77); // Firmware values stay behind the host adapter.
@@ -869,7 +751,7 @@ mod tests {
             trx.c64_core.clk += 512;
             assert_eq!((trx.read_full(0xd419), trx.read_full(0xd41a)), (22, 30));
         }).unwrap();
-        ue2_paddles(0, u32::MAX, u32::MAX, u32::MAX, u32::MAX);
+        with_browser(|browser| browser.machine.input(HostInput::Paddles { values: None }));
         with_browser(|browser| {
             let backend = browser.machine.bus.io.get_mut::<C64Port>().unwrap().backend_mut().unwrap();
             let trx = backend.as_any_mut().unwrap().downcast_mut::<Trx64Backend>().unwrap().trx64();

@@ -411,11 +411,6 @@ impl Trx64Backend {
         self.sid.drain_events_into(out);
     }
 
-    /// Read-only Ultimate Audio queue/voice state for host verification tools.
-    pub fn audio_debug_state(&self) -> [u32; 19] {
-        self.sampler.with(|s| s.audio_debug_state())
-    }
-
     /// S24 M3: the UDP audio stream's tap, while the firmware has the audio stream enabled.
     pub fn set_stream_audio(&mut self, on: bool) {
         if on == self.stream_tap.is_some() {

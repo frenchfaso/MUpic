@@ -14,10 +14,7 @@ opt-level = 1
 [profile.release]
 opt-level = 3
 debug = 0
-strip = "debuginfo"
+strip = "symbols"
 lto = "fat"
 codegen-units = 1
 panic = "abort"
-
-[profile.web-release]
-inherits = "release"

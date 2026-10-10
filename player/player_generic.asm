@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// Isolated360x200 dictionary/SKIP/RAW PAL3 experiment; qualifiedRAW unchanged.
+// 360x200 dictionary/SKIP/RAW PAL3 standalone player.
 // UPIC1.3: Aleksi Eeben's indexed LDX / eighth-pair immediate LDX,
 // 126 CPU slots per sixteen dots and the corrected two-NOP footer.
-// STATIC_RENDERER selects the isolated renderer; otherwise UCI streams
-// video and PCM through two REU cache slots. Front updates are progressive.
+// UCI streams video and PCM through two REU cache slots.
+// Front updates are progressive.
 // Primary: xahmol/ultimate-uci-oscar64 include/ultimate_upic_lib.c (2026-10-09),
 // authorized UPIC1.3 source port; default first raster25 and delay83.
 // Pixel stream uses the primary1.3 first180 columns,22 short pairs and both footer NOPs.
@@ -24,12 +24,8 @@
 .const DICT_MAX_LITERAL_BYTES=DICT_WORDS*5
 .const FRAME_BYTES=46080
 .const PREFETCH_BYTES_PER_ROW=13
-.const PREFETCH_HEAD_BYTES_PER_ROW=(SPAN_VERSION==9 ? 11 : 9)
-.const PREFETCH_TAIL_BYTES_PER_ROW=(SPAN_VERSION==9 ? 2 : 4)
-.const STATIC_RENDERER=0
-.const TEST_FRONT_SLOT=0
-.const TEST_TOGGLE_FRONT=0
-.const UCI_DELAY_TICKS=0
+.const PREFETCH_HEAD_BYTES_PER_ROW=11
+.const PREFETCH_TAIL_BYTES_PER_ROW=2
 .const AUDIO_VOICE_VOLUME=63
 .const AUDIO_BLOCK_OFFSET=225280
 .const STREAM_BLOCK_BYTES=262144
@@ -58,7 +54,6 @@
 .label browser_response_size=$0704
 .label browser_status_size=$0706
 .label browser_reply_state=$0707
-.label browser_attributes=$0708
 .label browser_entry_ptr=$86
 .label browser_text_ptr=$88
 .label browser_screen_ptr=$8a
@@ -70,12 +65,9 @@
 .label browser_limit=$070e
 .label playback_paused=$070f
 .label pause_request=$0710 // 1=pause, 2=resume, applied at the next PAL setup IRQ
-.label pause_count=$0711 // u16
-.label resume_count=$0713 // u16
 .label audio_tick_count=$0715 // elapsed PAL ticks in this PCM block, including before pauses
 .label audio_resume_offset=$0716 // u16, stereo-frame aligned byte offset
 .label audio_resume_active=$0718
-.label audio_last_resume_offset=$0719 // u16, diagnostics
 .label audio_calc_samples=$071b // u16
 .label audio_calc_sum=$071d // u24 numerator, then quotient
 .label audio_calc_remainder=$0720
@@ -100,11 +92,9 @@
 .const WRAPPER_EXTRA_CYCLES = 15
 .const UE2_PAL_PHASE_ADJUSTMENT_CYCLES = 194
 .const WIDE_WRAPPER_DELAY = 118
-.label phase_adjustment_cpu_cycles = UE2_PAL_PHASE_ADJUSTMENT_CYCLES
-.const PRE_PIXEL_BUSY_CYCLES = (SPAN_VERSION==9 ? 715 : 608)
-.const PREP_CALL_CYCLES = (SPAN_VERSION==9 ? 0 : 12)
-.const FIRST_D020_RENDER_CYCLE = SHORT_PAIRS*8+PREP_CALL_CYCLES+PRE_PIXEL_BUSY_CYCLES+6+8
-.assert "360 firstpixel phase", FIRST_D020_RENDER_CYCLE==(SPAN_VERSION==9 ? 905 : 810), true
+.const PRE_PIXEL_BUSY_CYCLES = 715
+.const FIRST_D020_RENDER_CYCLE = SHORT_PAIRS*8+PRE_PIXEL_BUSY_CYCLES+6+8
+.assert "360 firstpixel phase", FIRST_D020_RENDER_CYCLE==905, true
 .assert "UE2 PAL phase compensation changed", 5*(WIDE_WRAPPER_DELAY-UPIC13_PRIMARY_DELAY)+WRAPPER_EXTRA_CYCLES+4==UE2_PAL_PHASE_ADJUSTMENT_CYCLES, true
 .const FRAME_IRQ_RASTER = WIDE_FIRST_RASTER+ACTIVE_TOP-2
 .const TOP_SYNC_RASTER = WIDE_FIRST_RASTER+ACTIVE_TOP-1
@@ -119,27 +109,14 @@
 .label lz_source_pointer = $f6
 .label lz_output_logical = $046e
 .label lz_feed_available = $04c0
-.label lz_token = $04c2
-.label lz_run_length = $04c3
 .label lz_copy_count = $04c4
-.label lz_match_offset = $04c5
-.label lz_source_logical = $04c7
-.label lz_new_output = $04c9
-.label lz_literal_left = $04cb
 .label lz_prefetch_count = $04cc
 .label lz_prefetch_rows = $04ce
 .label lz_prefetch_end_row = $04cf
 .label lz_record_prepared = $04d0
-.label lz_reader_value = $04d2
 .label lz_copy_aligned = $04d3
 .label raw_output_column = lz_output_logical
-.label raw_columns_remaining = $04d4
-.label raw_prefix_columns = $04d5
 .label raw_header = $0430
-.label raw_column_count = $04db
-.label dictionary_load_count = $0464
-.label dict_decoded_column_count = $0466
-.label raw_decoded_column_count = $0479
 .label dict_column_total = $04d4
 .label dict_columns_left = $04d5
 .label dict_previous_column = $04d6
@@ -153,26 +130,10 @@
 .label dict_literals = $82
 .label dict_dest_page = $84
 .label dict_literal_bytes = $85
-.label source_pointer = $f8
-.label video_frame_count = $0400
-.label upic_missed_frames = $0402
-.label upic_line_late_count = $0404
 .label scanout_row = $0406
 .label fatal_error = $0417
 .label record_index = $0408
-.label cache_underrun = $040a
-.label underrun_count = cache_underrun
-.label refill_count = $040c
-.label update_raster_start = $0410
-.label update_raster_end = $0411
-.label update_raster_start_high = $0412
-.label update_raster_end_high = $0413
-.label max_packet_length = $0414
 .label playback_ended = $0416
-.label uci_error_count = $0418
-.label uci_status_chars = $0419
-.label deadline_miss_count = $041b
-.label blank_updates = $041d
 .label uci_busy = $0420
 .label uci_fill_bank = $0421
 .label cache_ready = $0422
@@ -184,82 +145,29 @@
 .label uci_status_count = $042b
 .label uci_status_bad = $042c
 .label uci_wait = $042d
-.label record_header = $0430
-.label packet_length = $0432
 .label audio_pending_start = $0435
-.label uci_last_response = $0436
-.label uci_refill_start = $043a
-.label uci_refill_max_ticks = $043c
-.label uci_elapsed_ticks = $043e
 .label uci_command_kind = $0440
 .label pending_refill_mask = $0441
-.label uci_pending_publish = $0442
-.label uci_completion_frame = $0443
-.label record_update_active = $0445
 .label uci_response_prefix = $0450
-.label framebuffer_front_slot = $0468
-.label compact_row = $0469
-.label source_base_low = $046a
-.label nmi_count = $046b
 .label cache_cursor_high = $046c
-.label decoded_chunk_count = $0460
-.label framebuffer_swap_count = $0462
 .label record_flags = $0470
 .label record_remaining = $0471
-.label chunk_length = $0473
 .label dma_destination = $0475
 .label dma_length = $0477
-.label decode_remaining = $0479
-.label max_chunk_length = $047b
-.label span_last = $047d
-.label span_source = $f8
-.label span_count = $fa
-.label span_tag = $fb
-.label span_advance = $fc
-.label span_destination = $fe
 
 // Persistent state: only0400..047F is reset when starting another pass.
-.label current_preset = $0480
-.label requested_preset = $0481
 .label restart_pending = $0482 // 1=keyboard, 2=completed EOF
 .label keyboard_last_key = $0483
-.label restart_in_progress = $0484
-.label playback_generation = $0485 // u16, first successful pass is1
-.label loop_count = $0487 // u16, completed passes restarted at EOF
-.label preset_switch_count = $0489 // u16, successful changes of preset
-.label restart_count = $048b // u16, successful restarts after cold startup
-.label restart_kind = $048d
-.label last_completed_preset = $048e
 .label eof_audio_stopped = $048f
-.label lifetime_missed_frames = $0490
-.label lifetime_line_late_count = $0492
-.label lifetime_deadline_miss_count = $0494
-.label lifetime_underrun_count = $0496
-.label lifetime_uci_error_count = $0498
-.label fatal_latched = $049a
-.label last_completed_record_count = $049c
-.label last_completed_generation = $049e
-.label last_completed_frame_count = $04a0
-.label last_completed_swap_count = $04a2
-.label last_completed_chunk_count = $04a4
-.label last_completed_refill_count = $04a6
-.label last_completed_eof_audio_stopped = $04a8
 .label file_open = $04aa
 .label keyboard_scan_scratch = $04ab
-.label previous_preset = $04ac
-.label uci_close_count = $04ad
-.label uci_open_count = $04af
-.label restart_drain_count = $04b1
-.label last_drained_command_kind = $04b3
 .label active_record_count = $04b4
-.label active_last_audio_length = $04b6 // u24, final PCM block's byte count
 
 .assert "Isolated canvas must be360x200", WIDE_WIDTH==360 && WIDE_HEIGHT==200, true
 .assert "Isolated bitmap must contain180 full-page columns", FRAME_BYTES==COLUMNS*256 && COLUMNS==180, true
 .assert "Wide active rows exceed canvas", ACTIVE_TOP>=0 && ACTIVE_HEIGHT>0 && ACTIVE_TOP+ACTIVE_HEIGHT<=WIDE_HEIGHT, true
 .assert "Wide raster range exceeds PAL", WIDE_FIRST_RASTER>=2 && WIDE_FIRST_RASTER+ACTIVE_TOP+ACTIVE_HEIGHT<=312, true
 .assert "Setup IRQ must precede raster256", FRAME_IRQ_RASTER<256, true
-.assert "Single wide front must be selected", TEST_FRONT_SLOT==0 && TEST_TOGGLE_FRONT==0, true
 .function wide_address(column) {
     .if (column<8) { .return $e000+column*256 }
     .return $1800+(column-8)*256
@@ -315,9 +223,6 @@ start:
     sta $0700,x
     inx
     bne !state-
-    lda #1
-    sta current_preset
-    sta requested_preset
     lda #$ff
     sta $dc02
     sta $dc00
@@ -351,55 +256,51 @@ generic_begin_scanout:
     sta $d01a
     cli
 main:
-    .if (STATIC_RENDERER!=0) {
-        jmp main
-    } else {
-        jsr keyboard_scan
-        jsr uci_poll
-        lda fatal_error
-        beq !healthy+
-        jmp comparison_halt
+    jsr keyboard_scan
+    jsr uci_poll
+    lda fatal_error
+    beq !healthy+
+    jmp comparison_halt
 !healthy:
-        lda restart_pending
-        bne !restart+
-        jmp !continue+
+    lda restart_pending
+    bne !restart+
+    jmp !continue+
 !restart:
-        jsr restart_playback
-        jmp main
+    jsr restart_playback
+    jmp main
 !continue:
-        lda playback_ended
-        beq !streaming+
-        // Let one final IRQ display the completed image and mute the sampler.
-        lda eof_audio_stopped
-        beq main
-        lda #2
-        sta restart_pending
-        jmp main
+    lda playback_ended
+    beq !streaming+
+    // Let one final IRQ display the completed image and mute the sampler.
+    lda eof_audio_stopped
+    beq main
+    lda #2
+    sta restart_pending
+    jmp main
 !streaming:
-        lda playback_paused
-        bne main
-        lda uci_busy
-        bne main
-        lda cache_need_refill
-        beq main
-        lda next_file_block+1
-        cmp active_stream_blocks+1
-        bcc !have_block+
-        bne main
-        lda next_file_block
-        cmp active_stream_blocks
-        bcs main
+    lda playback_paused
+    bne main
+    lda uci_busy
+    bne main
+    lda cache_need_refill
+    beq main
+    lda next_file_block+1
+    cmp active_stream_blocks+1
+    bcc !have_block+
+    bne main
+    lda next_file_block
+    cmp active_stream_blocks
+    bcs main
 !have_block:
-        ldx #0
-        lda cache_need_refill
-        and #1
-        bne !refill+
-        inx
+    ldx #0
+    lda cache_need_refill
+    and #1
+    bne !refill+
+    inx
 !refill:
-        stx uci_fill_bank
-        jsr uci_start_refill
-        jmp main
-    }
+    stx uci_fill_bank
+    jsr uci_start_refill
+    jmp main
 
 load_initial:
     lda #0
@@ -497,12 +398,6 @@ restart_playback:
     // asynchronous DOS command. LOAD_REU must finish and be acknowledged
     // before CLOSE/OPEN or a destination is reused.
     sei
-    lda #1
-    sta restart_in_progress
-    lda restart_pending
-    sta restart_kind
-    lda current_preset
-    sta previous_preset
     lda #0
     sta $d01a
     sta $dc0e
@@ -511,60 +406,13 @@ restart_playback:
     lda #1
     sta $d019
     jsr audio_stop
-    lda uci_busy
-    beq !drain+
-    lda uci_command_kind
-    sta last_drained_command_kind
-    inc restart_drain_count
-    bne !drain+
-    inc restart_drain_count+1
-!drain:
     jsr uci_wait_complete
     lda fatal_error
     beq !drained+
     jmp comparison_halt
 !drained:
-    jsr accumulate_pass_errors
-    lda restart_kind
-    cmp #2
-    bne !return+
-    // Completion is captured before the per-pass counters are reset.
-    lda current_preset
-    sta last_completed_preset
-    .for (var field=0;field<6;field++) {
-        .var from=List().add(record_index,playback_generation,video_frame_count,framebuffer_swap_count,decoded_chunk_count,refill_count).get(field)
-        .var to=List().add(last_completed_record_count,last_completed_generation,last_completed_frame_count,last_completed_swap_count,last_completed_chunk_count,last_completed_refill_count).get(field)
-        lda from
-        sta to
-        lda from+1
-        sta to+1
-    }
-    lda eof_audio_stopped
-    sta last_completed_eof_audio_stopped
-!return:
     jsr uci_close_file
     jmp generic_browser
-
-accumulate_pass_errors:
-    .for (var field=0;field<4;field++) {
-        .var from=List().add(upic_missed_frames,upic_line_late_count,deadline_miss_count,underrun_count).get(field)
-        .var to=List().add(lifetime_missed_frames,lifetime_line_late_count,lifetime_deadline_miss_count,lifetime_underrun_count).get(field)
-        clc
-        lda to
-        adc from
-        sta to
-        lda to+1
-        adc from+1
-        sta to+1
-    }
-    clc
-    lda lifetime_uci_error_count
-    adc uci_error_count
-    sta lifetime_uci_error_count
-    bcc !done+
-    inc lifetime_uci_error_count+1
-!done:
-    rts
 
 uci_close_file:
     // CLOSE has no LOAD_REU response prefix; validate its ASCII status only.
@@ -580,16 +428,11 @@ uci_close_file:
     bne !done+
     lda #0
     sta file_open
-    inc uci_close_count
-    bne !done+
-    inc uci_close_count+1
 !done:
     rts
 
 comparison_halt:
     sei
-    lda fatal_error
-    sta fatal_latched
     lda #0
     sta $d01a
     sta $dc0e
@@ -647,15 +490,10 @@ uci_push:
     sta uci_wait
     sta uci_wait+1
     sta uci_wait+2
-    sta uci_pending_publish
     rts
 uci_start_refill:
     lda #1
     sta uci_command_kind
-    lda video_frame_count
-    sta uci_refill_start
-    lda video_frame_count+1
-    sta uci_refill_start+1
     ldx uci_fill_bank
     lda #0
     sta cache_ready,x
@@ -716,22 +554,6 @@ uci_poll:
     bne !busy+
     rts
 !busy:
-    lda uci_pending_publish
-    beq !protocol+
-    sec
-    lda video_frame_count
-    sbc uci_completion_frame
-    sta uci_elapsed_ticks
-    lda video_frame_count+1
-    sbc uci_completion_frame+1
-    bne !delayed_done+
-    lda uci_elapsed_ticks
-    cmp #UCI_DELAY_TICKS
-    bcs !delayed_done+
-    rts
-!delayed_done:
-    jmp uci_publish_cache
-!protocol:
     lda $df1c
     and #$30
     cmp #$20
@@ -748,10 +570,6 @@ uci_poll:
     bcs !prefix+
     sta uci_response_prefix,x
 !prefix:
-    cpx #4
-    bcs !count+
-    sta uci_last_response,x
-!count:
     inc uci_response_count
     jmp !drain-
 !status:
@@ -762,7 +580,6 @@ uci_poll:
     ldx uci_status_count
     cpx #2
     bcs !status-
-    sta uci_status_chars,x
     inc uci_status_count
     cmp #48
     beq !status-
@@ -808,59 +625,18 @@ uci_poll:
     bne !short+
     dex
     bpl !full_read-
-    .if (UCI_DELAY_TICKS>0) {
-        // A reproducible cache-stall experiment, after the real command
-        // completed. Startup priming is exempt because scanout is not running.
-        lda video_frame_count
-        ora video_frame_count+1
-        beq uci_publish_cache
-        lda video_frame_count
-        sta uci_completion_frame
-        lda video_frame_count+1
-        sta uci_completion_frame+1
-        lda #1
-        sta uci_pending_publish
-        sta uci_busy
-        rts
-    }
 uci_publish_cache:
     lda #0
     sta uci_busy
-    sta uci_pending_publish
     ldx uci_fill_bank
     lda #1
     sta cache_ready,x
-    sec
-    lda video_frame_count
-    sbc uci_refill_start
-    sta uci_elapsed_ticks
-    lda video_frame_count+1
-    sbc uci_refill_start+1
-    sta uci_elapsed_ticks+1
-    cmp uci_refill_max_ticks+1
-    bcc !refill_count+
-    bne !refill_time+
-    lda uci_elapsed_ticks
-    cmp uci_refill_max_ticks
-    bcc !refill_count+
-!refill_time:
-    lda uci_elapsed_ticks
-    sta uci_refill_max_ticks
-    lda uci_elapsed_ticks+1
-    sta uci_refill_max_ticks+1
-!refill_count:
-    inc refill_count
-    bne !done+
-    inc refill_count+1
-!done:
     rts
 uci_bad_reply:
-    inc uci_error_count
     lda #3
     sta fatal_error
     rts
 !short:
-    inc uci_error_count
     lda #6
     sta fatal_error
     rts
@@ -957,28 +733,13 @@ lz_prepare_next:
 !count:
     sec
     lda raw_header
-    sta packet_length
     sbc #2
     sta record_remaining
     lda raw_header+1
-    sta packet_length+1
     sbc #0
     sta record_remaining+1
-    bcs !maximum+
+    bcs !prefix+
     jmp record_malformed
-!maximum:
-    lda packet_length+1
-    cmp max_packet_length+1
-    bcc !prefix+
-    bne !save+
-    lda packet_length
-    cmp max_packet_length
-    bcc !prefix+
-!save:
-    lda packet_length
-    sta max_packet_length
-    lda packet_length+1
-    sta max_packet_length+1
 !prefix:
     lda record_remaining+1
     cmp #>PREFETCH_CAPACITY
@@ -1043,15 +804,9 @@ apply_buffered_record:
 !active:
     lda lz_record_prepared
     bne !record+
-    inc cache_underrun
-    bne !retry+
-    inc cache_underrun+1
-!retry:
     jsr lz_prepare_next
     rts
 !record:
-    lda #1
-    sta record_update_active
     lda #<PREFETCH_BUFFER
     sta lz_feed_pointer
     lda #>PREFETCH_BUFFER
@@ -1084,9 +839,6 @@ apply_buffered_record:
     beq !loaded+
     rts
 !loaded:
-    inc dictionary_load_count
-    bne !columns+
-    inc dictionary_load_count+1
 !columns:
     clc
     lda raw_output_column
@@ -1155,9 +907,6 @@ dict_next_column:
     beq !raw_count+
     rts
 !raw_count:
-    inc raw_decoded_column_count
-    bne dict_column_complete
-    inc raw_decoded_column_count+1
     jmp dict_column_complete
 
 dict_mode:
@@ -1197,16 +946,9 @@ dict_mode:
     beq !decoded+
     rts
 !decoded:
-    inc dict_decoded_column_count
-    bne dict_column_complete
-    inc dict_decoded_column_count+1
 
 dict_column_complete:
     inc raw_output_column
-    inc decoded_chunk_count
-    bne !counted+
-    inc decoded_chunk_count+1
-!counted:
     dec dict_columns_left
     beq !done+
     jmp dict_next_column
@@ -1446,21 +1188,10 @@ record_complete:
 !consumed:
     lda #0
     sta lz_record_prepared
-    lda record_flags
-    and #1
-    beq !published+
-    inc framebuffer_swap_count
-    bne !published+
-    inc framebuffer_swap_count+1
-!published:
     inc record_index
     bne !updated+
     inc record_index+1
 !updated:
-    inc blank_updates
-    bne !eof+
-    inc blank_updates+1
-!eof:
     lda record_index+1
 record_count_compare_high:
     cmp #>VIDEO_RECORD_COUNT
@@ -1564,12 +1295,9 @@ generic_browser:
     sta cache_read_block
     sta cache_read_block+1
     sta restart_pending
-    sta restart_in_progress
     sta keyboard_last_key
     sta eof_audio_stopped
     sta audio_tick_count
-    sta audio_last_resume_offset
-    sta audio_last_resume_offset+1
     sta $d011
     sta $d015
     sta $d020
@@ -1579,10 +1307,6 @@ generic_browser:
     sta player_mode
     jsr load_initial
     jsr stream_startup
-    inc playback_generation
-    bne !started+
-    inc playback_generation+1
-!started:
     jmp generic_begin_scanout
 
 // File remains open on a manual restart; seek rather than reopen/reload.
@@ -1685,66 +1409,45 @@ pixel_stream:
 .assert "Wide kernel size changed", pixel_stream_end-pixel_stream==PIXEL_KERNEL_BYTES, true
 .assert "Wide kernel overlaps short-pair preparation", * == PREP_BASE, true
 
-prepare_short_pairs:
-    .if (SPAN_VERSION!=9) {
-        .for (var pair=0;pair<SHORT_PAIRS;pair++) {
-            .var column=pair*8+7
-            lda wide_address(column),y
-            sta kernel_opcode(column)+1
-        }
-        rts
-    }
 .align $40
 render_line:
-    // SD centers the unchanged360-dot kernel at nativeX12. Moving two
-    // prefetch bytes ahead of it and inlining preparation shifts pixel0
-    // by95 CPU slots, while saving31 slots over the complete active line.
-    // The legacy profile keeps nativeX0 and its original9+4 schedule.
-    .if (SPAN_VERSION==9) {
-        .for (var pair=0;pair<SHORT_PAIRS;pair++) {
-            .var column=pair*8+7
-            lda wide_address(column),y
-            sta kernel_opcode(column)+1
-        }
-    } else {
-        jsr prepare_short_pairs
+    // Codec9 centers the360-dot kernel at nativeX12 with an11+2
+    // prefetch split and inline short-pair preparation.
+    .for (var pair=0;pair<SHORT_PAIRS;pair++) {
+        .var column=pair*8+7
+        lda wide_address(column),y
+        sta kernel_opcode(column)+1
     }
 lz_prefetch_row_compare:
     cpy #ACTIVE_TOP
     bcs lz_no_prefetch
-    // SD:4 compare/branch +12 setup +693 DMA +6 padding =715c.
-    // Legacy:4 +12 +567 DMA +21 loop +4 NOP =608c.
+    // 4 compare/branch +12 setup +693 DMA +6 padding =715c.
     lda #PREFETCH_HEAD_BYTES_PER_ROW
     sta $df07
     lda #$91
     sta $df01
     ldx #4
 wide_delay:
-    .if (SPAN_VERSION!=9) {
-        dex
-        bne wide_delay
-    }
     nop
     nop
     jsr pixel_stream
     jmp raw_post_prefetch
 lz_no_prefetch:
     // Disabled prefetch must keep exactly the same first-pixel phase.
-    ldx #(SPAN_VERSION==9 ? 141 : 120)
+    ldx #141
 lz_idle_delay:
     dex
     bne lz_idle_delay
 wide_phase_padding:
     nop
-    .if (SPAN_VERSION==9) { nop }
+    nop
     jsr pixel_stream
     jmp raw_post_prefetch
 raw_post_prefetch:
 raw_post_row_compare:
     cpy #ACTIVE_TOP
     bcs !done+
-    // D020 is black at nativeX372 (SD) orX360 (legacy).
-    // SD transfers2 trailing bytes; legacy transfers4. Total remains13.
+    // D020 is black at nativeX372; transfer the2 trailing bytes.
     lda #PREFETCH_TAIL_BYTES_PER_ROW
     sta $df07
     lda #$91
@@ -1942,44 +1645,42 @@ frame_irq:
     bcc !ontime+
     jmp missed_frame
 !ontime:
-    .if (STATIC_RENDERER==0) {
-        lda playback_ended
-        ora fatal_error
-        beq !playing+
-        jsr audio_stop
-        lda playback_ended
-        beq !audio_ready+
-        lda #1
-        sta eof_audio_stopped
-        jmp !audio_ready+
+    lda playback_ended
+    ora fatal_error
+    beq !playing+
+    jsr audio_stop
+    lda playback_ended
+    beq !audio_ready+
+    lda #1
+    sta eof_audio_stopped
+    jmp !audio_ready+
 !playing:
-        jsr playback_control
-        lda playback_paused
-        bne !audio_ready+
-        lda audio_pending_start
-        beq !audio_ready+
-        ldx cache_read_bank
-        lda cache_ready,x
-        bne !buffered+
-        // Never start stale/in-flight PCM after an underrun.
-        jsr audio_stop
-        jmp !audio_ready+
+    jsr playback_control
+    lda playback_paused
+    bne !audio_ready+
+    lda audio_pending_start
+    beq !audio_ready+
+    ldx cache_read_bank
+    lda cache_ready,x
+    bne !buffered+
+    // Never start stale/in-flight PCM after an underrun.
+    jsr audio_stop
+    jmp !audio_ready+
 !buffered:
-        jsr audio_prepare
-        lda fatal_error
-        beq !pcm_valid+
-        jmp !audio_ready+
+    jsr audio_prepare
+    lda fatal_error
+    beq !pcm_valid+
+    jmp !audio_ready+
 !pcm_valid:
-        jsr audio_start
-        lda #0
-        sta audio_pending_start
-        lda pending_refill_mask
-        ora cache_need_refill
-        sta cache_need_refill
-        lda #0
-        sta pending_refill_mask
+    jsr audio_start
+    lda #0
+    sta audio_pending_start
+    lda pending_refill_mask
+    ora cache_need_refill
+    sta cache_need_refill
+    lda #0
+    sta pending_refill_mask
 !audio_ready:
-    }
     jsr lz_configure_prefetch
     ldy #ACTIVE_TOP
     sty scanout_row
@@ -2006,17 +1707,6 @@ line_edge:
     sta $d031
     stx $d031
     jsr render_line
-    // A completed kernel must still be on the intended physical row.
-    // This probes timing without changing any pre-pixel instruction.
-    tya
-    clc
-    adc #WIDE_FIRST_RASTER
-    cmp $d012
-    beq !line_ok+
-    inc upic_line_late_count
-    bne !line_ok+
-    inc upic_line_late_count+1
-!line_ok:
     iny
     sty scanout_row
     cpy #((ACTIVE_TOP+ACTIVE_HEIGHT)&255)
@@ -2025,14 +1715,11 @@ frame_finished:
     lda #0
     sta $dc0e
     lda $dc0d
-    .if (STATIC_RENDERER==0) { jsr buffered_blank_update }
+    jsr buffered_blank_update
     lda playback_paused
     bne !tick_counted+
     inc audio_tick_count
 !tick_counted:
-    inc video_frame_count
-    bne irq_restore
-    inc video_frame_count+1
 irq_restore:
     pla
     tay
@@ -2044,13 +1731,8 @@ missed_frame:
     lda #0
     sta $dc0e
     lda $dc0d
-    inc upic_missed_frames
-    bne !counted+
-    inc upic_missed_frames+1
-!counted:
     jmp irq_restore
 nmi_return:
-    inc nmi_count
     rti
 
 // Called from shadow $34; returns to shadow $34. Even tiny reads use the
@@ -2103,45 +1785,17 @@ cache_advance:
     rts
 
 buffered_blank_update:
-    lda #0
-    sta record_update_active
     lda playback_ended
     ora fatal_error
     ora playback_paused
     beq !active+
     rts
 !active:
-    lda $d012
-    sta update_raster_start
-    lda $d011
-    and #$80
-    sta update_raster_start_high
     lda #$34
     sta $01
     jsr apply_buffered_record
     lda #$35
     sta $01
-    lda $d012
-    sta update_raster_end
-    lda $d011
-    and #$80
-    sta update_raster_end_high
-    bne !done+
-    lda update_raster_start_high
-    bne !wrapped+
-    lda update_raster_end
-    cmp update_raster_start
-    bcs !done+
-!wrapped:
-    lda update_raster_end
-    cmp #FRAME_IRQ_RASTER
-    bcc !done+
-    inc deadline_miss_count
-    bne !done+
-    inc deadline_miss_count+1
-!done:
-    lda #0
-    sta record_update_active
     rts
 audio_prepare:
     jsr generic_audio_length
@@ -2196,10 +1850,6 @@ audio_prepare:
         lda #(voice==0 ? 0 : 15)
         sta base+2
     }
-    lda audio_resume_offset
-    sta audio_last_resume_offset
-    lda audio_resume_offset+1
-    sta audio_last_resume_offset+1
     lda #0
     sta audio_resume_offset
     sta audio_resume_offset+1

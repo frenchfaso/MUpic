@@ -1,19 +1,18 @@
-import * as wasmGlue from "./wasm.js";
+import "./wasm.js";
 // Rust owns SID state, sample clocks and the common mixer. The coordinator
 // retains one receiver; children transport raw contributions through atomics.
-const node = typeof process !== "undefined" && !!process.versions?.node;
-const { instantiateUE2 } = node ? wasmGlue.default : globalThis.UE2Wasm;
-let nodeThreads;
-const runtime = node ? import("node:worker_threads").then(value => { nodeThreads = value; }) : Promise.resolve();
-const send = (data, transfer = []) => node ? nodeThreads.parentPort.postMessage(data, transfer) : postMessage(data, transfer);
+const { instantiateUE2 } = globalThis.UE2Wasm;
+const wasmUrl = new URL("./ue2_web.wasm", import.meta.url);
+wasmUrl.search = new URL(import.meta.url).search;
+const send = (data, transfer = []) => postMessage(data, transfer);
 const MAX_EVENTS = 1_048_576, MAX_RAW = 384_000, RAW_BYTES = MAX_RAW * 4;
 const EPOCH = 0, EVENT_BYTES = 1, DONE = 2;
-const HEADER = 16, STRIDE = 16, COUNT = 0, MEMORY = 1, ERROR = 2;
+const HEADER = 16, STRIDE = 16, COUNT = 0, ERROR = 2;
 const TIMEOUT_MS = 30_000;
 let module, cpuPort, audioPort, control, samples;
 let capacity = 0, enabled = true, sampleRate = 48000;
 let serial = false, initialized = false, closing = false, quarantined = false;
-let leader = 0, activeMask = 0, shared = null, queue = Promise.resolve();
+let leader = 0, shared = null, queue = Promise.resolve();
 let clock = { lo: 0, hi: 0, hz: 985248 };
 const children = new Map(), pcmPool = [];
 const check = value => { if (value !== 0) throw new Error(module.UTF8ToString(module._ue2_error())); };
@@ -32,7 +31,7 @@ function publishPcm(pcm) {
     const read = Atomics.load(control, 0);
     let write = Atomics.load(control, 1);
     const frames = Math.floor(pcm.length / 2), free = capacity - 1 - ((write - read + capacity) % capacity);
-    if (frames > free) { Atomics.add(control, 3, frames); return 0; }
+    if (frames > free) return 0;
     for (let frame = 0; frame < frames; frame++) {
       samples[write * 2] = pcm[frame * 2] / 32768;
       samples[write * 2 + 1] = pcm[frame * 2 + 1] / 32768;
@@ -55,11 +54,11 @@ function publishPcm(pcm) {
   return 0;
 }
 
-function batchReturn(data, audioFramesSent, cpuMs) {
+function batchReturn(data, audioFramesSent) {
   const transfers = [data.buffer];
   if (data.sampler) transfers.push(data.sampler);
   cpuPort.postMessage({ type: "batch-return", buffer: data.buffer, sampler: data.sampler,
-    samplerSamples: data.samplerSamples, audioFramesSent, cpuMs }, transfers);
+    samplerSamples: data.samplerSamples, audioFramesSent }, transfers);
 }
 
 // Bound the mailbox before any SID state advances. Timing is still implemented
@@ -70,7 +69,7 @@ function preflight(data) {
   if (!Number.isSafeInteger(samplerCount) || samplerCount < 0 || samplerCount > MAX_RAW || samplerCount % 2 ||
       (samplerCount && (!(data.sampler instanceof ArrayBuffer) || samplerCount * 2 > data.sampler.byteLength))) throw new Error("Invalid SID sampler batch.");
   const words = new Uint32Array(data.buffer, 0, bytes / 4);
-  let { lo, hi, hz } = clock, frames = 0, needed = 0, first = 0, active = activeMask;
+  let { lo, hi, hz } = clock, frames = 0, needed = 0, first = 0;
   for (let i = 0; i < words.length; i += 4) {
     const header = words[i], kind = header & 255, reg = (header >>> 8) & 255, mask = header >>> 16;
     const value = words[i + 1], nextLo = words[i + 2], nextHi = words[i + 3];
@@ -79,8 +78,7 @@ function preflight(data) {
     if (kind < 1 || kind > 8 || (kind === 1 && (!one || value > 1)) || (kind === 2 && !one) ||
         (kind === 5 && (!one || (value & 65535) > 255 || (value >>> 16) > 255)) ||
         (kind === 3 && (reg > 31 || value > 255))) throw new Error("Invalid SID event payload.");
-    if (kind === 1) { needed |= mask; active |= mask; if (!first) first = mask; }
-    else if (kind === 2) active &= ~mask;
+    if (kind === 1) { needed |= mask; if (!first) first = mask; }
     else if (kind === 7) { lo = nextLo; hi = nextHi; }
     else if (kind === 8) {
       if (value < 100000 || value > 2000000) throw new Error("Invalid SID clock frequency.");
@@ -98,7 +96,7 @@ function preflight(data) {
       lo = nextLo; hi = nextHi;
     }
   }
-  return { lo, hi, hz, needed, first, active };
+  return { lo, hi, hz, needed, first };
 }
 
 function synth(events) {
@@ -118,7 +116,7 @@ function ensureMailbox() {
 async function spawnPartition(mask, bootstrap) {
   ensureMailbox();
   const index = children.size, rawBuffer = new SharedArrayBuffer(RAW_BYTES);
-  const worker = node ? new nodeThreads.Worker(new URL(import.meta.url)) : new Worker(new URL(import.meta.url), { type: "module" });
+  const worker = new Worker(new URL(import.meta.url), { type: "module" });
   let booted, ready, rejected, timer, settled = false;
   const boot = new Promise(resolve => { booted = resolve; });
   const started = new Promise((resolve, reject) => { ready = resolve; rejected = reject; });
@@ -137,13 +135,7 @@ async function spawnPartition(mask, bootstrap) {
       settled = true; clearTimeout(timer); record.starting = false; ready();
     } else if (data.type === "error") onError(data.message);
   };
-  if (node) {
-    worker.on("message", onMessage); worker.on("error", onError);
-    worker.on("exit", code => {
-      if (!closing && !record.termination) onError(new Error(`SID receiver ${mask} exited unexpectedly (${code}).`));
-    });
-  }
-  else { worker.onmessage = event => onMessage(event.data); worker.onerror = onError; }
+  worker.onmessage = event => onMessage(event.data); worker.onerror = onError;
   timer = setTimeout(() => onError(new Error("The SID partition did not start within 30 seconds.")), TIMEOUT_MS);
   // started is observed immediately; an import error may reject before boot.
   const bootAndStart = boot.then(() => {
@@ -219,18 +211,10 @@ function mixPartitions(data, count) {
   check(module._ue2_sid_mixer_finish(count));
 }
 
-function poolState() {
-  const masks = [];
-  for (let bit = 1; bit <= 256; bit <<= 1) if (activeMask & bit) masks.push(bit);
-  send({ type: "pool-state", sidWorkers: 1 + children.size, activeSids: masks.length, masks,
-    workerMasks: leader ? [leader, ...children.keys()] : [] });
-}
-
 async function processBatch(data) {
-  const begin = performance.now();
-  if (closing || quarantined) { batchReturn(data, 0, 0); return; }
+  if (closing || quarantined) { batchReturn(data, 0); return; }
   try {
-    const plan = preflight(data), previousWorkers = children.size, previousActive = activeMask;
+    const plan = preflight(data);
     const events = new Uint8Array(data.buffer, 0, data.byteLength);
     if (serial) {
       synth(events);
@@ -242,7 +226,7 @@ async function processBatch(data) {
       }
     } else {
       await ensurePartitions(plan);
-      if (closing || quarantined) { batchReturn(data, 0, performance.now() - begin); return; }
+      if (closing || quarantined) { batchReturn(data, 0); return; }
       publishEvents(events);
       let failure;
       try { synth(events); } catch (error) { failure = error; }
@@ -254,20 +238,18 @@ async function processBatch(data) {
       if (count > MAX_RAW) throw new Error("SID raw output exceeds its mailbox.");
       mixPartitions(data, count);
     }
-    clock = { lo: plan.lo, hi: plan.hi, hz: plan.hz }; activeMask = plan.active;
+    clock = { lo: plan.lo, hi: plan.hi, hz: plan.hz };
     const ptr = module._ue2_sid_audio(), count = module._ue2_sid_audio_samples();
     const audioFramesSent = enabled && ptr && count ? publishPcm(module.HEAP16.subarray(ptr >>> 1, (ptr >>> 1) + count)) : 0;
-    batchReturn(data, audioFramesSent, performance.now() - begin);
-    if (!serial && (activeMask !== previousActive || children.size !== previousWorkers)) poolState();
+    batchReturn(data, audioFramesSent);
   } catch (error) {
-    if (closing) batchReturn(data, 0, performance.now() - begin);
+    if (closing) batchReturn(data, 0);
     else fault(error);
   }
 }
 
 async function start(options) {
   if (module || initialized) throw new Error("The SID worker is already initialized.");
-  await runtime;
   sampleRate = options.sampleRate || 48000;
   cpuPort = options.cpuPort; audioPort = options.audioPort; enabled = Boolean(options.audioEnabled);
   if (!cpuPort) throw new Error("The SID CPU port is not connected.");
@@ -279,13 +261,13 @@ async function start(options) {
     audioPort.onmessage = ({ data }) => { if (data.type === "pcm-return" && data.buffer?.byteLength && pcmPool.length < 4) pcmPool.push(data.buffer); };
     audioPort.start();
   }
-  module = await instantiateUE2({ wasmModule: options.wasmModule,
+  module = await instantiateUE2({ wasmModule: options.wasmModule, wasmUrl,
     print: () => {}, printErr: message => send({ type: "log", message: String(message) }) });
   const abi = ["_ue2_sid_partition_control_init", "_ue2_sid_partition_select", "_ue2_sid_partition_snapshot",
     "_ue2_sid_partition_snapshot_bytes", "_ue2_sid_partition_snapshot_alloc", "_ue2_sid_partition_snapshot_import",
     "_ue2_sid_mixer_begin", "_ue2_sid_mixer_input_alloc", "_ue2_sid_mixer_add", "_ue2_sid_mixer_finish"];
   serial = typeof SharedArrayBuffer !== "function" || typeof Atomics.wait !== "function" ||
-    (!node && globalThis.crossOriginIsolated !== true) || abi.some(name => typeof module[name] !== "function");
+    globalThis.crossOriginIsolated !== true || abi.some(name => typeof module[name] !== "function");
   check(serial ? module._ue2_sid_init(sampleRate) : module._ue2_sid_partition_control_init(sampleRate));
   initialized = true;
   cpuPort.onmessage = ({ data }) => {
@@ -295,7 +277,6 @@ async function start(options) {
   cpuPort.start();
   send({ type: "ready", transport: control ? "shared-ring" : "transfer-port", sampling: "interpolate", wasmModule: module.wasmModule,
     ...(serial ? {} : { sidParallel: true, threading: "one-SID-per-worker" }) });
-  if (!serial) poolState();
 }
 
 async function shutdown() {
@@ -310,7 +291,6 @@ async function shutdown() {
 // imports metadata/cadence only; its fresh engine is constructed by that same
 // live full-stream Ensure, while established engines retain their phase.
 async function startPartition(options) {
-  await runtime;
   if (module) throw new Error("The SID partition is already initialized.");
   module = await instantiateUE2({ wasmModule: options.wasmModule, print: () => {}, printErr: () => {} });
   check(module._ue2_sid_partition_init(options.sampleRate, options.mask));
@@ -322,7 +302,6 @@ async function startPartition(options) {
   const mailbox = new Int32Array(options.controlBuffer), events = new Uint8Array(options.eventBuffer);
   const raw = new Int32Array(options.rawBuffer), base = HEADER + options.index * STRIDE;
   let seen = Atomics.load(mailbox, EPOCH);
-  Atomics.store(mailbox, base + MEMORY, module.memory.buffer.byteLength);
   send({ type: "partition-ready" });
   for (;;) {
     let epoch = Atomics.load(mailbox, EPOCH);
@@ -340,7 +319,6 @@ async function startPartition(options) {
       Atomics.store(mailbox, base + ERROR, 1);
       Atomics.store(mailbox, base + COUNT, 0);
     } finally {
-      Atomics.store(mailbox, base + MEMORY, module.memory.buffer.byteLength);
       Atomics.add(mailbox, DONE, 1);
       Atomics.notify(mailbox, DONE, 1);
     }
@@ -359,5 +337,5 @@ function onMainMessage(data) {
     queue = queue.then(shutdown).catch(error => { send({ type: "error", message: errorText(error) }); send({ type: "closed" }); });
   }
 }
-if (node) runtime.then(() => { nodeThreads.parentPort.on("message", onMainMessage); send({ type: "boot-ready" }); });
-else { self.onmessage = event => onMainMessage(event.data); send({ type: "boot-ready" }); }
+self.onmessage = event => onMainMessage(event.data);
+send({ type: "boot-ready" });

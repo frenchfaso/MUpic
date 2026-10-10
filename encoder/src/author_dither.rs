@@ -43,8 +43,6 @@ struct Candidate {
     len: usize,
     lab: [f64; 3],
     chroma: f64,
-    // Actual mean of the 64 displayed hardware cells, in linear-light sRGB.
-    mean_linear: [f64; 3],
     neutral: bool,
 }
 
@@ -124,6 +122,7 @@ impl SearchTree {
         id
     }
 
+    #[cfg(test)]
     fn nearest(&self, candidates: &[Candidate], query: [f64; 3]) -> usize {
         self.nearest_seeded(candidates, query, None)
     }
@@ -267,12 +266,7 @@ pub struct AuthorDither {
     neutral_tree: SearchTree,
     cache: HashMap<u32, usize>,
     neutral_guard: bool,
-    luma_limit: f64,
-    luma_range: f64,
     threads: usize,
-    max_workers_used: usize,
-    planning_batches: usize,
-    gpu_seeded_rgb_values: usize,
 }
 
 impl AuthorDither {
@@ -284,13 +278,12 @@ impl AuthorDither {
         // Telescoping sum of the 15 successive gaps, divided by 15.
         let luma_limit = luma_range * 7.0 / 15.0;
         let gamma_palette = palette.map(|p| p.map(|v| (f64::from(v) / 255.0).powf(GAMMA)));
-        let linear_palette = palette.map(|p| p.map(srgb_linear));
         let mut candidates = Vec::new();
         // Pure plans retain the hardware colour index as their plan id.
         for colour in 0..16 {
             let mut slots = [0; MAX_SLOTS];
             slots[0] = colour as u8;
-            candidates.push(make_candidate(slots, 1, &gamma_palette, &linear_palette));
+            candidates.push(make_candidate(slots, 1, &gamma_palette));
         }
         for len in 2..=MAX_SLOTS {
             let mut slots = [0; MAX_SLOTS];
@@ -304,7 +297,6 @@ impl AuthorDither {
                 &mut slots,
                 &mut candidates,
                 &gamma_palette,
-                &linear_palette,
             );
         }
         if candidates.is_empty()
@@ -323,12 +315,7 @@ impl AuthorDither {
             neutral_tree,
             cache: HashMap::new(),
             neutral_guard,
-            luma_limit,
-            luma_range,
             threads: default_threads(),
-            max_workers_used: 0,
-            planning_batches: 0,
-            gpu_seeded_rgb_values: 0,
         })
     }
 
@@ -467,12 +454,7 @@ impl AuthorDither {
             return;
         }
         self.cache.reserve(missing.len());
-        if seeds.is_some() {
-            self.gpu_seeded_rgb_values += missing.len();
-        }
         let workers = self.threads.min(missing.len().div_ceil(RGB_WORK_BATCH));
-        self.max_workers_used = self.max_workers_used.max(workers);
-        self.planning_batches += 1;
         #[cfg(not(target_arch = "wasm32"))]
         let next = AtomicUsize::new(0);
         // A single scoped pool drains the whole clip. Dynamic batches balance
@@ -619,56 +601,6 @@ impl AuthorDither {
     pub fn colour(&self, plan: usize, x: usize, y: usize) -> u8 {
         self.candidates[plan].colour(BAYER[(x & 7) + ((y & 7) << 3)])
     }
-
-    pub fn mean_linear(&self, plan: usize) -> [f64; 3] {
-        self.candidates[plan].mean_linear
-    }
-
-    pub fn is_mixed(&self, plan: usize) -> bool {
-        let c = &self.candidates[plan];
-        c.slots[..c.len].iter().any(|&slot| slot != c.slots[0])
-    }
-
-    pub fn metadata(&self) -> String {
-        let mut sizes = [0usize; MAX_SLOTS];
-        for candidate in &self.candidates {
-            sizes[candidate.len - 1] += 1;
-        }
-        format!(
-            concat!(
-                "{{\"algorithm\":\"Reconstruction of Yliluoma improved algorithm 1 from published pseudocode\",",
-                "\"source\":\"https://bisqwit.iki.fi/story/howto/dither/jy/\",",
-                "\"gamma\":2.2,\"matrix\":\"fixed Bayer8x8 at physical canvas coordinates\",",
-                "\"max_component_slots\":8,\"candidate_generation\":\"all nondecreasing palette multisets of 1..8 slots, repeated colours allowed\",",
-                "\"plans\":{},\"plans_by_slot_count\":{:?},\"cached_rgb_values\":{},",
-                "\"source_rgb_bits_per_channel\":8,\"neutral_guard\":{},",
-                "\"neutral_rule\":\"source max(RGB)-min(RGB)<=8; all components restricted to hardware indices0,1,11,12,15\",",
-                "\"requested_adaptations\":\"neutral guard added at user request; exact palette input retains its pure hardware colour\",",
-                "\"mixing\":\"gamma2.2 arithmetic mean then inverse gamma\",",
-                "\"metric\":\"CIEDE2000 squared; kL=kC=kH=1\",",
-                "\"lab_conversion\":\"article C-illuminant RGB matrix and encoded-RGB input; corrected C=sqrt(a*a+b*b)\",",
-                "\"luma\":\"encoded CCIR601, 299R+587G+114B\",",
-                "\"luma_range_limit\":{},\"palette_luma_range\":{},",
-                "\"luma_rule\":\"7*(max_luma-min_luma)/15, seven times the mean successive gap;46.6667% for16colours rather than treating article rounded45% as a second filter\",",
-                "\"search\":\"exact CIEDE2000 with conservative lightness/chroma rectangle bounds; full8-bit RGB cache; global unique RGB preplanning with a scoped dynamic worker pool\",",
-                "\"threads_requested\":{},\"max_workers_used\":{},\"work_batch_rgb_values\":{},\"planning_batches\":{},",
-                "\"gpu_seeded_rgb_values\":{},\"gpu_role\":\"optional approximate CIEDE2000-bound tree walk hints; exact f64 CPU refinement remains authoritative\",",
-                "\"statistics_mean\":\"actual64-cell output mean in linear-light sRGB; differs from ideal slot proportions for lengths3,5,6,7\",",
-                "\"stability\":\"same RGB and canvas position gives same hardware index; no frame index or neighbour error propagation\"}}"
-            ),
-            self.candidates.len(),
-            sizes,
-            self.cache.len(),
-            self.neutral_guard,
-            self.luma_limit,
-            self.luma_range,
-            self.threads,
-            self.max_workers_used,
-            RGB_WORK_BATCH,
-            self.planning_batches,
-            self.gpu_seeded_rgb_values,
-        )
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,10 +614,9 @@ fn enumerate(
     slots: &mut [u8; MAX_SLOTS],
     candidates: &mut Vec<Candidate>,
     gamma_palette: &[[f64; 3]; 16],
-    linear_palette: &[[f64; 3]; 16],
 ) {
     if depth == len {
-        candidates.push(make_candidate(*slots, len, gamma_palette, linear_palette));
+        candidates.push(make_candidate(*slots, len, gamma_palette));
         return;
     }
     for at in begin..order.len() {
@@ -704,17 +635,11 @@ fn enumerate(
             slots,
             candidates,
             gamma_palette,
-            linear_palette,
         );
     }
 }
 
-fn make_candidate(
-    slots: [u8; MAX_SLOTS],
-    len: usize,
-    gamma_palette: &[[f64; 3]; 16],
-    linear_palette: &[[f64; 3]; 16],
-) -> Candidate {
+fn make_candidate(slots: [u8; MAX_SLOTS], len: usize, gamma_palette: &[[f64; 3]; 16]) -> Candidate {
     let gamma_mean: [f64; 3] = std::array::from_fn(|axis| {
         slots[..len]
             .iter()
@@ -724,18 +649,11 @@ fn make_candidate(
     });
     let mixed_rgb = gamma_mean.map(|v| v.powf(1.0 / GAMMA));
     let lab = comparison_lab(mixed_rgb);
-    let mean_linear = std::array::from_fn(|axis| {
-        (0..64)
-            .map(|rank| linear_palette[usize::from(slots[rank * len / 64])][axis])
-            .sum::<f64>()
-            / 64.0
-    });
     Candidate {
         slots,
         len,
         lab,
         chroma: lab[1].hypot(lab[2]),
-        mean_linear,
         neutral: slots[..len].iter().all(|slot| NEUTRAL.contains(slot)),
     }
 }
@@ -752,18 +670,8 @@ fn encoded_luma([r, g, b]: [u8; 3]) -> f64 {
     299.0 * f64::from(r) + 587.0 * f64::from(g) + 114.0 * f64::from(b)
 }
 
-fn srgb_linear(v: u8) -> f64 {
-    let v = f64::from(v) / 255.0;
-    if v <= 0.04045 {
-        v / 12.92
-    } else {
-        ((v + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-// Keep the article's comparison-space conversion independently of the
-// physically linear sRGB mean used by the encoder's existing quality statistics.
-// This is not a claim that this historic matrix is a modern D65 sRGB transform.
+// Use the article's comparison-space conversion for the exact color metric.
+// This historical matrix is not a modern D65 sRGB transform.
 fn comparison_lab([r, g, b]: [f64; 3]) -> [f64; 3] {
     let xyz = [
         (0.488718 * r + 0.310680 * g + 0.200602 * b) / (0.488718 + 0.176204),
@@ -786,6 +694,7 @@ fn comparison_lab([r, g, b]: [f64; 3]) -> [f64; 3] {
 
 /// Correct CIEDE2000 squared, verified against Sharma/Wu/Dalal's supplementary
 /// Lab pairs: https://hajim.rochester.edu/ece/sites/gsharma/ciede2000/ .
+#[cfg(test)]
 fn ciede2000_squared(first: [f64; 3], second: [f64; 3]) -> f64 {
     ciede2000_precomputed(
         first,
@@ -939,13 +848,11 @@ mod tests {
         let mut palette = PALETTE;
         palette[1] = [255; 3];
         let gp = palette.map(|p| p.map(|v| (f64::from(v) / 255.).powf(GAMMA)));
-        let lp = palette.map(|p| p.map(srgb_linear));
-        let c = make_candidate([0, 1, 1, 0, 0, 0, 0, 0], 3, &gp, &lp);
+        let c = make_candidate([0, 1, 1, 0, 0, 0, 0, 0], 3, &gp);
         let rgb = (2.0_f64 / 3.0).powf(1. / GAMMA);
         assert_eq!(c.lab, comparison_lab([rgb; 3]));
         let count = (0..64).filter(|&rank| c.colour(rank) == 1).count();
         assert_eq!(count, 42);
-        assert_eq!(c.mean_linear, [42. / 64.; 3]);
         let mut ranks = BAYER;
         ranks.sort_unstable();
         assert_eq!(ranks, std::array::from_fn(|i| i));
@@ -957,7 +864,7 @@ mod tests {
         assert_eq!(d.candidates.len(), 99384);
         for (index, &rgb) in PALETTE.iter().enumerate() {
             let plan = d.plan(rgb);
-            assert!(!d.is_mixed(plan));
+            assert_eq!(plan, index);
             for y in 0..8 {
                 for x in 0..8 {
                     assert_eq!(d.colour(plan, x, y), index as u8);
@@ -994,7 +901,7 @@ mod tests {
         for c in &d.candidates {
             let lo = encoded_luma(PALETTE[usize::from(c.slots[0])]);
             let hi = encoded_luma(PALETTE[usize::from(c.slots[c.len - 1])]);
-            assert!(hi - lo <= d.luma_limit);
+            assert!(hi - lo <= (encoded_luma(PALETTE[1]) - encoded_luma(PALETTE[0])) * 7.0 / 15.0);
         }
         let mut seed = 123456789u32;
         for _ in 0..50 {
@@ -1049,7 +956,6 @@ mod tests {
         assert_eq!([first[2], first[1], first[0]], second[..]);
         assert_eq!(first[0], first[3]);
         assert_eq!(d.cache.len(), 3);
-        assert!(d.metadata().contains("\"source_rgb_bits_per_channel\":8"));
     }
 
     #[test]
@@ -1071,21 +977,14 @@ mod tests {
             let got = parallel.frame_plans(&source);
             assert_eq!(got, expected);
             assert_eq!(parallel.cache.len(), reference.cache.len());
-            assert_eq!(parallel.planning_batches, 1);
-            assert!(parallel.max_workers_used > 1);
             for (i, &plan) in got.iter().enumerate() {
                 assert_eq!(
                     parallel.colour(plan, i % 320, i / 320),
                     reference.colour(expected[i], i % 320, i / 320)
                 );
-                assert_eq!(
-                    parallel.mean_linear(plan),
-                    reference.mean_linear(expected[i])
-                );
             }
             let rev: Vec<_> = source.chunks_exact(3).rev().flatten().copied().collect();
             parallel.frame_plans(&rev);
-            assert_eq!(parallel.planning_batches, 1);
         }
     }
 

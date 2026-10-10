@@ -284,7 +284,7 @@ export class CrtPresenter {
     this.canvas=canvas; this.device=device; this.context=context; this.format=navigator.gpu.getPreferredCanvasFormat();
     context.configure({device,format:this.format,alphaMode:"opaque"});
     this.params=new Float32Array(8); this.enabled=true; this.ready=false; this.shader=null;
-    this.frames=0; this.completedFrames=0; this.inFlight=0; this.maxInFlight=0; this.measurement=null; this.submitCpuMs=0;
+    this.inFlight=0;
     this.failure=onFailure; this.lastFrameId=null; this.lastEmuMs=null;
   }
   async configure(shader,defaults) {
@@ -296,7 +296,7 @@ export class CrtPresenter {
   resetHistory() { if (this.chain) this.chain.resetPending=true; this.lastFrameId=null; this.lastEmuMs=null; }
   draw(frame) {
     if (!this.ready||this.inFlight>=2) return false;
-    const started=performance.now(),bounds=this.canvas.getBoundingClientRect();
+    const bounds=this.canvas.getBoundingClientRect();
     // The phosphor mask is an output-pixel effect: render at physical resolution.
     // A second nearest-neighbour CSS enlargement produces broad coloured bands.
     const factor=Math.min(window.devicePixelRatio||1,this.device.limits.maxTextureDimension2D/Math.max(1,bounds.width,bounds.height));
@@ -306,14 +306,10 @@ export class CrtPresenter {
     this.lastFrameId=frame.frameId; this.lastEmuMs=frame.emuMs;
     const encoder=this.device.createCommandEncoder({label:"Commodore 1702 Guest PAL frame"});
     this.chain.render(encoder,frame,width,height,this.context.getCurrentTexture().createView(),this.enabled);
-    this.device.queue.submit([encoder.finish()]); this.inFlight++; this.maxInFlight=Math.max(this.maxInFlight,this.inFlight);
-    if (this.measurement) this.measurement.maxInFlight=Math.max(this.measurement.maxInFlight,this.inFlight);
+    this.device.queue.submit([encoder.finish()]); this.inFlight++;
     this.device.queue.onSubmittedWorkDone().then(()=>{
-      this.inFlight--; this.completedFrames++;
-      if (this.measurement) { const at=performance.now(); this.measurement.maxGapMs=Math.max(this.measurement.maxGapMs,at-this.measurement.lastCompletedAt); this.measurement.lastCompletedAt=at; }
+      this.inFlight--;
     }).catch(error=>{this.inFlight--; this.failure(`WebGPU: ${error.message||error}`);});
-    this.frames++; this.submitCpuMs+=performance.now()-started; return true;
+    return true;
   }
-  beginMeasurement() { this.measurement={lastCompletedAt:performance.now(),maxGapMs:0,maxInFlight:this.inFlight}; }
-  measurementGapMs() { return this.measurement?Math.max(this.measurement.maxGapMs,performance.now()-this.measurement.lastCompletedAt):0; }
 }

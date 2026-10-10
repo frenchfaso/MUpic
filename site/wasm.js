@@ -64,7 +64,8 @@ async function instantiateUE2({ wasmModule, wasmUrl, print = () => {}, printErr 
   let compiled = wasmModule;
   if (!compiled) {
     const url = wasmUrl || new URL("./ue2_web.wasm", globalThis.location.href);
-    const response = await fetch(url);
+    if (!wasmUrl) url.search = new URL(globalThis.location.href).search;
+    const response = await fetch(url, { cache: "no-cache" });
     if (!response.ok) throw new Error(`ue2_web.wasm: HTTP ${response.status}`);
     const mime = response.headers.get("Content-Type")?.split(";")[0].trim();
     compiled = WebAssembly.compileStreaming && mime === "application/wasm"
@@ -81,12 +82,12 @@ async function instantiateUE2({ wasmModule, wasmUrl, print = () => {}, printErr 
       ? remoteRead(offset >>> 0, length >>> 0, destination >>> 0, instance.exports.memory) : -1,
     log: (ptr, length) => {
       if (!instance) pendingLogs.push({ ptr, length });
-      else print(decodeLog(ptr, length));
+      else printErr(decodeLog(ptr, length));
     },
   } };
   try {
     instance = await WebAssembly.instantiate(compiled, imports);
-    for (const message of pendingLogs) print(decodeLog(message.ptr, message.length));
+    for (const message of pendingLogs) printErr(decodeLog(message.ptr, message.length));
     return adaptUE2(instance, compiled);
   } catch (error) {
     printErr(`Rust WASM: ${error.message || error}`);

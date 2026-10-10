@@ -1,5 +1,5 @@
 //! Shared bounded-memory encoder used by the CLI and isolated browser workers.
-use crate::{author_dither::AuthorDither, dict4_rate, sample_at_tick, wide_dict4};
+use crate::{audio::sample_at_tick, author_dither::AuthorDither, dict4_rate, sd};
 use sha2::{Digest, Sha256};
 
 pub const VIDEO_WIDTH: usize = 360;
@@ -127,9 +127,6 @@ impl Quantizer {
         }
         packed
     }
-    pub fn metadata(&self) -> String {
-        self.author.metadata()
-    }
     pub fn author_mut(&mut self) -> &mut AuthorDither {
         &mut self.author
     }
@@ -190,7 +187,6 @@ pub struct Encoder {
     finished: bool,
     pub peak_slots: usize,
     pub adapted_frames: usize,
-    pub last_rate_report: String,
 }
 impl Encoder {
     pub fn new(frames: usize, pcm: Vec<u8>, title: String) -> Result<Self, String> {
@@ -210,7 +206,7 @@ impl Encoder {
             pcm,
             initial: vec![],
             previous: vec![],
-            metric: dict4_rate::Prepared::with_geometry(&PALETTE, 0, 200, 200),
+            metric: dict4_rate::Prepared::new(&PALETTE),
             block: vec![0; CACHE_BYTES],
             cursor: 0,
             ticks_in_block: 0,
@@ -222,7 +218,6 @@ impl Encoder {
             finished: false,
             peak_slots: 0,
             adapted_frames: 0,
-            last_rate_report: String::new(),
         })
     }
     pub fn push(&mut self, packed: &[u8]) -> Result<(), String> {
@@ -234,15 +229,11 @@ impl Encoder {
             self.initial = exact.clone();
             exact
         } else {
-            let mut pair = self.previous.clone();
-            pair.extend_from_slice(&exact);
-            let (projected, report) =
-                self.metric
-                    .convert(&pair, RATE_BUDGET, wide_dict4::sd_peak)?;
-            let after = projected[PAGE_FRAME_BYTES..].to_vec();
+            let after = self
+                .metric
+                .project(&self.previous, &exact, RATE_BUDGET, sd::peak)?;
             self.adapted_frames += usize::from(after != exact);
-            self.last_rate_report = report;
-            let (records, peak) = wide_dict4::sd_group(&self.previous, Some(&after))?;
+            let (records, peak) = sd::group(&self.previous, Some(&after))?;
             if peak > RATE_BUDGET {
                 return Err(format!(
                     "Qualified cost model exceeds budget: {peak}/{RATE_BUDGET}"
@@ -323,7 +314,7 @@ impl Encoder {
                 self.frames, self.received
             ));
         }
-        let (holds, peak) = wide_dict4::sd_group(&self.previous, None)?;
+        let (holds, peak) = sd::group(&self.previous, None)?;
         self.peak_slots = self.peak_slots.max(peak);
         for record in holds {
             self.packet(&record)?;
@@ -404,6 +395,48 @@ fn stream_offset(frames: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn draining_cache_blocks_preserves_pcm_timing_and_zero_pads_the_tail() {
+        let frames = 9;
+        let ticks = frames * FRAME_TICKS;
+        let pcm: Vec<u8> = (0..sample_at_tick(ticks - 1, AUDIO_DIVIDER) * 2)
+            .flat_map(|n| (n as u16).to_le_bytes())
+            .collect();
+        let mut encoder = Encoder::new(frames, pcm.clone(), "Cache boundary".into()).unwrap();
+        let mut stream = Vec::new();
+        for _ in 0..frames {
+            encoder.push(&vec![0; PACKED_BYTES]).unwrap();
+            stream.extend(encoder.take_output());
+        }
+        let prefix = encoder.finish().unwrap();
+        stream.extend(encoder.take_output());
+        assert_eq!(stream.len(), 2 * CACHE_BYTES);
+        assert_eq!(&prefix[128..160], &Sha256::digest(&stream)[..]);
+        let mut reconstructed_pcm = Vec::new();
+        for (block, count) in [CACHE_TICKS, ticks - CACHE_TICKS].into_iter().enumerate() {
+            let length_at = 256 + block * 3;
+            let length = usize::from(prefix[length_at])
+                | usize::from(prefix[length_at + 1]) << 8
+                | usize::from(prefix[length_at + 2]) << 16;
+            let expected = (sample_at_tick(block * CACHE_TICKS + count, AUDIO_DIVIDER)
+                - sample_at_tick(block * CACHE_TICKS, AUDIO_DIVIDER))
+                * 4;
+            assert_eq!(length, expected);
+            let audio_at = block * CACHE_BYTES + AUDIO_OFFSET;
+            reconstructed_pcm.extend_from_slice(&stream[audio_at..audio_at + length]);
+            let mut cursor = block * CACHE_BYTES;
+            for _ in 0..count {
+                let bytes =
+                    u16::from_le_bytes(stream[cursor..cursor + 2].try_into().unwrap()) as usize;
+                assert!(bytes >= 2);
+                cursor += 2 + bytes;
+            }
+            assert_eq!(&stream[cursor..cursor + 2], &[0, 0]);
+        }
+        assert_eq!(&reconstructed_pcm[..pcm.len()], &pcm);
+        assert!(reconstructed_pcm[pcm.len()..].iter().all(|&v| v == 0));
+        assert!(encoder.finish().is_err());
+    }
     #[test]
     fn emitted_mup_has_valid_hashes_crc_pcm_and_sd_geometry() {
         let mut a = vec![0; PACKED_BYTES];

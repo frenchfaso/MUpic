@@ -72,6 +72,5 @@ def main():
     m['mupic']['disk']=dict(url=f'media/{sha}/',bytes=size,sha256=sha,transport='chunks',chunks=hashes,compression=o.compression,storedBytes=stored,chunkBytes=CHUNK,cacheBytes=16<<20,regions=disk_regions(image))
     p.write_text(json.dumps(m,indent=2)+'\n')
     out=dict(schema='mupic-pages-media-v1',image_sha256=sha,disk_bytes=size,downloadable_chunk_bytes=total,uncompressed_nonzero_chunk_bytes=inflated,compression=o.compression,chunk_bytes=CHUNK,total_chunks=len(hashes),zero_chunks=hashes.count(None),movies=[r['name'] for r in m['mupic']['disk']['regions']])
-    (site/'media-manifest.json').write_text(json.dumps(out,indent=2)+'\n')
     print(json.dumps(out,indent=2))
 if __name__=='__main__':main()

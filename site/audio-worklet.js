@@ -8,7 +8,6 @@ class UE2AudioProcessor extends AudioWorkletProcessor {
     this.target = this.initialTarget;
     this.left = new Float32Array(this.capacity); this.right = new Float32Array(this.capacity);
     this.read = 0; this.write = 0; this.available = 0; this.primed = false; this.enabled = false;
-    this.underflows = 0; this.droppedFrames = 0; this.statsCountdown = sampleRate / 2;
     this.consumedFrames = 0; this.receivedFrames = 0; this.clockCountdown = 0;
     const ring = options.processorOptions?.ring;
     if (ring) {
@@ -55,7 +54,7 @@ class UE2AudioProcessor extends AudioWorkletProcessor {
   append(samples) {
     const frames = Math.floor(samples.length / 2), skip = Math.max(0, frames - this.capacity), incoming = frames - skip;
     const discard = Math.max(0, this.available + incoming - this.capacity);
-    this.read = (this.read + discard) % this.capacity; this.available -= discard; this.droppedFrames += discard + skip;
+    this.read = (this.read + discard) % this.capacity; this.available -= discard;
     for (let frame = skip; frame < frames; frame++) {
       this.left[this.write] = samples[frame * 2] / 32768; this.right[this.write] = samples[frame * 2 + 1] / 32768;
       this.write = (this.write + 1) % this.capacity;
@@ -71,7 +70,6 @@ class UE2AudioProcessor extends AudioWorkletProcessor {
     if (this.control) {
       sharedRead = Atomics.load(this.control, 0);
       this.available = (Atomics.load(this.control, 1) - sharedRead + this.capacity) % this.capacity;
-      this.droppedFrames = Atomics.load(this.control, 3);
     }
     if (this.enabled && !this.primed && this.available >= this.target) {
       this.primed = true;
@@ -106,7 +104,7 @@ class UE2AudioProcessor extends AudioWorkletProcessor {
       this.consumedFrames += count;
       if (this.control) Atomics.add(this.control, 6, count);
       this.available -= count;
-      if (count < left.length) { this.underflows++; if (this.control) Atomics.store(this.control, 2, this.underflows); this.primed = false; }
+      if (count < left.length) this.primed = false;
     }
     // Fully populated quanta need no silence fill. Partial or cold quanta keep
     // the exact silent tail and underrun behavior of the previous output path.
@@ -115,13 +113,6 @@ class UE2AudioProcessor extends AudioWorkletProcessor {
     if (this.clockPort && this.clockCountdown <= 0) {
       this.clockCountdown += Math.ceil(sampleRate * 0.016);
       this.publishClock();
-    }
-    this.statsCountdown -= left.length;
-    if (this.statsCountdown <= 0) {
-      this.statsCountdown += sampleRate / 2;
-      this.port.postMessage({ queuedMs: this.available / sampleRate * 1000, underflows: this.underflows,
-        droppedFrames: this.droppedFrames, initialPrimingMs: this.initialTarget / sampleRate * 1000,
-        recoveryPrimingMs: this.recoveryTarget / sampleRate * 1000 });
     }
     return true;
   }

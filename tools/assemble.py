@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Assemble and validate fresh C64 artifacts before replacing a working build."""
 
-import argparse
 import os
 from pathlib import Path
 import re
@@ -132,20 +131,3 @@ def assemble(source: Path, output: Path) -> None:
             stage,
         )
         print(f"Published {output}: {end - start} bytes at ${start:04x}..${end - 1:04x}")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source", nargs="?", type=Path, default=ROOT / "src/wolf-poc.asm")
-    parser.add_argument("output", nargs="?", type=Path, default=ROOT / "build/wolf-poc.prg")
-    args = parser.parse_args()
-    try:
-        assemble(args.source, args.output)
-    except (AssemblyError, OSError) as error:
-        print(f"Assembly failed: {error}", file=sys.stderr)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

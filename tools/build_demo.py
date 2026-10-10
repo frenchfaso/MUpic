@@ -5,15 +5,21 @@ from pathlib import Path
 from package_disk import build_image, sha256_file
 ROOT = Path(__file__).resolve().parent.parent
 
-def version_converter_entrypoint(site):
-    """A refreshed HTML page must not reuse a cached previous converter."""
-    version = sha256_file(site/'converter.mjs')[:16]
-    page = site/'convert.html'
-    text, count = re.subn(r'(src="(?:\./)?converter\.mjs)(?:\?[^" ]*)?(")',
-                         lambda match: match[1]+'?v='+version+match[2], page.read_text())
-    if count != 1:
-        raise ValueError('Expected one converter module entrypoint')
-    page.write_text(text)
+def version_browser_entrypoints(site):
+    """Refresh entrypoints and their workers whenever a deployed module changes."""
+    digest = hashlib.sha256()
+    for source in sorted(site.rglob('*')):
+        if source.suffix in {'.js', '.mjs', '.wasm'} and source.is_file():
+            digest.update(source.relative_to(site).as_posix().encode()+b'\0')
+            digest.update(source.read_bytes())
+    version = digest.hexdigest()[:16]
+    for name, module in [('index.html', 'app.js'), ('convert.html', 'converter.mjs')]:
+        page = site/name
+        text, count = re.subn(r'(src="(?:\./)?'+re.escape(module)+r')(?:\?[^" ]*)?(")',
+                             lambda match: match[1]+'?v='+version+match[2], page.read_text())
+        if count != 1:
+            raise ValueError(f'Expected one {module} entrypoint')
+        page.write_text(text)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -47,7 +53,7 @@ def main():
     subprocess.run([sys.executable, str(ROOT/'tools'/'stage_media.py'), str(args.output),
                     '--expected-sha256', report['image_sha256'], '--site', str(args.site),
                     '--compression', 'gzip'], check=True)
-    version_converter_entrypoint(args.site)
+    version_browser_entrypoints(args.site)
 
 if __name__ == '__main__':
     main()
