@@ -1,8 +1,10 @@
 import "./wasm.js";
-import { RemoteDisk } from "./remote-disk.js";
+import { RemoteDisk } from "./remote-disk.js?v=19b858e4a836d6d0";
 import { fetchBytes } from "./fetch-bytes.mjs";
+import { EmulatedKeys } from "./emulated-keys.mjs?v=aca3ab369e0476a1";
 const { instantiateUE2 } = globalThis.UE2Wasm;
 const wasmUrl = new URL("./ue2_web.wasm", import.meta.url);
+const emulatedKeys = new EmulatedKeys((index, down) => module._ue2_key(index, down ? 1 : 0));
 wasmUrl.search = new URL(import.meta.url).search;
 // CPU, VIC and CIA share bus timing. A separate SID worker replays timestamped
 // Rust events; no mutable chip state is shared concurrently across threads.
@@ -100,6 +102,9 @@ async function start(options) {
   if (!Array.isArray(manifest.core) || !Array.isArray(manifest.mupic?.assets)) throw new Error("Invalid file manifest.");
   if (!manifest.mupic.disk) throw new Error("MUpic disk manifest is missing.");
   remoteDisk = new RemoteDisk(manifest.mupic.disk);
+  // Warm both movie openings silently while firmware and ROMs load. A demand
+  // retries any failed speculative download through the ordinary disk path.
+  remoteDisk.preloadMovies().catch(() => {});
   module = await instantiateUE2({
     wasmModule: options.wasmModule,
     wasmUrl,
@@ -147,6 +152,7 @@ function resume() {
   send("state", { state: "running" }); scheduleTick();
 }
 function pause() {
+  emulatedKeys.reset();
   releaseJoysticks();
   if (!running) return;
   running = false;
@@ -274,6 +280,7 @@ async function tick() {
       if (next < emuMs) throw new Error("Emulator time moved backwards.");
       if (next > emuMs) lastEmuProgressHost = performance.now();
       emuMs = next;
+      emulatedKeys.advance(emuMs);
       // Capture the stable VIC `displayed` buffer before stepping far enough
       // for the next phase. Rust caps each step at four emulated milliseconds.
       publishVideo(); publishSid();
@@ -321,7 +328,8 @@ self.onmessage = ({ data }) => {
           anchorAudioClock();
         }
         break;
-      case "key": if (Number.isInteger(data.index) && data.index >= 0 && data.index < 64) module._ue2_key(data.index, data.down ? 1 : 0); break;
+      case "key": if (running && Number.isInteger(data.index) && data.index >= 0 && data.index < 64) emulatedKeys.set(data.index, data.down, emuMs); break;
+      case "release-keys": emulatedKeys.reset(); break;
       case "joystick":
         if (Number.isInteger(data.port) && data.port >= 1 && data.port <= 2 &&
             Number.isInteger(data.lines) && data.lines >= 0 && data.lines <= 0xff) {

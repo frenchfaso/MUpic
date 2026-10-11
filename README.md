@@ -23,9 +23,11 @@ The complete table is generated offline and distributed as a losslessly compress
 
 Checksums and an algorithm/palette fingerprint protect loading and cache reuse. The CLI caches the expanded asset in the system user-cache directory (`--cache-dir PATH` overrides it). Use `mupic-encoder --prepare-lut` to warm this cache, or `--no-cache` for ordinary exact color search. Unavailable browser storage still allows acceleration for the current page. Clearing storage requires downloading the compressed asset again. Palette or algorithm changes require regenerating it offline.
 
-Copy `movie.mup` and `MUPIC.PRG` to a FAT32 USB stick. Use PAL, 64 MHz, HDMI SD output with 4:3 shape, 16 MB REU with preload disabled, command interface enabled, and UltimateAudio at `$DF20–DFFF`. Set sampler L/R volume to 0 dB and pan left/right; see the [reference configuration](releases/ultimate-pal.cfg).
+Copy `movie.mup` and `MUPIC.PRG` to a FAT32 USB stick. Use PAL, 64 MHz, HDMI SD output with 4:3 shape, at least 2 MB REU with preload disabled, command interface enabled, and UltimateAudio at `$DF20–DFFF`. Set sampler L/R volume to 0 dB and pan left/right; see the [reference configuration](releases/ultimate-pal.cfg).
 
 Run the PRG from the Ultimate file browser. Arrow keys select, Return plays, Left goes up a directory, Space pauses, and RUN/STOP returns to the list. EOF returns to the browser. Playback uses two 256 KiB REU cache slots. Physical hardware validation remains outstanding.
+
+The web demo silently preloads about nine seconds of both movies during startup and maintains that reserve for the playing movie within its 16 MiB browser cache. Audio starts automatically when browser policy permits; otherwise the first click, tap or key on the page enables it.
 
 ## Build and run locally
 

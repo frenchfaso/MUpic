@@ -12,6 +12,8 @@ def version_browser_entrypoints(site):
     # Hash dependencies before their importers so cached workers cannot combine
     # a previous adapter with a new raw-WASM ABI.
     for parent, child in [
+        ('worker.js', 'remote-disk.js'),
+        ('worker.js', 'emulated-keys.mjs'),
         ('app.js', 'mobile-keyboard.mjs'),
         ('worker-pool.mjs', 'lut-cache.mjs'),
         ('quantizer-worker.mjs', 'wasm-core.mjs'),

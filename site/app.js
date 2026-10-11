@@ -34,7 +34,7 @@ const AUDIO_SAMPLE_RATE = 48000;
 let audioRequest = 0;
 let audioHandshake = 0;
 const audioReadyWaiters = new Map();
-// Prepare worker endpoints before boot; output starts in a real user gesture.
+// Prepare worker endpoints before boot; autoplay is attempted when permitted.
 let workerAudioTransport = null;
 let generation = 0;
 const gamepadInput = new GamepadInput();
@@ -142,7 +142,7 @@ async function ensureAudio() {
     audioContext = new AudioContextClass({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
   }
   if (audioContext.sampleRate !== AUDIO_SAMPLE_RATE) throw new Error("This browser cannot create the required 48 kHz audio output.");
-  // Create and resume within the user gesture, before the first await.
+  // Resume before the first await so a fallback user gesture can unlock audio.
   const resumed = audioContext.resume();
   if (!audioSetup) {
     const setup = (async () => {
@@ -167,7 +167,6 @@ async function ensureAudio() {
 }
 
 async function setAudio(enabled) {
-  audioAutoStartPending = false;
   const request = ++audioRequest;
   cancelAudioActivation();
   audioEnabled = Boolean(enabled);
@@ -176,6 +175,7 @@ async function setAudio(enabled) {
     try {
       await ensureAudio();
       if (request !== audioRequest) return;
+      audioAutoStartPending = false;
     } catch (error) {
       if (request !== audioRequest) return;
       audioEnabled = false;
@@ -190,10 +190,13 @@ async function setAudio(enabled) {
 function activateAudioFromInput(event) {
   // Escape and browser shortcuts need not grant activation. Keep auto-start
   // available for the next usable gesture instead of creating suspended audio.
-  if (!audioAutoStartPending || !event.isTrusted || event.code === "Escape"
+  if (!audioAutoStartPending || !event.isTrusted || event.repeat || event.metaKey || event.ctrlKey || event.code === "Escape"
       || navigator.userActivation?.isActive === false) return;
   setAudio(true);
 }
+// A suspended autoplay request must not prevent a later gesture from retrying.
+for (const type of ["pointerdown", "pointerup", "click", "keydown"])
+  window.addEventListener(type, activateAudioFromInput, { capture: true });
 
 function stopSidWorker(instance) {
   // A reset clears sidWorker immediately. Later resets and error recovery must
@@ -236,6 +239,7 @@ async function start() {
   if (token !== generation) return;
   releaseAudioTransport();
   workerAudioTransport = prepareAudioTransport(token);
+  if (audioAutoStartPending) setAudio(true);
   try {
     if (!presenter) presenter = await CrtPresenter.create(canvas, showError);
     if (token !== generation) return;
@@ -458,6 +462,7 @@ function releaseAllKeys() {
   mobilePulses?.reset();
   nativeKeyboardInput?.reset();
   for (const source of [...held.keys()]) release(source);
+  worker?.postMessage({ type: "release-keys" });
 }
 
 const acceptsMobileInput = () => state.workerReady && state.state === "running" && !document.hidden;
@@ -496,7 +501,7 @@ window.visualViewport?.addEventListener("resize", updateKeyboardViewport);
 for (const button of mobileControls.querySelectorAll("[data-player-key]")) {
   const tap = event => {
     if (!acceptsMobileInput()) return;
-    event.preventDefault();activateAudioFromInput(event);
+    event.preventDefault();
     mobilePulses.add(keys[button.dataset.playerKey]);
   };
   button.addEventListener("pointerdown", tap);
@@ -530,7 +535,7 @@ window.addEventListener("keydown", (event) => {
     if (["Enter", "NumpadEnter", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape"].includes(code)) {
       event.preventDefault();
       nativeKeyboardInput.suppressKey(code);
-      if (!event.repeat) {activateAudioFromInput(event);mobilePulses.add(keys[code]);}
+      if (!event.repeat) mobilePulses.add(keys[code]);
     }
     return;
   }
@@ -539,7 +544,6 @@ window.addEventListener("keydown", (event) => {
   if (!mapped) return;
   event.preventDefault();
   if (!event.repeat) {
-    activateAudioFromInput(event);
     press(event.code, mapped);
   }
 });
@@ -552,12 +556,11 @@ window.addEventListener("blur", () => { hideMobileKeyboard(); releaseGamepad(); 
 canvas.addEventListener("blur", releaseAllKeys);
 canvas.addEventListener("pointerdown", event => {
   if (event.isTrusted && ["touch", "pen"].includes(event.pointerType) && acceptsMobileInput()) {
-    event.preventDefault();activateAudioFromInput(event);
+    event.preventDefault();
     mobileKeyboard.focus({ preventScroll: true });
   } else canvas.focus({ preventScroll: true });
 });
 canvas.addEventListener("pointercancel", releaseAllKeys);
-canvas.addEventListener("click", activateAudioFromInput);
 function onVisibilityChange() {
   if (document.hidden) {
     videoWasHidden = true;

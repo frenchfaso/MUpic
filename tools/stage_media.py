@@ -38,7 +38,13 @@ def disk_regions(image):
             else:
                 if cluster >= 0xffffff8:
                     offset = data + (first - 2) * cluster_bytes
-                    regions.append({"name": entry[:8].decode("ascii").rstrip() + ".MUP", "start": offset, "end": offset + size})
+                    region = {"name": entry[:8].decode("ascii").rstrip() + ".MUP", "start": offset, "end": offset + size}
+                    f.seek(offset); header = f.read(256)
+                    if len(header) == 256 and header[:4] == b"MUP9":
+                        stream = struct.unpack_from("<I", header, 56)[0]
+                        if 256 <= stream < size:
+                            region["streamStart"] = offset + stream
+                    regions.append(region)
         return regions
 
 def main():

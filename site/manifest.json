@@ -51,8 +51,8 @@
       {
         "url": "data/mupic.cfg",
         "path": "/mupic.cfg",
-        "bytes": 523,
-        "sha256": "faa61f66b399deee3584b3a6eccd48357052acf60c867f17725dd49277ca911c"
+        "bytes": 522,
+        "sha256": "494ca6723c3582ed6f58a094cbbfbb48c847a244b828598821ed834a7a338feb"
       },
       {
         "url": "data/mupic.prg",
@@ -4173,12 +4173,14 @@
         {
           "name": "BUNNY.MUP",
           "start": 2113536,
-          "end": 419250176
+          "end": 419250176,
+          "streamStart": 2179072
         },
         {
           "name": "CYBER77.MUP",
           "start": 419250176,
-          "end": 458899456
+          "end": 458899456,
+          "streamStart": 419315712
         }
       ]
     }

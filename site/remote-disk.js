@@ -1,5 +1,7 @@
 // Read-only USB disk: HTTP ranges live in a bounded host cache, never a whole
 // image in WASM. A miss yields to fetch while Rust holds the guest clock.
+// MUP9 stores 20 PAL ticks in each 256 KiB block. Keep about nine seconds ahead.
+const MOVIE_AHEAD_BYTES = Math.ceil(9 * (985248 / (63 * 312)) / 20) * 262144;
 export class RemoteDisk {
   constructor({ url, bytes, regions = [], chunkBytes = 262144, cacheBytes = 16777216,
     transport = "range", chunks = null, compression = "none", storedBytes = null },
@@ -25,11 +27,17 @@ export class RemoteDisk {
     this.transport = transport; this.chunks = chunks; this.compression = compression; this.storedBytes = storedBytes;
     this.capacity = cacheBytes / chunkBytes;
     this.regions = regions.filter(r => Number.isSafeInteger(r.start) && Number.isSafeInteger(r.end) &&
-      r.start >= 0 && r.end > r.start && r.end <= bytes);
+      r.start >= 0 && r.end > r.start && r.end <= bytes &&
+      (r.streamStart === undefined || (Number.isSafeInteger(r.streamStart) && r.streamStart >= r.start && r.streamStart < r.end)));
     this.fetcher = fetcher;
     this.cache = new Map(); this.inflight = new Map(); this.controllers = new Set();
     this.demand = null; this.failure = null; this.etag = null; this.closed = false;
     this.lastChunk = new Map();
+    this.playback = null;
+    this.movieWindows = new Map();
+    const movies = this.regions.filter(r => r.streamStart !== undefined).length;
+    this.aheadChunks = Math.min(Math.ceil(MOVIE_AHEAD_BYTES / this.chunkBytes),
+      Math.max(0, Math.floor((this.capacity - 4) / Math.max(1, movies)) - 1));
   }
   indices(offset, length) {
     const first = Math.floor(offset / this.chunkBytes), last = Math.floor((offset + length - 1) / this.chunkBytes);
@@ -46,7 +54,17 @@ export class RemoteDisk {
       this.failure = new Error("Remote USB read is out of bounds."); return -1;
     }
     const indices = this.indices(offset, length);
-    if (indices.some(i => !this.cache.has(i))) {
+    const region = this.regions.find(r => offset >= r.streamStart && offset < r.end);
+    if (region) {
+      const first = indices[0];
+      let window = this.movieWindows.get(region);
+      if (!window || first < window.first) window = this.createWindow(region, first);
+      this.playback = window;
+      window.first = first;
+      window.through = Math.min(Math.ceil(region.end / this.chunkBytes) - 1,
+        first + this.aheadChunks);
+    }
+    if (indices.some(i => !this.cache.has(i)) || (region && this.playback.initializing)) {
       this.demand = { offset, length, indices }; return 1;
     }
     const heap = new Uint8Array(memory.buffer);
@@ -64,6 +82,11 @@ export class RemoteDisk {
   }
   trim() {
     const pinned = new Set(this.demand?.indices || []);
+    for (const window of [this.playback, ...this.movieWindows.values()]) if (window)
+      for (const index of this.windowIndices(window)) {
+        if (pinned.size >= this.capacity) break;
+        pinned.add(index);
+      }
     for (const index of this.cache.keys()) {
       if (this.cache.size <= this.capacity) break;
       if (!pinned.has(index)) this.cache.delete(index);
@@ -171,12 +194,60 @@ export class RemoteDisk {
   async settle() {
     if (this.failure) throw this.failure;
     if (!this.demand) throw new Error("USB is waiting without a remote read.");
-    try { await Promise.all(this.demand.indices.map(i => this.chunk(i))); }
+    try {
+      await Promise.all(this.demand.indices.map(i => this.chunk(i)));
+      const window = this.playback;
+      if (window?.initializing) {
+        await this.fillWindow(window);
+        window.initializing = false;
+      }
+    }
     catch (error) { this.failure = error; throw error; }
+  }
+  windowIndices(window) {
+    return Array.from({ length: window.through - window.first + 1 }, (_, i) => window.first + i);
+  }
+  createWindow(region, first = Math.floor(region.streamStart / this.chunkBytes)) {
+    const window = { region, first, through: Math.min(Math.ceil(region.end / this.chunkBytes) - 1,
+      first + this.aheadChunks), initializing: true, filling: null };
+    this.movieWindows.set(region, window);
+    return window;
+  }
+  async preloadMovies() {
+    await Promise.all(this.regions.filter(r => r.streamStart !== undefined).map(async region => {
+      const window = this.movieWindows.get(region) || this.createWindow(region);
+      await this.fillWindow(window);
+      window.initializing = false;
+    }));
+  }
+  fillWindow(window) {
+    if (window.filling) return window.filling;
+    const indices = this.windowIndices(window);
+    let next = 0, failed = false;
+    const run = async () => {
+      while (!failed && this.movieWindows.get(window.region) === window && next < indices.length) {
+        if (this.closed) throw new DOMException("Disk closed", "AbortError");
+        const index = indices[next++];
+        if (this.cache.has(index)) continue;
+        // Four speculative requests leave a slot for a guest's urgent read.
+        while (this.inflight.size >= 4) await Promise.race([...this.inflight.values()].map(p => p.catch(() => {})));
+        if (this.closed) throw new DOMException("Disk closed", "AbortError");
+        if (failed || this.movieWindows.get(window.region) !== window) return;
+        try { await this.chunk(index); }
+        catch (error) { failed = true; throw error; }
+      }
+    };
+    window.filling = Promise.all(Array.from({ length: 4 }, run)).finally(() => { window.filling = null; });
+    return window.filling;
   }
   prefetch(index, offset) {
     const region = this.regions.find(r => offset >= r.start && offset < r.end);
     if (!region) return;
+    if (region.streamStart !== undefined) {
+      if (offset >= region.streamStart && this.playback?.region === region)
+        this.fillWindow(this.playback).catch(() => {}); // Demand retries speculative failures.
+      return;
+    }
     const previous = this.lastChunk.get(region.start);
     this.lastChunk.set(region.start, index);
     // A header probe alone does not download a movie. Read-ahead starts only
