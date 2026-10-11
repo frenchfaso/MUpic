@@ -6,7 +6,7 @@ Movie night, Commodore style. MUpic turns video into 16-color pictures and stere
 
 **[Watch the demo](https://frenchfaso.github.io/MUpic/)** · **[Convert a video](https://frenchfaso.github.io/MUpic/convert.html)** · **[Download the player](releases/MUPIC.PRG)**
 
-The SD canvas is 360×200 with up to 356×200 active picture, preserved aspect ratio and about 16.7 fps. The CLI and browser share a lookup table covering all 16,777,216 RGB colors. Browser video processing stays local; its preview reconstructs the encoded file.
+The SD canvas is 360×200 with up to 356×200 active picture, preserved aspect ratio and about 16.7 fps. The CLI and browser share a lookup table covering all 16,777,216 RGB colors. Browser conversion starts when you choose a video, includes available audio with automatic level adjustment, and stays local; its preview reconstructs the encoded file.
 
 ## Convert and play
 

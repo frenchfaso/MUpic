@@ -1,11 +1,11 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#080b0d">
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#18182b">
   <meta name="description" content="Convert a local video to MUpic, privately in your browser.">
   <title>Convert · MUpic</title>
-  <link rel="stylesheet" href="style.css"><link rel="stylesheet" href="mupic.css?v=77733d2422f8ed45"><link rel="stylesheet" href="converter.css">
+  <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6"><link rel="stylesheet" href="mupic.css?v=f1abbd3acfe94a64"><link rel="stylesheet" href="converter.css?v=b62bd73d92bcf587">
 </head>
 <body data-preset="converter">
 <main>
@@ -18,30 +18,16 @@
       <a href="https://github.com/frenchfaso/MUpic">GitHub</a>
     </nav>
   </header>
-  <section class="lut-panel" aria-label="Color table">
-    <p id="lut-status" role="status" aria-live="polite">Loading color table…</p>
-    <progress id="lut-progress" max="1" value="0" aria-label="Color table loading progress"></progress>
-    <p id="lut-note">The color table downloads once and is saved on this device. You can choose a video while it loads; videos stay on your device.</p>
-    <div class="conversion-actions"><button id="lut-retry" type="button" hidden>Retry loading</button><button id="lut-standard" type="button">Use standard encoding</button></div>
-  </section>
   <section id="drop-zone" class="drop-zone" aria-label="Choose a local video">
     <span class="drop-icon" aria-hidden="true">↓</span>
     <p>Drop a video</p>
     <button id="choose-video" type="button">Choose a video</button>
+    <small>Conversion starts automatically. Audio is included when present, with its level adjusted automatically. Videos stay on your device.</small>
     <input id="video-file" type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.mkv" hidden>
   </section>
   <section class="conversion-panel" aria-label="Conversion">
     <p id="file-details" class="file-details" hidden></p>
-    <div class="conversion-actions"><button id="convert" type="button" disabled>Convert</button><button id="cancel" type="button" hidden>Cancel</button><a id="download" class="button-link" hidden>Download MUP</a></div>
-    <details class="options"><summary>Options</summary>
-      <div class="settings">
-        <label><input id="silent-source" type="checkbox"> Silent source</label>
-        <label>Audio gain <select id="audio-gain"><option value="0">0 dB</option><option value="6">+6 dB</option><option value="12">+12 dB</option></select></label>
-        <a href="https://github.com/frenchfaso/MUpic">Native CLI</a>
-      </div>
-    </details>
-    <progress id="conversion-progress" max="1" value="0" hidden aria-label="Conversion progress"></progress>
-    <p id="conversion-status" role="status" aria-live="polite" hidden></p>
+    <p id="conversion-result" role="status" aria-live="polite" hidden></p>
   </section>
   <section id="comparison" class="comparison" aria-label="Original and converted video preview" hidden>
     <figure><figcaption>Original</figcaption>
@@ -49,6 +35,7 @@
     </figure>
     <figure><figcaption>MUpic</figcaption>
       <div class="preview-screen"><canvas id="mup-preview" width="360" height="200" aria-label="Decoded MUP preview"></canvas></div>
+      <a id="download" class="download-link" hidden>Download MUP</a>
     </figure>
   </section>
   <div id="preview-controls" class="preview-controls" hidden>
@@ -56,6 +43,19 @@
   </div>
   <video id="decode-video" muted playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
 </main>
-<script type="module" src="converter.mjs?v=83c743bb6a39bcbc"></script>
+<dialog id="lut-dialog" class="progress-dialog" aria-labelledby="lut-title">
+  <h2 id="lut-title">Preparing the encoder</h2>
+  <p id="lut-status" role="status" aria-live="polite">Loading color table…</p>
+  <progress id="lut-progress" max="1" value="0" aria-label="Color table loading progress"></progress>
+  <p id="lut-note">The color table downloads once and is saved on this device.</p>
+  <div class="progress-dialog-actions"><button id="lut-standard" type="button">Skip for now</button></div>
+</dialog>
+<dialog id="conversion-dialog" class="progress-dialog" aria-labelledby="conversion-title">
+  <h2 id="conversion-title">Converting video</h2>
+  <p id="conversion-status" role="status" aria-live="polite"></p>
+  <progress id="conversion-progress" max="1" aria-label="Conversion progress"></progress>
+  <div class="progress-dialog-actions"><button id="cancel" type="button" autofocus>Cancel</button></div>
+</dialog>
+<script type="module" src="converter.mjs?v=2c8da23691e5f2b2"></script>
 </body>
 </html>

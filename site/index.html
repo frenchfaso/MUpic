@@ -2,12 +2,12 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#080b0d">
+  <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+  <meta name="theme-color" content="#18182b">
   <meta name="description" content="MUpic video on the Commodore 64 Ultimate. Sixteen colors, one player, and a little movie magic.">
   <title>MUpic</title>
-  <link rel="stylesheet" href="style.css">
-  <link rel="stylesheet" href="mupic.css?v=77733d2422f8ed45">
+  <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6">
+  <link rel="stylesheet" href="mupic.css?v=f1abbd3acfe94a64">
 </head>
 <body data-preset="mupic">
   <main>
@@ -23,28 +23,37 @@
     <section class="emulator" aria-label="MUpic Player on Commodore 64 Ultimate">
       <div class="hardware-stage">
         <section id="display" class="screen-window" aria-label="C64 display">
-          <canvas id="screen" width="384" height="272" tabindex="0" data-gamepads="0" title="Up and Down select a video; Return plays it. Space pauses or resumes; Escape returns to the list. Click or press a key here to enable audio." aria-label="MUpic Player screen" aria-describedby="player-keys"></canvas>
-          <div id="screen-hint" class="screen-hint" role="status" aria-live="polite">
-            <span class="screen-mark">MUpic</span>
-            <p>Starting MUpic Player…</p>
-          </div>
-          <progress id="download-progress" max="1" value="0" hidden aria-label="Player loading progress"></progress>
-          <button id="exit-fullscreen" type="button">EXIT FULLSCREEN</button>
+          <canvas id="screen" width="384" height="272" tabindex="0" data-gamepads="0" title="Up and Down select a video; Return plays it. Space pauses or resumes; Escape returns to the list. Tap the screen to open the keyboard." aria-label="MUpic Player screen" aria-describedby="player-keys"></canvas>
+          <textarea id="mobile-keyboard" class="mobile-keyboard" rows="1" inputmode="text" enterkeyhint="enter" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" tabindex="-1" aria-label="C64 keyboard" aria-describedby="player-keys"></textarea>
         </section>
         <img class="hardware-art" src="assets/monitor.svg" width="936" height="867" alt="" aria-hidden="true" draggable="false" fetchpriority="high" decoding="async">
       </div>
+      <div id="mobile-player-controls" class="mobile-player-controls" aria-label="Touch player controls" hidden>
+        <button class="mobile-player-key" type="button" data-player-key="ArrowUp" aria-label="Up">↑</button>
+        <button class="mobile-player-key" type="button" data-player-key="ArrowDown" aria-label="Down">↓</button>
+        <button class="mobile-player-key" type="button" data-player-key="Enter">Return</button>
+        <button class="mobile-player-key" type="button" data-player-key="Space">Space</button>
+        <button class="mobile-player-key" type="button" data-player-key="Escape">Escape</button>
+        <button id="hide-mobile-keyboard" class="mobile-player-key" type="button">Hide keyboard</button>
+      </div>
       <nav class="main-controls" aria-label="Player controls">
         <div class="quick-controls">
-          <button id="audio" class="audio-button" type="button" aria-pressed="false" aria-label="Toggle audio">AUDIO</button>
-          <button id="fullscreen" type="button">FULLSCREEN</button>
           <button id="start-c64" type="button" title="Restart MUpic Player" hidden>PLAYER</button>
         </div>
         <p id="player-keys" class="sr-only">Up and Down select a video. Return plays it. Space pauses or resumes. Escape returns to the list.</p>
       </nav>
     </section>
     <p class="tech-credit">UPIC by <a href="https://csdb.dk/release/?id=263980">Aleksi Eeben</a> · Color selection and dithering by <a href="https://bisqwit.iki.fi/story/howto/dither/jy/">Joel Yliluoma (Bisqwit)</a>.</p>
-    <output id="runtime-status" class="sr-only" role="status" aria-live="polite">Starting MUpic Player…</output>
+    <dialog id="player-progress" class="progress-dialog" aria-labelledby="player-progress-title" aria-describedby="runtime-status">
+      <h2 id="player-progress-title">Starting player</h2>
+      <p id="runtime-status" class="progress-status" role="status" aria-live="polite">Loading player…</p>
+      <progress id="download-progress" max="1" aria-label="Player loading progress"></progress>
+      <div class="progress-dialog-actions">
+        <button id="retry-player" type="button" hidden>Retry</button>
+        <button id="close-player-progress" type="button">Cancel</button>
+      </div>
+    </dialog>
   </main>
-  <script type="module" src="app.js?v=83c743bb6a39bcbc"></script>
+  <script type="module" src="app.js?v=2c8da23691e5f2b2"></script>
 </body>
 </html>

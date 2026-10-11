@@ -1,5 +1,6 @@
 import { CrtPresenter } from "./gpu.js";
 import { GamepadInput } from "./gamepad.js";
+import { KeyPulseQueue, NativeKeyboardInput } from "./mobile-keyboard.mjs?v=8ec35fb998bd6ffd";
 function assetUrl(name) {
   const url = new URL(name, import.meta.url);
   url.search = new URL(import.meta.url).search;
@@ -8,12 +9,17 @@ function assetUrl(name) {
 const $ = (id) => document.getElementById(id);
 const canvas = $("screen");
 const controls = {
-  c64: $("start-c64"), audio: $("audio"), fullscreen: $("fullscreen"),
+  c64: $("start-c64"),
 };
+const progressDialog = $("player-progress");
+const mobileKeyboard = $("mobile-keyboard");
+const mobileControls = $("mobile-player-controls");
+let mobilePulses = null, nativeKeyboardInput = null;
 
 let worker = null;
 let sidWorker = null;
 let sidShutdown = Promise.resolve();
+let cancelSidInitialization = null;
 let presenter = null;
 const pendingFrames = [];
 let paintQueued = false;
@@ -34,12 +40,23 @@ let generation = 0;
 const gamepadInput = new GamepadInput();
 const state = { state: "idle", workerReady: false, download: null, error: null };
 
+function showProgressDialog(error = false) {
+  $("player-progress-title").textContent = error ? "Player unavailable" : "Starting player";
+  $("retry-player").hidden = !error;
+  $("close-player-progress").textContent = error ? "Close" : "Cancel";
+  $("download-progress").hidden = error;
+  if (!progressDialog.open) progressDialog.showModal();
+}
+
+function closeProgressDialog(focusCanvas = false) {
+  if (progressDialog.open) progressDialog.close();
+  if (focusCanvas) canvas.focus({ preventScroll: true });
+}
+
 function updateUI(message) {
   const loading = ["loading", "booting"].includes(state.state);
   controls.c64.disabled = loading;
-  controls.audio.setAttribute("aria-pressed", String(audioEnabled));
-  controls.audio.setAttribute("aria-label", `Audio ${audioEnabled ? "on" : "off"}`);
-  controls.audio.title = audioEnabled ? "Turn audio off" : "Turn audio on";
+  controls.c64.hidden = !["idle", "error"].includes(state.state);
   const status = {
     idle: "Ready.", loading: "Loading files…", booting: "Booting firmware…",
     running: "MUpic Player running.", paused: "Emulation paused.",
@@ -47,7 +64,8 @@ function updateUI(message) {
   };
   $("runtime-status").textContent = message || status[state.state] || state.state;
   canvas.dataset.state = state.state;
-  $("download-progress").hidden = !loading || !state.download;
+  if (loading && !state.workerReady) showProgressDialog();
+  else if (state.state !== "error") closeProgressDialog();
 }
 
 function cancelAudioActivation() {
@@ -149,7 +167,6 @@ async function ensureAudio() {
 }
 
 async function setAudio(enabled) {
-  // A manual choice also consumes auto-start, so playing cannot undo a mute.
   audioAutoStartPending = false;
   const request = ++audioRequest;
   cancelAudioActivation();
@@ -162,6 +179,7 @@ async function setAudio(enabled) {
     } catch (error) {
       if (request !== audioRequest) return;
       audioEnabled = false;
+      audioAutoStartPending = true;
       console.error(error.message || error);
     }
   }
@@ -199,6 +217,8 @@ function stopSidWorker(instance) {
 
 async function start() {
   const token = ++generation;
+  hideMobileKeyboard();
+  cancelSidInitialization?.();
   cancelAudioActivation();
   releaseAllKeys();
   releaseGamepad();
@@ -206,17 +226,16 @@ async function start() {
   const previousSidWorker = sidWorker;
   worker = null;
   sidWorker = null;
+  pendingFrames.length = 0;
+  audioNode?.port.postMessage({ type: "enabled", enabled: false });
+  clearAudio();
+  Object.assign(state, { state: "loading", workerReady: false, error: null, download: null });
+  $("download-progress").removeAttribute("value");
+  updateUI("Loading emulator…");
   await stopSidWorker(previousSidWorker);
   if (token !== generation) return;
   releaseAudioTransport();
   workerAudioTransport = prepareAudioTransport(token);
-  audioNode?.port.postMessage({ type: "enabled", enabled: false });
-  pendingFrames.length = 0;
-  clearAudio();
-  Object.assign(state, { state: "loading", workerReady: false, error: null, download: null });
-  $("screen-hint").hidden = false;
-  $("screen-hint").querySelector("p").textContent = "Loading emulator…";
-  updateUI();
   try {
     if (!presenter) presenter = await CrtPresenter.create(canvas, showError);
     if (token !== generation) return;
@@ -230,15 +249,23 @@ async function start() {
     sidWorker = currentSidWorker;
     const sidReady = new Promise((resolve, reject) => {
       let ready = false;
-      const timeout = setTimeout(() => reject(new Error("The SID worker has not responded for 30 seconds.")), 30000);
+      const finish = () => {
+        clearTimeout(timeout);
+        if (cancelSidInitialization === cancel) cancelSidInitialization = null;
+      };
+      const cancel = () => { finish(); reject(new Error("Player loading cancelled.")); };
+      const timeout = setTimeout(() => {
+        finish(); reject(new Error("The SID worker has not responded for 30 seconds."));
+      }, 30000);
+      cancelSidInitialization = cancel;
       currentSidWorker.onmessage = ({ data }) => {
         if (sidWorker !== currentSidWorker) return;
         if (receiveAudioReady(data)) return;
         if (data.type === "ready") {
           ready = true; compiledWasmModule = data.wasmModule;
-          clearTimeout(timeout); resolve();
+          finish(); resolve();
         } else if (data.type === "error") {
-          clearTimeout(timeout);
+          finish();
           if (ready) showError(data.message); else reject(new Error(data.message));
         }
         else if (data.type === "log") console.error(data.message);
@@ -246,7 +273,7 @@ async function start() {
       currentSidWorker.onerror = (event) => {
         if (sidWorker !== currentSidWorker) return;
         const message = event.message || "SID worker error.";
-        clearTimeout(timeout);
+        finish();
         if (ready) showError(message); else reject(new Error(message));
       };
     });
@@ -274,21 +301,46 @@ async function start() {
   }
 }
 
-function showError(message) {
+function cancelStartup() {
+  ++generation;
+  hideMobileKeyboard();
+  cancelSidInitialization?.();
+  cancelAudioActivation();
   releaseAllKeys();
   releaseGamepad();
   worker?.terminate();
   worker = null;
   void stopSidWorker(sidWorker);
   sidWorker = null;
+  releaseAudioTransport();
+  audioNode?.port.postMessage({ type: "enabled", enabled: false });
+  pendingFrames.length = 0;
+  clearAudio();
+  Object.assign(state, { state: "idle", workerReady: false, download: null, error: null });
+  updateUI("Player loading cancelled.");
+  controls.c64.focus({ preventScroll: true });
+}
+
+function showError(message) {
+  ++generation;
+  hideMobileKeyboard();
+  cancelSidInitialization?.();
+  cancelAudioActivation();
+  releaseAllKeys();
+  releaseGamepad();
+  worker?.terminate();
+  worker = null;
+  void stopSidWorker(sidWorker);
+  sidWorker = null;
+  releaseAudioTransport();
+  audioNode?.port.postMessage({ type: "enabled", enabled: false });
   pendingFrames.length = 0;
   clearAudio();
   state.state = "error";
   state.error = String(message);
   console.error(message);
   updateUI();
-  $("screen-hint").hidden = false;
-  $("screen-hint").querySelector("p").textContent = String(message);
+  showProgressDialog(true);
 }
 
 function schedulePaint() {
@@ -301,7 +353,7 @@ function schedulePaint() {
     const frame = pendingFrames[0];
     try {
       if (presenter.draw(frame)) {
-        $("screen-hint").hidden = true;
+        closeProgressDialog();
       } else {
         schedulePaint();
         return;
@@ -322,7 +374,7 @@ function onWorkerMessage(data) {
       break;
     case "state":
       state.state = data.state;
-      if (data.state !== "running") releaseGamepad();
+      if (data.state !== "running") {hideMobileKeyboard();releaseAllKeys();releaseGamepad();}
       if (data.state === "paused") clearAudio();
       audioNode?.port.postMessage({ type: "enabled", enabled: audioEnabled && data.state === "running" });
       updateUI(data.message);
@@ -334,14 +386,16 @@ function onWorkerMessage(data) {
       progress.max = data.count;
       progress.value = data.index - 1 + (data.total ? Math.min(1, data.loaded / data.total) : 0);
       $("runtime-status").textContent = `Loading ${data.file.split("/").pop()}…`;
+      if (["loading", "booting"].includes(state.state) && !state.workerReady) showProgressDialog();
       break;
     }
     case "ready":
       state.workerReady = true;
-      // Toggles during asset download arrive before Rust initialization. Apply
-      // the latest choice again once this worker can accept audio commands.
+      // A gesture during asset download precedes Rust initialization. Apply
+      // audio activation once this worker can accept commands.
       syncAudioTransport();
       updateUI();
+      closeProgressDialog(true);
       break;
     case "frame":
       // Preserve each A/B colour-mixing phase in arrival order. The worker
@@ -401,7 +455,54 @@ function release(source) {
 }
 
 function releaseAllKeys() {
+  mobilePulses?.reset();
+  nativeKeyboardInput?.reset();
   for (const source of [...held.keys()]) release(source);
+}
+
+const acceptsMobileInput = () => state.workerReady && state.state === "running" && !document.hidden;
+mobilePulses = new KeyPulseQueue({
+  press: mapped => press("mobile-input", mapped), release: () => release("mobile-input"), active: acceptsMobileInput,
+});
+nativeKeyboardInput = new NativeKeyboardInput(mobileKeyboard, {
+  text: text => mobilePulses.text(text),
+  active: () => acceptsMobileInput() && document.activeElement === mobileKeyboard,
+});
+
+function updateKeyboardViewport() {
+  if (!document.body.classList.contains("keyboard-active")) return;
+  document.body.style.setProperty("--player-viewport-height", `${window.visualViewport?.height || window.innerHeight}px`);
+}
+function hideMobileKeyboard() {
+  mobileKeyboard.blur();
+  mobileControls.hidden = true;
+  document.body.classList.remove("keyboard-active");
+  document.body.style.removeProperty("--player-viewport-height");
+  releaseAllKeys();
+}
+mobileKeyboard.addEventListener("focus", () => {
+  mobileControls.hidden = false;
+  document.body.classList.add("keyboard-active");
+  updateKeyboardViewport();
+});
+mobileKeyboard.addEventListener("blur", () => {
+  mobileControls.hidden = true;
+  document.body.classList.remove("keyboard-active");
+  document.body.style.removeProperty("--player-viewport-height");
+  releaseAllKeys();
+});
+window.addEventListener("resize", updateKeyboardViewport);
+window.visualViewport?.addEventListener("resize", updateKeyboardViewport);
+$("hide-mobile-keyboard").addEventListener("click", () => {hideMobileKeyboard();canvas.focus({preventScroll:true});});
+for (const button of mobileControls.querySelectorAll("[data-player-key]")) {
+  const tap = event => {
+    if (!acceptsMobileInput()) return;
+    event.preventDefault();activateAudioFromInput(event);
+    mobilePulses.add(keys[button.dataset.playerKey]);
+  };
+  button.addEventListener("pointerdown", tap);
+  button.addEventListener("click", event => {if(event.detail===0)tap(event);});
+  button.addEventListener("pointercancel", releaseAllKeys);
 }
 
 function sendGamepadEvents(events) {
@@ -415,7 +516,7 @@ function pollGamepads() {
   let pads = [];
   try { pads = navigator.getGamepads?.() || []; }
   catch (error) {
-    if (!gamepadReadFailed) log(`Gamepad unavailable: ${error.message || error}`, "error");
+    if (!gamepadReadFailed) console.error(`Gamepad unavailable: ${error.message || error}`);
     gamepadReadFailed = true;
   }
   const focused = state.workerReady && state.state === "running" && !document.hidden && document.hasFocus();
@@ -424,6 +525,16 @@ function pollGamepads() {
 }
 
 window.addEventListener("keydown", (event) => {
+  if (document.activeElement === mobileKeyboard && acceptsMobileInput()) {
+    if (event.isComposing || event.keyCode === 229 || event.metaKey || event.ctrlKey) return;
+    const code = event.code || event.key;
+    if (["Enter", "NumpadEnter", "Backspace", "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Escape"].includes(code)) {
+      event.preventDefault();
+      nativeKeyboardInput.suppressKey(code);
+      if (!event.repeat) {activateAudioFromInput(event);mobilePulses.add(keys[code]);}
+    }
+    return;
+  }
   if (document.activeElement !== canvas || state.state !== "running" || event.metaKey) return;
   const mapped = keys[event.code];
   if (!mapped) return;
@@ -438,14 +549,20 @@ window.addEventListener("keyup", (event) => {
   event.preventDefault();
   release(event.code);
 });
-window.addEventListener("blur", () => { releaseAllKeys(); releaseGamepad(); });
+window.addEventListener("blur", () => { hideMobileKeyboard(); releaseGamepad(); });
 canvas.addEventListener("blur", releaseAllKeys);
-canvas.addEventListener("pointerdown", () => canvas.focus({ preventScroll: true }));
+canvas.addEventListener("pointerdown", event => {
+  if (event.isTrusted && ["touch", "pen"].includes(event.pointerType) && acceptsMobileInput()) {
+    event.preventDefault();activateAudioFromInput(event);
+    mobileKeyboard.focus({ preventScroll: true });
+  } else canvas.focus({ preventScroll: true });
+});
+canvas.addEventListener("pointercancel", releaseAllKeys);
 canvas.addEventListener("click", activateAudioFromInput);
 function onVisibilityChange() {
   if (document.hidden) {
     videoWasHidden = true;
-    releaseAllKeys(); releaseGamepad();
+    hideMobileKeyboard(); releaseGamepad();
     return;
   }
   if (!videoWasHidden) return;
@@ -458,26 +575,26 @@ function onVisibilityChange() {
   presenter?.resetHistory?.();
 }
 document.addEventListener("visibilitychange", onVisibilityChange);
+window.addEventListener("pagehide", () => {hideMobileKeyboard();releaseGamepad();});
 controls.c64.addEventListener("click", () => {
   canvas.focus({ preventScroll: true });
   start();
 });
-controls.audio.addEventListener("click", () => setAudio(!audioEnabled));
-controls.fullscreen.addEventListener("click", async () => {
-  try {
-    if (document.fullscreenElement) await document.exitFullscreen();
-    else await $("display").requestFullscreen();
-    canvas.focus({ preventScroll: true });
-  } catch (error) { log(`Fullscreen: ${error.message || error}`, "error"); }
+$("retry-player").addEventListener("click", () => start());
+$("close-player-progress").addEventListener("click", () => {
+  if (["loading", "booting"].includes(state.state)) cancelStartup();
+  else {
+    closeProgressDialog();
+    controls.c64.focus({ preventScroll: true });
+  }
 });
-$("exit-fullscreen").addEventListener("click", async () => {
-  try {
-    await document.exitFullscreen();
-    canvas.focus({ preventScroll: true });
-  } catch (error) { log(`Exit fullscreen: ${error.message || error}`, "error"); }
-});
-document.addEventListener("fullscreenchange", () => {
-  controls.fullscreen.textContent = document.fullscreenElement ? "EXIT FULLSCREEN" : "FULLSCREEN";
+progressDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  if (["loading", "booting"].includes(state.state)) cancelStartup();
+  else {
+    closeProgressDialog();
+    controls.c64.focus({ preventScroll: true });
+  }
 });
 updateUI();
 requestAnimationFrame(pollGamepads);

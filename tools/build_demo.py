@@ -12,10 +12,13 @@ def version_browser_entrypoints(site):
     # Hash dependencies before their importers so cached workers cannot combine
     # a previous adapter with a new raw-WASM ABI.
     for parent, child in [
+        ('app.js', 'mobile-keyboard.mjs'),
         ('worker-pool.mjs', 'lut-cache.mjs'),
         ('quantizer-worker.mjs', 'wasm-core.mjs'),
         ('encoder-worker.mjs', 'wasm-core.mjs'),
         ('converter.mjs', 'worker-pool.mjs'),
+        ('converter.mjs', 'media.mjs'),
+        ('converter.mjs', 'conversion-progress.mjs'),
     ]:
         path = site/parent
         version = hashlib.sha256((site/child).read_bytes()).hexdigest()[:16]
@@ -36,6 +39,14 @@ def version_browser_entrypoints(site):
                              lambda match: match[1]+'?v='+version+match[2], page.read_text())
         if count != 1:
             raise ValueError(f'Expected one {module} entrypoint')
+        for stylesheet in ['style.css', 'mupic.css', 'converter.css']:
+            if stylesheet == 'converter.css' and name != 'convert.html':
+                continue
+            css_version = hashlib.sha256((site/stylesheet).read_bytes()).hexdigest()[:16]
+            text, count = re.subn(r'(href="(?:\./)?'+re.escape(stylesheet)+r')(?:\?[^" ]*)?(")',
+                                 lambda match: match[1]+'?v='+css_version+match[2], text)
+            if count != 1:
+                raise ValueError(f'Expected one {stylesheet} link in {name}')
         page.write_text(text)
 
 def main():
