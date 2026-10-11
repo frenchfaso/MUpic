@@ -493,7 +493,6 @@ mobileKeyboard.addEventListener("blur", () => {
 });
 window.addEventListener("resize", updateKeyboardViewport);
 window.visualViewport?.addEventListener("resize", updateKeyboardViewport);
-$("hide-mobile-keyboard").addEventListener("click", () => {hideMobileKeyboard();canvas.focus({preventScroll:true});});
 for (const button of mobileControls.querySelectorAll("[data-player-key]")) {
   const tap = event => {
     if (!acceptsMobileInput()) return;

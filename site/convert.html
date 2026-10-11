@@ -5,7 +5,7 @@
   <meta name="theme-color" content="#18182b">
   <meta name="description" content="Convert a local video to MUpic, privately in your browser.">
   <title>Convert · MUpic</title>
-  <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6"><link rel="stylesheet" href="mupic.css?v=f1abbd3acfe94a64"><link rel="stylesheet" href="converter.css?v=b62bd73d92bcf587">
+  <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6"><link rel="stylesheet" href="mupic.css?v=a8e271e937ab32a9"><link rel="stylesheet" href="converter.css?v=4370ab94139841df">
 </head>
 <body data-preset="converter">
 <main>
@@ -31,16 +31,27 @@
   </section>
   <section id="comparison" class="comparison" aria-label="Original and converted video preview" hidden>
     <figure><figcaption>Original</figcaption>
-      <div class="preview-screen"><video id="original-video" controls playsinline preload="metadata" aria-label="Original video and shared playback controls"></video></div>
+      <div class="preview-screen"><video id="original-video" playsinline preload="metadata" aria-label="Original video"></video></div>
+      <div id="original-controls" class="playback-controls" role="group" aria-label="Original playback controls">
+        <button type="button" data-action="play" aria-label="Play original" title="Play original" disabled><span aria-hidden="true">▶</span></button>
+        <button type="button" data-action="pause" aria-label="Pause original" title="Pause original" disabled><span aria-hidden="true">Ⅱ</span></button>
+        <button type="button" data-action="stop" aria-label="Stop original" title="Stop original" disabled><span aria-hidden="true">■</span></button>
+        <output class="playback-time" data-role="time" aria-live="off">0:00 / 0:00</output>
+        <input type="range" data-action="seek" min="0" max="0" step="any" value="0" aria-label="Seek original" disabled>
+      </div>
     </figure>
     <figure><figcaption>MUpic</figcaption>
       <div class="preview-screen"><canvas id="mup-preview" width="360" height="200" aria-label="Decoded MUP preview"></canvas></div>
+      <div id="mup-controls" class="playback-controls" role="group" aria-label="MUpic playback controls">
+        <button type="button" data-action="play" aria-label="Play MUpic" title="Play MUpic" disabled><span aria-hidden="true">▶</span></button>
+        <button type="button" data-action="pause" aria-label="Pause MUpic" title="Pause MUpic" disabled><span aria-hidden="true">Ⅱ</span></button>
+        <button type="button" data-action="stop" aria-label="Stop MUpic" title="Stop MUpic" disabled><span aria-hidden="true">■</span></button>
+        <output class="playback-time" data-role="time" aria-live="off">0:00 / 0:00</output>
+        <input type="range" data-action="seek" min="0" max="0" step="any" value="0" aria-label="Seek MUpic" disabled>
+      </div>
       <a id="download" class="download-link" hidden>Download MUP</a>
     </figure>
   </section>
-  <div id="preview-controls" class="preview-controls" hidden>
-    <label>Audio <select id="preview-audio"><option value="mup">MUpic</option><option value="original">Original</option><option value="mute">Mute</option></select></label>
-  </div>
   <video id="decode-video" muted playsinline preload="auto" aria-hidden="true" tabindex="-1"></video>
 </main>
 <dialog id="lut-dialog" class="progress-dialog" aria-labelledby="lut-title">
@@ -56,6 +67,6 @@
   <progress id="conversion-progress" max="1" aria-label="Conversion progress"></progress>
   <div class="progress-dialog-actions"><button id="cancel" type="button" autofocus>Cancel</button></div>
 </dialog>
-<script type="module" src="converter.mjs?v=2c8da23691e5f2b2"></script>
+<script type="module" src="converter.mjs?v=d2ecf8ee67339761"></script>
 </body>
 </html>

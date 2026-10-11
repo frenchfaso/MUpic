@@ -45,7 +45,7 @@ body[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(280px, c
 .mobile-player-key:active { border-color: var(--cyan); color: var(--cyan); }
 body.keyboard-active[data-preset="mupic"] main { min-height: 0; padding-top: 16px; padding-bottom: 16px; }
 body.keyboard-active .page-title, body.keyboard-active .tech-credit, body.keyboard-active .main-controls { display: none; }
-body.keyboard-active[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(128px, calc((var(--player-viewport-height, 100dvh) - 156px) * 1.0795848))); }
+body.keyboard-active[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(128px, calc((var(--player-viewport-height, 100dvh) - 104px) * 1.0795848))); }
 @supports (height: 100svh) {
   body[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(280px, calc(107.95848svh - 300px))); }
 }

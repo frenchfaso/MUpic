@@ -1,4 +1,5 @@
 import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
+import {MupPlayer} from './preview-player.mjs?v=a6729b77ebe488a6';
 import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=81de3bb75e9c558f';
 import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=f2dd967349f8b8a2';
 import {ConversionProgress} from './conversion-progress.mjs?v=ff2c0e223da601a2';
@@ -14,11 +15,12 @@ function assetUrl(name) {
 }
 const wasmUrl=assetUrl('./assets/encoder.wasm').href;
 let selected=null,plan=null,inputUrl=null,outputUrl=null,busy=false,loadSerial=0,abortController=null;
-let pool=null,encoder=null,preview=null,previewSerial=0,paintRequested=-1,painting=false;
+let pool=null,encoder=null;
 const workerCount=Math.max(1,Math.min(8,(navigator.hardwareConcurrency||2)-1));
 let poolInitialization=null,preparation=null,preparationController=null,standardEncoding=false;
 const hasLut=()=>Boolean(pool?.lutReady&&!pool.closed&&!pool.workers[0]?.closed);
-let audioContext=null,audioBuffer=null,audioSource=null,audioLoading=null;
+const originalControls=$('original-controls'),mupControls=$('mup-controls');
+let originalStarting=false,originalPlaySerial=0,originalFrame=null;
 const conversionDialog=$('conversion-dialog'),tableDialog=$('lut-dialog');
 function status(message,{error=false}={}) {
   $('conversion-status').textContent=message;
@@ -42,11 +44,69 @@ function cancelConversion() {
 conversionDialog.addEventListener('cancel',event=>{event.preventDefault();cancelConversion();});
 const sizeLabel=bytes=>`${(bytes/1048576).toFixed(1)} MiB`;
 const timeLabel=seconds=>`${Math.floor(seconds/60)}:${String(Math.floor(seconds%60)).padStart(2,'0')}`;
-function stopAudio() { if(audioSource) {try{audioSource.stop();}catch{}audioSource.disconnect();audioSource=null;} }
+function renderControls(controls,snapshot) {
+  const {ready,playing,starting,time,duration}=snapshot;
+  controls.dataset.state=!ready?'empty':starting?'starting':playing?'playing':'paused';
+  controls.querySelector('[data-action="play"]').disabled=!ready||playing||starting;
+  controls.querySelector('[data-action="pause"]').disabled=!ready||(!playing&&!starting);
+  controls.querySelector('[data-action="stop"]').disabled=!ready;
+  const seek=controls.querySelector('[data-action="seek"]');
+  seek.disabled=!ready;seek.max=ready?duration:0;seek.value=ready?time:0;
+  seek.setAttribute('aria-valuetext',`${timeLabel(time)} of ${timeLabel(duration)}`);
+  controls.querySelector('[data-role="time"]').textContent=`${timeLabel(time)} / ${timeLabel(duration)}`;
+}
+const mupPlayer=new MupPlayer({
+  drawFrame:rgba=>context.putImageData(new ImageData(rgba,360,200),0,0),
+  onUpdate:snapshot=>renderControls(mupControls,snapshot),
+  onError:error=>resultStatus(`MUpic playback: ${error.message}`,{error:true}),
+});
+function updateOriginalControls() {
+  const ready=Number.isFinite(original.duration)&&original.duration>0&&original.readyState>=1;
+  const playing=ready&&!original.paused&&!original.ended;
+  renderControls(originalControls,{ready,playing,starting:originalStarting,
+    time:ready?original.currentTime:0,duration:ready?original.duration:0});
+  if(playing&&originalFrame===null)originalFrame=requestAnimationFrame(()=>{originalFrame=null;updateOriginalControls();});
+  else if(!playing&&originalFrame!==null){cancelAnimationFrame(originalFrame);originalFrame=null;}
+}
+function pauseOriginal() {
+  originalPlaySerial++;originalStarting=false;original.pause();updateOriginalControls();
+}
+async function playOriginal() {
+  const serial=++originalPlaySerial;originalStarting=true;updateOriginalControls();
+  if(original.ended||original.currentTime>=original.duration)original.currentTime=0;
+  try {await original.play();}
+  catch(error) {if(serial===originalPlaySerial)resultStatus(`Original playback: ${error.message}`,{error:true});}
+  finally {if(serial===originalPlaySerial){originalStarting=false;updateOriginalControls();}}
+}
+function bindControls(controls,{play,pause,stop,seek}) {
+  for(const [action,callback] of Object.entries({play,pause,stop})) {
+    controls.querySelector(`[data-action="${action}"]`).addEventListener('click',async()=>{
+      try {await callback();}catch(error){resultStatus(error.message,{error:true});}
+    });
+  }
+  controls.querySelector('[data-action="seek"]').addEventListener('input',async event=>{
+    const value=Number(event.target.value),end=Number(event.target.max);
+    // Range values may round the exact endpoint by a few floating-point units.
+    const seconds=value>=end-Number.EPSILON*Math.max(1,end)*8?end:value;
+    try {await seek(seconds);}catch(error){resultStatus(error.message,{error:true});}
+  });
+}
+bindControls(originalControls,{
+  play:playOriginal,pause:pauseOriginal,
+  stop:()=>{pauseOriginal();original.currentTime=0;updateOriginalControls();},
+  seek:seconds=>{original.currentTime=seconds;updateOriginalControls();},
+});
+bindControls(mupControls,{
+  play:()=>mupPlayer.play(),pause:()=>mupPlayer.pause(),
+  stop:()=>mupPlayer.stop(),seek:seconds=>mupPlayer.seek(seconds),
+});
+for(const event of ['loadedmetadata','durationchange','emptied','play','pause','ended','timeupdate','seeking','seeked'])
+  original.addEventListener(event,updateOriginalControls);
+updateOriginalControls();renderControls(mupControls,mupPlayer.snapshot);
 function clearOutput() {
-  previewSerial++;preview=null;paintRequested=-1;audioBuffer=null;audioLoading=null;stopAudio();original.muted=false;
+  mupPlayer.clear();original.muted=false;
   if(outputUrl) URL.revokeObjectURL(outputUrl);outputUrl=null;
-  $('download').hidden=true;$('preview-controls').hidden=true;
+  $('download').hidden=true;
   context.fillStyle='#000';context.fillRect(0,0,360,200);
 }
 function setBusy(value) {
@@ -103,7 +163,7 @@ tableDialog.addEventListener('cancel',event=>{event.preventDefault();skipTable()
 async function selectFile(file) {
   if(!file||busy)return;
   const serial=++loadSerial;selected=null;plan=null;
-  original.pause();clearOutput();resultStatus('');
+  pauseOriginal();clearOutput();resultStatus('');
   if(inputUrl)URL.revokeObjectURL(inputUrl);inputUrl=URL.createObjectURL(file);
   original.src=inputUrl;decoder.src=inputUrl;original.load();decoder.load();
   $('comparison').hidden=true;$('file-details').hidden=false;$('file-details').textContent=`${file.name} · ${sizeLabel(file.size)}`;
@@ -203,56 +263,19 @@ async function convertSelected(signal) {
   updateProgress(progress.finishing());
   const finished=await encoder.call('finish');addChunks(finished.chunks);checkAbort(signal);
   const movie=new Blob([finished.prefix,...parts],{type:'application/octet-stream'});
-  preview=await MupPreview.open(movie);checkAbort(signal);
+  const preview=await MupPreview.open(movie);checkAbort(signal);
   outputUrl=URL.createObjectURL(movie);$('download').href=outputUrl;
   $('download').download=`${asciiTitle(selected.name).replace(/[^A-Za-z0-9_-]/g,'_').slice(0,48)}.MUP`;
-  original.currentTime=0;original.muted=true;$('preview-audio').value='mup';
-  await paintFrame(0);
+  original.currentTime=0;
+  const painted=await mupPlayer.load(preview);
   checkAbort(signal);
-  $('download').hidden=false;$('preview-controls').hidden=false;
+  if(!painted)throw new Error('The MUpic preview could not be displayed.');
+  $('download').hidden=false;
   $('conversion-progress').value=progress.complete().value;
   resultStatus(`Ready · ${sizeLabel(movie.size)}`);
 }
-async function paintFrame(index) {
-  if(!preview)return;paintRequested=index;
-  if(painting)return;painting=true;
-  const serial=previewSerial;
-  try {
-    while(paintRequested>=0&&preview&&serial===previewSerial) {
-      const next=paintRequested;paintRequested=-1;
-      const rgba=await preview.frame(next);
-      if(serial===previewSerial)context.putImageData(new ImageData(rgba,360,200),0,0);
-    }
-  } catch(error) {resultStatus(`Preview: ${error.message}`,{error:true});}
-  finally {painting=false;}
-}
-async function startAudio() {
-  stopAudio();if(!preview||original.paused||$('preview-audio').value!=='mup')return;
-  const serial=previewSerial,Context=globalThis.AudioContext||globalThis.webkitAudioContext;
-  if(!Context)return;
-  try {
-    if(!audioContext)audioContext=new Context();await audioContext.resume();
-    if(!audioBuffer) {
-      if(!audioLoading)audioLoading=preview.audioBuffer(audioContext);
-      audioBuffer=await audioLoading;audioLoading=null;
-    }
-    if(serial!==previewSerial||original.paused||$('preview-audio').value!=='mup')return;
-    stopAudio();audioSource=audioContext.createBufferSource();audioSource.buffer=audioBuffer;
-    const ratio=preview.header.audioHz/preview.header.sampleRate;
-    audioSource.playbackRate.value=ratio*original.playbackRate;audioSource.connect(audioContext.destination);
-    const offset=original.currentTime*ratio;
-    if(offset<audioBuffer.duration)audioSource.start(0,offset);
-  } catch(error) {resultStatus(`Audio preview: ${error.message}. You can listen to the original instead.`,{error:true});}
-}
-$('preview-audio').addEventListener('change',()=>{original.muted=$('preview-audio').value!=='original';startAudio();});
-original.addEventListener('play',()=>{startAudio();requestAnimationFrame(playbackFrame);});
-original.addEventListener('pause',stopAudio);original.addEventListener('ended',stopAudio);
-original.addEventListener('seeking',stopAudio);
-original.addEventListener('seeked',()=>{paintFrame(Math.floor(original.currentTime*CONTENT_FPS));startAudio();});
-original.addEventListener('ratechange',startAudio);
-function playbackFrame() {
-  if(preview)paintFrame(Math.floor(original.currentTime*CONTENT_FPS));
-  if(!original.paused&&!original.ended)requestAnimationFrame(playbackFrame);
-}
-window.addEventListener('pagehide',()=>{abortController?.abort();pool?.close();encoder?.close();stopAudio();audioContext?.close();});
+window.addEventListener('pagehide',event=>{
+  abortController?.abort();preparationController?.abort();pool?.close();encoder?.close();pauseOriginal();
+  if(event.persisted)mupPlayer.pause();else mupPlayer.dispose();
+});
 void loadTable();

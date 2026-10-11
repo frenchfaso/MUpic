@@ -19,6 +19,8 @@ def version_browser_entrypoints(site):
         ('converter.mjs', 'worker-pool.mjs'),
         ('converter.mjs', 'media.mjs'),
         ('converter.mjs', 'conversion-progress.mjs'),
+        ('preview-player.mjs', 'media.mjs'),
+        ('converter.mjs', 'preview-player.mjs'),
     ]:
         path = site/parent
         version = hashlib.sha256((site/child).read_bytes()).hexdigest()[:16]
