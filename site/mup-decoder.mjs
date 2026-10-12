@@ -29,12 +29,13 @@ export function readMupHeader(raw, fileBytes) {
   const crcBytes = new Uint8Array(252);
   crcBytes.set(bytes.subarray(0, 224)); crcBytes.set(bytes.subarray(228), 224);
   require(crc32(crcBytes) === u32(224), 'The MUP header checksum failed.');
-  require(bytes[4] === 9 && bytes[5] === 9 && bytes[6] === 13 && bytes[7] <= 1,
+  require(bytes[4] === 9 && bytes[5] === 9 && bytes[6] === 13 && [0,1,3].includes(bytes[7]),
     'The preview supports the native SD MUP9 profile.');
   require(u16(8) === 256 && u16(10) === 360 && u16(12) === 200 && u16(14) === 356 &&
     u16(16) === 200 && u16(18) === 0 && bytes[20] === 3 && bytes[21] === 0 && bytes[22] === 13,
     'Unsupported MUP picture geometry or timing.');
   const header = {
+    pcm8: Boolean(bytes[7] & 2), bytesPerSample: bytes[7] & 2 ? 2 : 4,
     recordCount: u32(24), blockCount: u32(28), divider: u16(32), ticksPerBlock: u16(34),
     audioOffset: u32(36), blockBytes: u32(40), audioTableOffset: u32(44),
     initialOffset: u32(48), initialBytes: u32(52), streamOffset: u32(56),
@@ -43,7 +44,7 @@ export function readMupHeader(raw, fileBytes) {
   require(header.recordCount >= 6 && header.recordCount <= 65535 && header.recordCount % 3 === 0 &&
     header.frameCount === header.recordCount / 3 && header.blockCount === Math.ceil(header.recordCount / 20),
     'Invalid MUP frame count.');
-  require(header.ticksPerBlock === 20 && header.audioOffset === AUDIO_OFFSET && header.blockBytes === BLOCK_BYTES &&
+  require(header.ticksPerBlock === 20 && header.audioOffset === (header.pcm8?221184:AUDIO_OFFSET) && header.blockBytes === BLOCK_BYTES &&
     header.audioTableOffset === 256 && header.initialBytes === FRAME_BYTES &&
     header.initialOffset === Math.ceil((256 + header.blockCount * 3) / 256) * 256 &&
     header.streamOffset === Math.ceil((header.initialOffset + FRAME_BYTES) / 65536) * 65536 &&
@@ -53,7 +54,9 @@ export function readMupHeader(raw, fileBytes) {
     'Invalid MUP container bounds.');
   require(![23,74,75,...Array.from({length:16}, (_,i)=>80+i),...Array.from({length:28},(_,i)=>228+i)]
     .some(index => bytes[index]), 'Reserved MUP header bytes are nonzero.');
-  return {...header, duration: header.recordCount / PAL_HZ, audioHz: 6250000 / (header.divider + 2)};
+  require(!header.pcm8 || (header.sampleRate>=8000 && header.sampleRate<=48000 &&
+    header.divider===Math.round(6250000/header.sampleRate-1.5)), 'Invalid PCM8 source sample rate or divider.');
+  return {...header, duration: header.recordCount / PAL_HZ, audioHz: 6250000 / (header.divider + (header.pcm8?1.5:2))};
 }
 export function applyRecord(payload, state) {
   require(payload.length >= 2, 'Truncated MUP video record.');
@@ -120,13 +123,13 @@ export class MupPreview {
     for (let column = 0; column < 180; column++) require(!initial.subarray(column*256+200,(column+1)*256).some(Boolean), 'MUP row padding is nonzero.');
     const table = new Uint8Array(await blob.slice(256,256+header.blockCount*3).arrayBuffer());
     const audioLengths = Array.from({length:header.blockCount}, (_,i) => table[i*3] | table[i*3+1]<<8 | table[i*3+2]<<16);
-    require(audioLengths.every(n => n % 4 === 0 && n <= BLOCK_BYTES-AUDIO_OFFSET), 'Invalid MUP audio table.');
+    require(audioLengths.every(n => n % header.bytesPerSample === 0 && n <= BLOCK_BYTES-header.audioOffset), 'Invalid MUP audio table.');
     return new MupPreview(blob,header,initial,audioLengths);
   }
   async loadBlock(index) {
     if (this.blockIndex === index) return;
     const offset = this.header.streamOffset + index * BLOCK_BYTES;
-    this.block = new Uint8Array(await this.blob.slice(offset,offset+AUDIO_OFFSET).arrayBuffer());
+    this.block = new Uint8Array(await this.blob.slice(offset,offset+this.header.audioOffset).arrayBuffer());
     this.blockIndex = index; this.cursor = 0;
     // A checkpoint can begin inside a block; walk lengths without decoding preceding records.
     const skip = this.record - index * 20;
@@ -135,7 +138,7 @@ export class MupPreview {
   readLength(at) {
     require(at+2 <= this.block.length, 'Truncated MUP block.');
     const length = this.block[at] | this.block[at+1]<<8;
-    require(length >= 2 && at+length+4 <= AUDIO_OFFSET, 'Invalid MUP record length.');
+    require(length >= 2 && at+length+4 <= this.header.audioOffset, 'Invalid MUP record length.');
     return length;
   }
   async frame(index) {
@@ -162,16 +165,18 @@ export class MupPreview {
     return framebufferToRgba(this.state.front,this.rgba);
   }
   async audioBuffer(context) {
-    const samples = this.audioLengths.reduce((a,b)=>a+b,0)/4;
+    const bytesPerSample=this.header.bytesPerSample;
+    const samples = this.audioLengths.reduce((a,b)=>a+b,0)/bytesPerSample;
     const result = context.createBuffer(2,samples,this.header.sampleRate);
     const left = result.getChannelData(0), right = result.getChannelData(1);
     let sample = 0;
     for (let block = 0; block < this.header.blockCount; block++) {
-      const offset = this.header.streamOffset + block*BLOCK_BYTES+AUDIO_OFFSET;
+      const offset = this.header.streamOffset + block*BLOCK_BYTES+this.header.audioOffset;
       const raw = await this.blob.slice(offset,offset+this.audioLengths[block]).arrayBuffer();
       const data = new DataView(raw);
-      for (let at = 0; at < raw.byteLength; at += 4, sample++) {
-        left[sample] = data.getInt16(at,true)/32768; right[sample] = data.getInt16(at+2,true)/32768;
+      for (let at = 0; at < raw.byteLength; at += bytesPerSample, sample++) {
+        left[sample] = this.header.pcm8?data.getInt8(at)/128:data.getInt16(at,true)/32768;
+        right[sample] = this.header.pcm8?data.getInt8(at+1)/128:data.getInt16(at+2,true)/32768;
       }
     }
     return result;

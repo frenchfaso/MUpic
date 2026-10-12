@@ -11,7 +11,7 @@ use std::{
 };
 
 fn help() {
-    println!("MUpic — 16 colors is all you need!\n\nUsage: mupic-encoder INPUT -o OUTPUT.mup [options]\n       mupic-encoder --prepare-lut [--cache-dir PATH]\n\n  --duration SECONDS  Convert a shorter clip (default: whole video)\n  --start SECONDS     Start at this timestamp (default: 0)\n  --threads auto|N    Exact color-search workers (default: auto)\n  --cache-dir PATH    Cache the bundled RGB24 lookup table here\n  --no-cache          Use exact color search without the lookup table\n  --prepare-lut       Populate the lookup cache without converting\n  --gain-db DB       Offline PCM gain (default: 0)\n  --title TITLE      Up to 63 ASCII characters (default: input stem)\n  --force            Replace an existing output\n  --help             Show this help\n\nOutput: native SD MUP9, PAL/3 (~16.708 fps), fixed Bayer8x8 Yliluoma author\npreset + neutral guard, 360x200 canvas, 356x200 maximum active picture.\nThe complete RGB24 lookup table is bundled losslessly compressed and\nexpanded into the system user cache; conversion does not generate it.\nRequires FFmpeg and ffprobe on PATH for conversion.");
+    println!("MUpic — 16 colors is all you need!\n\nUsage: mupic-encoder INPUT -o OUTPUT.mup [options]\n       mupic-encoder --prepare-lut [--cache-dir PATH]\n\n  --duration SECONDS  Convert a shorter clip (default: whole video)\n  --start SECONDS     Start at this timestamp (default: 0)\n  --threads auto|N    Exact color-search workers (default: auto)\n  --cache-dir PATH    Cache the bundled RGB24 lookup table here\n  --no-cache          Use exact color search without the lookup table\n  --prepare-lut       Populate the lookup cache without converting\n  --audio-format pcm16|pcm8  Audio format (default: pcm16)\n  --gain-db DB        Offline PCM16 gain (default: 0)\n  --title TITLE      Up to 63 ASCII characters (default: input stem)\n  --force            Replace an existing output\n  --help             Show this help\n\nPCM8 keeps the source frequency (8–48 kHz), with HQ Shibata noise shaping\nand automatic gain. The hardware divider approximates the source clock.\nOutput: native SD MUP9, PAL/3 (~16.708 fps), fixed Bayer8x8 Yliluoma author\npreset + neutral guard, 360x200 canvas, 356x200 maximum active picture.\nThe complete RGB24 lookup table is bundled losslessly compressed and\nexpanded into the system user cache; conversion does not generate it.\nRequires FFmpeg and ffprobe on PATH for conversion.");
 }
 #[derive(Debug)]
 struct Args {
@@ -23,6 +23,7 @@ struct Args {
     cache_dir: Option<PathBuf>,
     no_cache: bool,
     gain: f64,
+    audio_format: AudioFormat,
     title: Option<String>,
     force: bool,
 }
@@ -41,6 +42,7 @@ fn args() -> Result<Option<Action>, String> {
     let mut no_cache = false;
     let mut prepare_lut = false;
     let mut gain = 0.0;
+    let mut audio_format = AudioFormat::Pcm16;
     let mut title = None;
     let mut force = false;
     while let Some(arg) = iter.next() {
@@ -65,6 +67,13 @@ fn args() -> Result<Option<Action>, String> {
                 }
             }
             "--gain-db" => gain = next()?.parse::<f64>().map_err(|_| "Invalid gain")?,
+            "--audio-format" => {
+                audio_format = match next()?.as_str() {
+                    "pcm16" => AudioFormat::Pcm16,
+                    "pcm8" => AudioFormat::Pcm8,
+                    _ => return Err("--audio-format must be pcm16 or pcm8".into()),
+                }
+            }
             "--cache-dir" => {
                 let value = next()?;
                 if value.is_empty() {
@@ -97,6 +106,7 @@ fn args() -> Result<Option<Action>, String> {
             || duration.is_some()
             || start != 0.0
             || gain != 0.0
+            || audio_format != AudioFormat::Pcm16
             || title.is_some()
             || force
         {
@@ -109,6 +119,9 @@ fn args() -> Result<Option<Action>, String> {
     }
     let input = input.ok_or("Provide an input video; use --help for usage")?;
     let output = output.ok_or("Provide -o OUTPUT.mup")?;
+    if audio_format == AudioFormat::Pcm8 && gain != 0.0 {
+        return Err("PCM8 uses automatic gain; --gain-db applies only to PCM16".into());
+    }
     Ok(Some(Action::Encode(Args {
         input,
         output,
@@ -118,6 +131,7 @@ fn args() -> Result<Option<Action>, String> {
         cache_dir,
         no_cache,
         gain,
+        audio_format,
         title,
         force,
     })))
@@ -270,6 +284,24 @@ fn run(args: Args) -> Result<(), String> {
         ],
     )?
     .is_empty();
+    let audio_config = if audio_present && args.audio_format == AudioFormat::Pcm8 {
+        let source_rate = probe(
+            &args.input,
+            &[
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate",
+                "-of",
+                "default=nw=1:nk=1",
+            ],
+        )?
+        .parse::<u32>()
+        .map_err(|_| "Cannot determine the source audio frequency for PCM8")?;
+        AudioConfig::pcm8(source_rate)?
+    } else {
+        AudioConfig::default()
+    };
     let title = args.title.unwrap_or_else(|| {
         args.input
             .file_stem()
@@ -303,7 +335,8 @@ fn run(args: Args) -> Result<(), String> {
         }
     }
     let pcm = if audio_present {
-        let audio = Command::new("ffmpeg")
+        let mut decoder = Command::new("ffmpeg");
+        decoder
             .args([
                 "-v",
                 "error",
@@ -313,11 +346,19 @@ fn run(args: Args) -> Result<(), String> {
                 "-i",
             ])
             .arg(&args.input)
-            .args([
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-af",
+            .args(["-map", "0:a:0", "-vn", "-af"]);
+        if audio_config.format() == AudioFormat::Pcm8 {
+            let (numerator, denominator) = audio_config.rate_ratio();
+            // Scaling both metadata rates represents the fractional sampler
+            // clock exactly. Trim/pad before scaling; raw samples are neither
+            // time-stretched nor forced to a rounded Hz rate.
+            decoder.arg(format!(
+                "atrim=duration={seconds},apad=whole_dur={seconds},asetrate={},aresample={numerator},asetrate={}",
+                u64::from(audio_config.source_rate()) * u64::from(denominator),
+                audio_config.rate().round() as u32,
+            )).args(["-ac", "2", "-f", "f32le", "pipe:1"]);
+        } else {
+            decoder.args([
                 &format!("volume={}dB,apad", args.gain),
                 "-t",
                 &seconds.to_string(),
@@ -328,7 +369,9 @@ fn run(args: Args) -> Result<(), String> {
                 "-f",
                 "s16le",
                 "pipe:1",
-            ])
+            ]);
+        }
+        let audio = decoder
             .output()
             .map_err(|e| format!("Cannot run FFmpeg: {e}"))?;
         if !audio.status.success() {
@@ -337,12 +380,21 @@ fn run(args: Args) -> Result<(), String> {
                 String::from_utf8_lossy(&audio.stderr)
             ));
         }
-        audio.stdout
+        if audio_config.format() == AudioFormat::Pcm8 {
+            eprintln!(
+                "PCM8 HQ: source {} Hz, sampler {:.6} Hz, automatic gain.",
+                audio_config.source_rate(),
+                audio_config.rate()
+            );
+            prepare_pcm8_hq(&audio.stdout, audio_config.source_rate())?
+        } else {
+            audio.stdout
+        }
     } else {
         eprintln!("Input has no audio track; encoding silence.");
         vec![]
     };
-    let mut encoder = Encoder::new(count, pcm, title)?;
+    let mut encoder = Encoder::with_audio(count, pcm, title, audio_config)?;
     let filter = format!("tpad=stop_mode=clone:stop_duration={seconds},fps={},scale={active_w}:{active_h}:flags=lanczos,setsar=1,pad=360:200:{left}:{top}:black,format=rgb24", content_fps());
     let mut child = DecoderChild(
         Command::new("ffmpeg")

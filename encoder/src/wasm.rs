@@ -92,6 +92,44 @@ pub extern "C" fn mup_begin(
         Ok(())
     })
 }
+/// Float32LE stereo must already be resampled to the exact PCM8 sampler clock.
+#[no_mangle]
+pub extern "C" fn mup_begin_pcm8(
+    frames: usize,
+    float_pointer: usize,
+    float_bytes: usize,
+    title: usize,
+    title_length: usize,
+    source_rate: u32,
+) -> i32 {
+    operation(|r| {
+        let audio = AudioConfig::pcm8(source_rate)?;
+        let pcm = prepare_pcm8_hq(r.input(float_pointer, float_bytes)?, source_rate)?;
+        let title = std::str::from_utf8(r.input(title, title_length)?)
+            .map_err(|_| "Title must be ASCII")?
+            .to_owned();
+        r.encoder = Some(Encoder::with_audio(frames, pcm, title, audio)?);
+        r.result.clear();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_pcm8_info(source_rate: u32) -> i32 {
+    operation(|r| {
+        let audio = AudioConfig::pcm8(source_rate)?;
+        let (numerator, denominator) = audio.rate_ratio();
+        r.result = [
+            u32::from(audio.divider()),
+            numerator,
+            denominator,
+            audio.audio_offset() as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        Ok(())
+    })
+}
 #[no_mangle]
 pub extern "C" fn mup_quantize(pointer: usize, length: usize) -> i32 {
     operation(|r| {

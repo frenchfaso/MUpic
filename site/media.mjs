@@ -170,6 +170,166 @@ export async function audioTrackPresence(file,{signal}={}) {
     return null;
   } catch(error) { if(error instanceof ContainerError)return null;throw error; }
 }
+async function mp4Child(file,parent,type,signal) {
+  for(let at=parent.start;at<parent.end;) {
+    const box=await mp4Box(file,at,parent.end,signal);at=box.end;
+    if(box.type===type) return box;
+  }
+  return null;
+}
+function descriptor(bytes,start,end) {
+  if(start>=end) throw new ContainerError('Incomplete AAC descriptor.');
+  const tag=bytes[start++];let size=0,complete=false;
+  for(let i=0;i<4 && start<end;i++) {
+    const byte=bytes[start++];size=size*128+(byte&127);
+    if(!(byte&128)){complete=true;break;}
+  }
+  if(!complete || size>end-start) throw new ContainerError('Invalid AAC descriptor size.');
+  return {tag,start,end:start+size};
+}
+function aacConfiguration(bytes) {
+  if(bytes.length<5) throw new ContainerError('Missing AAC decoder configuration.');
+  const es=descriptor(bytes,4,bytes.length);
+  if(es.tag!==3 || es.end-es.start<3) throw new ContainerError('Missing AAC stream descriptor.');
+  let at=es.start+3;const flags=bytes[es.start+2];
+  if(flags&128) at+=2;
+  if(flags&64) {if(at>=es.end) throw new ContainerError('Incomplete AAC URL.');at+=1+bytes[at];}
+  if(flags&32) at+=2;
+  const config=descriptor(bytes,at,es.end);
+  if(config.tag!==4 || config.end-config.start<13 || bytes[config.start]!==0x40) throw new ContainerError('Unsupported MP4 audio codec.');
+  for(at=config.start+13;at<config.end;) {
+    const item=descriptor(bytes,at,config.end);at=item.end;
+    if(item.tag===5) return bytes.subarray(item.start,item.end);
+  }
+  throw new ContainerError('Missing AAC AudioSpecificConfig.');
+}
+function aacSampleRate(bytes,entryRate) {
+  let bit=0;
+  const read=count=>{
+    if(bit+count>bytes.length*8) throw new ContainerError('Incomplete AAC AudioSpecificConfig.');
+    let value=0;for(let i=0;i<count;i++,bit++) value=value*2+((bytes[bit>>3]>>(7-(bit&7)))&1);
+    return value;
+  };
+  const objectType=()=>{const type=read(5);return type===31?32+read(6):type;};
+  const frequency=()=>{const index=read(4),rate=index===15?read(24):[96000,88200,64000,48000,44100,32000,24000,22050,16000,12000,11025,8000,7350][index];if(!rate)throw new ContainerError('Invalid AAC frequency.');return rate;};
+  let type=objectType(),rate=frequency();const channels=read(4);let extended=false;
+  if(type===5 || type===29) {rate=frequency();type=objectType();extended=true;}
+  if(![1,2,3,4,17].includes(type) || channels===0) throw new ContainerError('Unsupported AAC configuration.');
+  // SBR can signal its decoded rate after the LC configuration (HE-AAC).
+  read(1);if(read(1))read(14);read(1);
+  while(!extended && bit+16<=bytes.length*8) {
+    const position=bit,sync=read(11);
+    if(sync===0x2b7) {
+      if(objectType()===5 && read(1)){rate=frequency();extended=true;}
+      break;
+    }
+    bit=position+1;
+  }
+  // A different entry rate without a signalled SBR rate is ambiguous.
+  if(!extended && entryRate && entryRate!==rate) throw new ContainerError('Ambiguous AAC sample rate.');
+  return rate;
+}
+async function mp4AacRate(file,entry,signal) {
+  if(entry.type!=='mp4a' || entry.end-entry.start<28) throw new ContainerError('Unsupported MP4 audio sample entry.');
+  const bytes=await readContainerBytes(file,entry.start,28,signal),view=new DataView(bytes.buffer);
+  const version=view.getUint16(8),extra=version===0?0:version===1?16:null;
+  if(extra===null || entry.end-entry.start<28+extra) throw new ContainerError('Unsupported MOV audio sample entry.');
+  const children={start:entry.start+28+extra,end:entry.end};
+  let esds=await mp4Child(file,children,'esds',signal);
+  if(!esds) {const wave=await mp4Child(file,children,'wave',signal);if(wave)esds=await mp4Child(file,wave,'esds',signal);}
+  if(!esds || esds.end-esds.start>65536) throw new ContainerError('Missing AAC sample rate metadata.');
+  return aacSampleRate(aacConfiguration(await readContainerBytes(file,esds.start,esds.end-esds.start,signal)),view.getUint32(24)/65536);
+}
+async function mp4SourceRate(file,signal) {
+  const movie=await mp4Child(file,{start:0,end:file.size},'moov',signal);
+  if(!movie) throw new ContainerError('Missing MP4 movie metadata.');
+  for(let at=movie.start;at<movie.end;) {
+    const track=await mp4Box(file,at,movie.end,signal);at=track.end;if(track.type!=='trak')continue;
+    const media=await mp4Child(file,track,'mdia',signal);if(!media)continue;
+    const handler=await mp4Child(file,media,'hdlr',signal);
+    if(!handler || handler.end-handler.start<12 || textAt(await readContainerBytes(file,handler.start,12,signal),8,4)!=='soun')continue;
+    const minf=await mp4Child(file,media,'minf',signal),stbl=minf && await mp4Child(file,minf,'stbl',signal),stsd=stbl && await mp4Child(file,stbl,'stsd',signal);
+    if(!stsd || stsd.end-stsd.start<8) throw new ContainerError('Missing MP4 sample description.');
+    const count=new DataView((await readContainerBytes(file,stsd.start,8,signal)).buffer).getUint32(4);
+    if(count!==1) throw new ContainerError('Ambiguous MP4 audio sample descriptions.');
+    const entry=await mp4Box(file,stsd.start+8,stsd.end,signal);
+    if(entry.end!==stsd.end) throw new ContainerError('Invalid MP4 audio sample description.');
+    return mp4AacRate(file,entry,signal);
+  }
+  throw new ContainerError('Missing MP4 audio track.');
+}
+async function webmSourceRate(file,signal) {
+  const header=await ebmlElement(file,0,file.size,signal);
+  for(let offset=header.end;offset<file.size;) {
+    const segment=await ebmlElement(file,offset,file.size,signal);offset=segment.end;if(segment.id!==0x18538067)continue;
+    for(let at=segment.start;at<segment.end;) {
+      const tracks=await ebmlElement(file,at,segment.end,signal);at=tracks.end;
+      if(tracks.id!==0x1654ae6b){if(tracks.unknown)break;continue;}
+      if(tracks.unknown) throw new ContainerError('Unknown WebM tracks metadata size.');
+      for(let child=tracks.start;child<tracks.end;) {
+        const entry=await ebmlElement(file,child,tracks.end,signal);child=entry.end;if(entry.id!==0xae)continue;
+        if(entry.unknown) throw new ContainerError('Unknown WebM track metadata size.');
+        let type,codec,rate=8000;
+        for(let next=entry.start;next<entry.end;) {
+          const item=await ebmlElement(file,next,entry.end,signal);next=item.end;
+          if(item.unknown) throw new ContainerError('Unknown WebM audio metadata size.');
+          if(item.id===0x83) {if(item.end-item.start!==1)throw new ContainerError('Invalid WebM track type.');type=(await readContainerBytes(file,item.start,1,signal))[0];}
+          if(item.id===0x86) {if(item.end-item.start>128)throw new ContainerError('Invalid WebM codec.');codec=textAt(await readContainerBytes(file,item.start,item.end-item.start,signal),0,item.end-item.start);}
+          if(item.id===0xe1) for(let audio=item.start;audio<item.end;) {
+            const property=await ebmlElement(file,audio,item.end,signal);audio=property.end;if(property.id!==0xb5)continue;
+            if(property.unknown) throw new ContainerError('Unknown WebM frequency metadata size.');
+            const size=property.end-property.start;if(size!==4 && size!==8)throw new ContainerError('Invalid WebM audio frequency.');
+            const view=new DataView((await readContainerBytes(file,property.start,size,signal)).buffer);rate=size===4?view.getFloat32(0):view.getFloat64(0);
+          }
+        }
+        if(type===2) {if(codec==='A_OPUS')return 48000;if(codec==='A_VORBIS')return rate;throw new ContainerError('Unsupported WebM audio codec.');}
+      }
+      break;
+    }
+  }
+  throw new ContainerError('Missing WebM audio track.');
+}
+// decodeAudioData resamples to the AudioContext rate, so inspect the stream first.
+export async function audioSourceSampleRate(file,{signal}={}) {
+  checkAbort(signal);
+  if(await audioTrackPresence(file,{signal})===false) return null;
+  try {
+    if(!file.slice || !Number.isSafeInteger(file.size) || file.size<8) throw new ContainerError('Unknown container.');
+    const header=await readContainerBytes(file,0,Math.min(16,file.size),signal);let rate;
+    if(['ftyp','moov','mdat','wide','free','skip'].includes(textAt(header,4,4))) rate=await mp4SourceRate(file,signal);
+    else if(new DataView(header.buffer).getUint32(0)===0x1a45dfa3)rate=await webmSourceRate(file,signal);
+    else throw new ContainerError('Unknown audio container.');
+    if(!Number.isInteger(rate)) throw new ContainerError('Invalid audio frequency.');
+    if(rate<8000 || rate>48000) throw new Error(`PCM8 preserves source frequencies from 8 to 48 kHz; this audio is ${rate} Hz. Choose PCM16 for this file.`);
+    return rate;
+  } catch(error) {
+    if(error instanceof ContainerError) throw new Error(`The original audio frequency could not be read safely (${error.message}). Please use the native CLI for this file.`);
+    throw error;
+  }
+}
+export async function decodePcm8Source(file,duration,{signal}={}) {
+  const sampleRate=await audioSourceSampleRate(file,{signal});
+  if(sampleRate===null)return {pcm:new Uint8Array(0),sampleRate:SAMPLE_RATE};
+  const Context=globalThis.AudioContext || globalThis.webkitAudioContext,Offline=globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
+  if(!Context || !Offline) throw new Error('This browser cannot decode audio. Please use the native CLI.');
+  let context,decoded;
+  try {
+    context=new Context({sampleRate});
+    const bytes=await awaitAbort(file.arrayBuffer(),signal);checkAbort(signal);
+    decoded=await awaitAbort(context.decodeAudioData(bytes),signal);
+  } catch {
+    checkAbort(signal);
+    throw new Error('The browser could not decode this file\'s audio at its original frequency. Please use the native CLI.');
+  } finally {if(context)await context.close();}
+  checkAbort(signal);
+  const divisor=Math.round(6250000/sampleRate-1.5),actualRate=6250000/(divisor+1.5),renderRate=Math.max(8000,Math.round(actualRate)),samples=Math.round(duration*actualRate);
+  const offline=new Offline(2,samples,renderRate),source=offline.createBufferSource();
+  source.buffer=decoded;source.playbackRate.value=renderRate/actualRate;source.connect(offline.destination);source.start();
+  const rendered=await awaitAbort(offline.startRendering(),signal);decoded=null;checkAbort(signal);
+  const left=rendered.getChannelData(0),right=rendered.getChannelData(1),pcm=new Uint8Array(samples*8),view=new DataView(pcm.buffer);
+  for(let sample=0;sample<samples;sample++) {view.setFloat32(sample*8,left[sample],true);view.setFloat32(sample*8+4,right[sample],true);}
+  return {pcm,sampleRate};
+}
 export function automaticGainDb(left,right) {
   if(left.length!==right.length) throw new Error('Audio channel lengths differ.');
   let peak=0;

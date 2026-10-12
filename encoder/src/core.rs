@@ -1,5 +1,11 @@
 //! Shared bounded-memory encoder used by the CLI and isolated browser workers.
-use crate::{audio::sample_at_tick, author_dither::AuthorDither, dict4_rate, lut, sd};
+#[cfg(test)]
+use crate::audio::sample_at_tick;
+use crate::{
+    audio::{AudioConfig, AudioFormat},
+    author_dither::AuthorDither,
+    dict4_rate, lut, sd,
+};
 use sha2::{Digest, Sha256};
 
 pub const VIDEO_WIDTH: usize = 360;
@@ -280,6 +286,7 @@ pub struct Encoder {
     received: usize,
     title: String,
     pcm: Vec<u8>,
+    audio: AudioConfig,
     initial: Vec<u8>,
     previous: Vec<u8>,
     metric: dict4_rate::Prepared,
@@ -297,11 +304,23 @@ pub struct Encoder {
 }
 impl Encoder {
     pub fn new(frames: usize, pcm: Vec<u8>, title: String) -> Result<Self, String> {
+        Self::with_audio(frames, pcm, title, AudioConfig::default())
+    }
+    pub fn with_audio(
+        frames: usize,
+        pcm: Vec<u8>,
+        title: String,
+        audio: AudioConfig,
+    ) -> Result<Self, String> {
         if !(2..=MAX_FRAMES).contains(&frames) {
             return Err(format!("Frame count must be 2..={MAX_FRAMES}"));
         }
-        if pcm.len() % 4 != 0 {
-            return Err("PCM must be stereo S16LE (four bytes per sample)".into());
+        if !pcm.len().is_multiple_of(audio.bytes_per_frame()) {
+            return Err(match audio.format() {
+                AudioFormat::Pcm16 => "PCM must be stereo S16LE (four bytes per sample)",
+                AudioFormat::Pcm8 => "PCM must be stereo signed PCM8 (two bytes per sample)",
+            }
+            .into());
         }
         if !title.is_ascii() || title.contains('\0') || title.len() > 63 {
             return Err("Title must contain at most 63 ASCII bytes".into());
@@ -311,6 +330,7 @@ impl Encoder {
             received: 0,
             title,
             pcm,
+            audio,
             initial: vec![],
             previous: vec![],
             metric: dict4_rate::Prepared::new(&PALETTE),
@@ -358,7 +378,7 @@ impl Encoder {
         Ok(())
     }
     fn packet(&mut self, payload: &[u8]) -> Result<(), String> {
-        if self.cursor + payload.len() + 4 > AUDIO_OFFSET {
+        if self.cursor + payload.len() + 4 > self.audio.audio_offset() {
             return Err("Video cache area overflow".into());
         }
         self.block[self.cursor..self.cursor + 2]
@@ -377,15 +397,19 @@ impl Encoder {
         if self.ticks_in_block == 0 {
             return Ok(());
         }
-        let begin = sample_at_tick(self.total_ticks - self.ticks_in_block, AUDIO_DIVIDER) * 4;
-        let end = sample_at_tick(self.total_ticks, AUDIO_DIVIDER) * 4;
+        let begin = self
+            .audio
+            .sample_at_tick(self.total_ticks - self.ticks_in_block)
+            * self.audio.bytes_per_frame();
+        let end = self.audio.sample_at_tick(self.total_ticks) * self.audio.bytes_per_frame();
         let length = end - begin;
-        if length > CACHE_BYTES - AUDIO_OFFSET {
+        let audio_offset = self.audio.audio_offset();
+        if length > CACHE_BYTES - audio_offset {
             return Err("PCM cache area overflow".into());
         }
         let available = self.pcm.len().min(end).saturating_sub(begin);
         if available != 0 {
-            self.block[AUDIO_OFFSET..AUDIO_OFFSET + available]
+            self.block[audio_offset..audio_offset + available]
                 .copy_from_slice(&self.pcm[begin..begin + available]);
         }
         self.stream_hash.update(&self.block);
@@ -440,7 +464,15 @@ impl Encoder {
             (4, 1, 9),
             (5, 1, 9),
             (6, 1, 13),
-            (7, 1, 1),
+            (
+                7,
+                1,
+                if self.audio.format() == AudioFormat::Pcm8 {
+                    3
+                } else {
+                    1
+                },
+            ),
             (8, 2, 256),
             (10, 2, 360),
             (12, 2, 200),
@@ -452,9 +484,9 @@ impl Encoder {
             (22, 1, 13),
             (24, 4, records),
             (28, 4, blocks),
-            (32, 2, AUDIO_DIVIDER as usize),
+            (32, 2, self.audio.divider() as usize),
             (34, 2, 20),
-            (36, 4, AUDIO_OFFSET),
+            (36, 4, self.audio.audio_offset()),
             (40, 4, CACHE_BYTES),
             (44, 4, 256),
             (48, 4, initial_offset),
@@ -464,7 +496,7 @@ impl Encoder {
             (64, 4, stream_offset + blocks * CACHE_BYTES),
             (68, 4, self.frames),
             (72, 2, records - (blocks - 1) * CACHE_TICKS),
-            (76, 4, AUDIO_RATE as usize),
+            (76, 4, self.audio.source_rate() as usize),
         ];
         for &(at, count, value) in values {
             prefix[at..at + count].copy_from_slice(&(value as u32).to_le_bytes()[..count]);
@@ -479,8 +511,8 @@ impl Encoder {
         for block in 0..blocks {
             let start = block * CACHE_TICKS;
             let end = (start + CACHE_TICKS).min(records);
-            let bytes =
-                (sample_at_tick(end, AUDIO_DIVIDER) - sample_at_tick(start, AUDIO_DIVIDER)) * 4;
+            let bytes = (self.audio.sample_at_tick(end) - self.audio.sample_at_tick(start))
+                * self.audio.bytes_per_frame();
             prefix[256 + block * 3..259 + block * 3]
                 .copy_from_slice(&(bytes as u32).to_le_bytes()[..3]);
         }
@@ -502,6 +534,57 @@ fn stream_offset(frames: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pcm8_container_uses_signed_bytes_fractional_lengths_and_valid_checksums() {
+        for rate in [8000, 11025, 22050, 44100, 48000] {
+            let audio = AudioConfig::pcm8(rate).unwrap();
+            let frames = 9;
+            let ticks = frames * FRAME_TICKS;
+            let pcm: Vec<_> = (0..audio.sample_at_tick(ticks - 1) * 2)
+                .map(|n| n as u8)
+                .collect();
+            let mut encoder =
+                Encoder::with_audio(frames, pcm.clone(), "PCM8 HQ".into(), audio).unwrap();
+            for _ in 0..frames {
+                encoder.push(&vec![0; PACKED_BYTES]).unwrap();
+            }
+            let prefix = encoder.finish().unwrap();
+            let stream = encoder.take_output();
+            assert_eq!(prefix[7], 3);
+            assert_eq!(
+                u16::from_le_bytes(prefix[32..34].try_into().unwrap()),
+                audio.divider()
+            );
+            assert_eq!(
+                u32::from_le_bytes(prefix[36..40].try_into().unwrap()) as usize,
+                audio.audio_offset()
+            );
+            assert_eq!(u32::from_le_bytes(prefix[76..80].try_into().unwrap()), rate);
+            assert_eq!(&prefix[128..160], &Sha256::digest(&stream)[..]);
+            let mut crc = crc32fast::Hasher::new();
+            crc.update(&prefix[..224]);
+            crc.update(&prefix[228..256]);
+            assert_eq!(
+                u32::from_le_bytes(prefix[224..228].try_into().unwrap()),
+                crc.finalize()
+            );
+            let mut reconstructed_pcm = Vec::new();
+            for block in 0..ticks.div_ceil(CACHE_TICKS) {
+                let start = block * CACHE_TICKS;
+                let end = (start + CACHE_TICKS).min(ticks);
+                let expected = (audio.sample_at_tick(end) - audio.sample_at_tick(start)) * 2;
+                let length_at = 256 + block * 3;
+                let length = usize::from(prefix[length_at])
+                    | usize::from(prefix[length_at + 1]) << 8
+                    | usize::from(prefix[length_at + 2]) << 16;
+                assert_eq!(length, expected);
+                let at = block * CACHE_BYTES + audio.audio_offset();
+                reconstructed_pcm.extend_from_slice(&stream[at..at + length]);
+            }
+            assert_eq!(&reconstructed_pcm[..pcm.len()], &pcm);
+            assert!(reconstructed_pcm[pcm.len()..].iter().all(|&v| v == 0));
+        }
+    }
     #[test]
     fn draining_cache_blocks_preserves_pcm_timing_and_zero_pads_the_tail() {
         let frames = 9;

@@ -824,10 +824,75 @@ browser_validate_header:
     cpx #browser_header_values_end-browser_header_values
     bcc !fixed-
     lda HEADER+7
-    and #$fe
+    cmp #2 // 0/1 preserve legacy PCM16; 3 is signed PCM8 stereo.
+    bcc !check_next+
+    cmp #3
     beq !check_next+
     jmp !bad+
 !check_next:
+    lda HEADER+7
+    and #2
+    beq !pcm16_offset+
+    lda HEADER+37
+    cmp #$60 // PCM8: $036000 leaves 40 KiB per stream block.
+    beq !check_next+
+    jmp !bad+
+!pcm16_offset:
+    lda HEADER+37
+    cmp #$70 // PCM16: $037000 leaves 36 KiB per stream block.
+    beq !check_next+
+    jmp !bad+
+!check_next:
+    lda HEADER+7
+    and #2
+    beq !pcm8_valid+
+    // PCM8 uses the nearest physical divider for a nominal 8..48 kHz
+    // source. Keep legacy PCM16 metadata acceptance unchanged.
+    lda HEADER+78
+    ora HEADER+79
+    beq !rate_low+
+    jmp !bad+
+!rate_low:
+    lda HEADER+77
+    cmp #$1f
+    bcs !rate_minimum+
+    jmp !bad+
+!rate_minimum:
+    bne !rate_high+
+    lda HEADER+76
+    cmp #$40 // 8000
+    bcs !rate_high+
+    jmp !bad+
+!rate_high:
+    lda HEADER+77
+    cmp #$bb
+    bcc !divider_high+
+    beq !rate_maximum+
+    jmp !bad+
+!rate_maximum:
+    lda HEADER+76
+    cmp #$81 // up to 48000 inclusive
+    bcc !divider_high+
+    jmp !bad+
+!divider_high:
+    lda HEADER+33
+    cmp #3
+    bcc !divider_low+
+    beq !divider_maximum+
+    jmp !bad+
+!divider_maximum:
+    lda HEADER+32
+    cmp #13 // up to 780 inclusive
+    bcc !pcm8_valid+
+    jmp !bad+
+!divider_low:
+    lda HEADER+33
+    bne !pcm8_valid+
+    lda HEADER+32
+    cmp #129
+    bcs !pcm8_valid+
+    jmp !bad+
+!pcm8_valid:
     lda HEADER+26
     ora HEADER+27
     ora HEADER+30
@@ -966,11 +1031,11 @@ browser_validate_header:
     rts
 browser_header_offsets:
     .byte 0,1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23
-    .byte 34,35,36,37,38,39,40,41,42,43,44,45,46,47,52,53,54,55
+    .byte 34,35,36,38,39,40,41,42,43,44,45,46,47,52,53,54,55
     .byte 60,61,64,65,73
 browser_header_values:
     .byte 77,85,80,57,9,SPAN_VERSION,13,0,1,<WIDE_WIDTH,>WIDE_WIDTH,<WIDE_HEIGHT,>WIDE_HEIGHT,<ACTIVE_WIDTH,>ACTIVE_WIDTH,<ACTIVE_HEIGHT,>ACTIVE_HEIGHT,<ACTIVE_TOP,>ACTIVE_TOP,3,0,13,0
-    .byte 20,0,0,112,3,0,0,0,4,0,0,1,0,0,0,180,0,0
+    .byte 20,0,0,3,0,0,0,4,0,0,1,0,0,0,180,0,0
     .byte 0,0,0,0,0
 browser_header_values_end:
 

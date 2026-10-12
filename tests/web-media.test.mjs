@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {videoPlan,asciiTitle,interleavePcm,automaticGainDb,audioTrackPresence,decodePcm,awaitAbort,SAMPLE_RATE,MAX_FRAMES} from '../site/media.mjs';
+import {readFile} from 'node:fs/promises';
+import {videoPlan,asciiTitle,interleavePcm,automaticGainDb,audioTrackPresence,audioSourceSampleRate,decodePcm,decodePcm8Source,awaitAbort,SAMPLE_RATE,MAX_FRAMES} from '../site/media.mjs';
 import {CONTENT_FPS} from '../site/mup-decoder.mjs';
 test('16:9 fits the native SD active area without stretching',()=>{
   const plan=videoPlan(60,1920,1080);assert.equal(plan.width,356);assert.equal(plan.height,200);assert.equal(plan.left,2);assert.equal(plan.top,0);
@@ -54,6 +55,55 @@ function webm(types,unknownSegment=false) {
   const entries=types.flatMap(type=>Array.from(ebml([0xae],type===undefined?new Uint8Array():ebml([0x83],Uint8Array.of(type)))));
   return new Blob([ebml([0x1a,0x45,0xdf,0xa3]),ebml([0x18,0x53,0x80,0x67],ebml([0x16,0x54,0xae,0x6b],Uint8Array.from(entries)),unknownSegment)]);
 }
+function bytes(...parts) {return Uint8Array.from(parts.flatMap(part=>Array.from(part)));}
+function aacTrack(rate,asc=Uint8Array.of(0x12,0x10),{codec='mp4a',version=0,wave=false}={}) {
+  const header=new Uint8Array(28+(version===1?16:0)),view=new DataView(header.buffer);view.setUint16(8,version);view.setUint16(16,2);view.setUint16(18,16);view.setUint32(24,rate*65536);
+  const descriptor=(tag,payload)=>Uint8Array.of(tag,payload.length,...payload);
+  const config=new Uint8Array(13);config[0]=0x40;config[1]=0x15;
+  let esds=mp4Box('esds',bytes(new Uint8Array(4),descriptor(3,bytes(Uint8Array.of(0,1,0),descriptor(4,bytes(config,descriptor(5,asc)))))));
+  if(wave)esds=mp4Box('wave',esds);
+  const count=Uint8Array.of(0,0,0,0,0,0,0,1),handler=new Uint8Array(12);handler.set(new TextEncoder().encode('soun'),8);
+  return mp4Box('trak',mp4Box('mdia',bytes(mp4Box('hdlr',handler),mp4Box('minf',mp4Box('stbl',mp4Box('stsd',bytes(count,mp4Box(codec,bytes(header,esds)))))))));
+}
+function aacBits(...fields) {
+  const bits=fields.map(([value,size])=>value.toString(2).padStart(size,'0')).join(''),result=new Uint8Array(Math.ceil(bits.length/8));
+  for(let bit=0;bit<bits.length;bit++)if(bits[bit]==='1')result[bit>>3]|=1<<(7-(bit&7));
+  return result;
+}
+function webmAudio(codec,rate,unknownSegment=false) {
+  const frequency=new Uint8Array(8);new DataView(frequency.buffer).setFloat64(0,rate);
+  const entry=ebml([0xae],bytes(ebml([0x83],Uint8Array.of(2)),ebml([0x86],new TextEncoder().encode(codec)),ebml([0xe1],ebml([0xb5],frequency))));
+  return new Blob([ebml([0x1a,0x45,0xdf,0xa3]),ebml([0x18,0x53,0x80,0x67],ebml([0x16,0x54,0xae,0x6b],entry),unknownSegment)]);
+}
+test('PCM8 reads original AAC rates, including MOV wave entries and signalled HE-AAC',async()=>{
+  assert.equal(await audioSourceSampleRate(mp4(aacTrack(44100))),44100);
+  assert.equal(await audioSourceSampleRate(mp4(aacTrack(44100,Uint8Array.of(0x12,0x10),{version:1,wave:true}))),44100);
+  const he=aacBits([5,5],[7,4],[2,4],[4,4],[2,5],[0,3]);
+  assert.equal(await audioSourceSampleRate(mp4(aacTrack(22050,he))),44100);
+  const extension=aacBits([2,5],[7,4],[2,4],[0,3],[0x2b7,11],[5,5],[1,1],[4,4]);
+  assert.equal(await audioSourceSampleRate(mp4(aacTrack(22050,extension))),44100);
+  const explicit=aacBits([2,5],[15,4],[32000,24],[2,4],[0,3]);
+  assert.equal(await audioSourceSampleRate(mp4(aacTrack(32000,explicit))),32000);
+});
+test('PCM8 uses the 48 kHz Opus decoded stream rate and Vorbis SamplingFrequency',async()=>{
+  assert.equal(await audioSourceSampleRate(webmAudio('A_OPUS',24000,true)),48000);
+  assert.equal(await audioSourceSampleRate(webmAudio('A_VORBIS',32000)),32000);
+  assert.equal(await audioSourceSampleRate(mp4(mp4Track('vide'))),null);
+  assert.equal(await audioSourceSampleRate(webm([1],true)),null);
+});
+test('PCM8 metadata from genuine FFmpeg AAC and Opus containers preserves source rates',async()=>{
+  // Generated from 0.04 s of stereo silence; these contain full codec metadata.
+  for(const [filename,expected] of [['rate-aac-44100.mp4',44100],['rate-opus-48000.webm',48000]]) {
+    const source=new Blob([await readFile(new URL(`./fixtures/${filename}`,import.meta.url))]);
+    assert.equal(await audioSourceSampleRate(source),expected);
+  }
+});
+test('PCM8 rejects unknown, truncated, ambiguous and unsupported stream metadata explicitly',async()=>{
+  for(const source of [new Blob(['unknown source']),mp4(mp4Track('vide'),mp4Track('soun')),mp4(aacTrack(48000)),mp4(aacTrack(44100,Uint8Array.of(0x12,0x10),{codec:'ac-3'})),webmAudio('A_FLAC',44100)])
+    await assert.rejects(audioSourceSampleRate(source),/native CLI/);
+  const truncated=mp4(aacTrack(44100));await assert.rejects(audioSourceSampleRate(truncated.slice(0,truncated.size-1)),/native CLI/);
+  await assert.rejects(audioSourceSampleRate(webmAudio('A_VORBIS',96000)),/96000 Hz.*Choose PCM16/);
+});
 test('MP4 and MOV handler metadata distinguishes absent audio from undecodable tracks',async()=>{
   assert.equal(await audioTrackPresence(mp4(mp4Track('vide'))),false);
   assert.equal(await audioTrackPresence(mp4(mp4Track('vide'),mp4Track('soun'))),true);
@@ -92,6 +142,38 @@ function mockAudio(t,{left,right,reject=false,decode,render}) {
     if(originalOffline===undefined)delete globalThis.OfflineAudioContext;else globalThis.OfflineAudioContext=originalOffline;});
   return calls;
 }
+function mockPcm8Audio(t,{left,right,decode,render}) {
+  const originalContext=globalThis.AudioContext,originalOffline=globalThis.OfflineAudioContext,calls={closed:0};
+  globalThis.AudioContext=class {
+    constructor(options){calls.decodeRate=options.sampleRate;}
+    async decodeAudioData(){return decode?decode():{sampleRate:calls.decodeRate};}
+    async close(){calls.closed++;}
+  };
+  globalThis.OfflineAudioContext=class {
+    constructor(channels,samples,rate){Object.assign(calls,{channels,samples,rate});}
+    createBufferSource(){const source={playbackRate:{value:1},connect(){},start(){calls.playbackRate=source.playbackRate.value;}};return source;}
+    async startRendering(){return render?render():{getChannelData:channel=>channel?right:left};}
+  };
+  t.after(()=>{if(originalContext===undefined)delete globalThis.AudioContext;else globalThis.AudioContext=originalContext;
+    if(originalOffline===undefined)delete globalThis.OfflineAudioContext;else globalThis.OfflineAudioContext=originalOffline;});
+  return calls;
+}
+test('PCM8 retains original frequency and sends unquantized stereo floats to the shared DSP',async t=>{
+  const left=Float32Array.of(0,0.125,0.25,-0.75),right=Float32Array.of(0,-0.125,0.5,0.75),calls=mockPcm8Audio(t,{left,right});
+  const rate=6250000/(Math.round(6250000/44100-1.5)+1.5),{pcm,sampleRate}=await decodePcm8Source(mp4(aacTrack(44100)),4/rate);
+  assert.equal(sampleRate,44100);assert.equal(calls.decodeRate,44100);assert.equal(calls.samples,4);assert.equal(calls.channels,2);assert.equal(calls.rate,Math.round(rate));assert.equal(calls.closed,1);
+  assert.ok(Math.abs(calls.playbackRate-calls.rate/rate)<1e-15);
+  const view=new DataView(pcm.buffer);
+  assert.deepEqual(Array.from({length:8},(_,sample)=>view.getFloat32(sample*4,true)),[0,0,0.125,-0.125,0.25,0.5,-0.75,0.75]);
+});
+test('PCM8 supports the 8 kHz sampler rate below OfflineAudioContext minimum without timing drift',async t=>{
+  const calls=mockPcm8Audio(t,{left:Float32Array.of(0.25),right:Float32Array.of(-0.25)}),rate=6250000/(Math.round(6250000/8000-1.5)+1.5);
+  const {pcm,sampleRate}=await decodePcm8Source(mp4(aacTrack(8000,Uint8Array.of(0x15,0x90))),1/rate);
+  assert.equal(sampleRate,8000);assert.equal(pcm.length,8);assert.equal(calls.rate,8000);assert.ok(rate<8000);assert.equal(calls.playbackRate,8000/rate);
+});
+test('PCM8 video-only sources produce empty audio without requiring browser audio contexts',async()=>{
+  assert.deepEqual(await decodePcm8Source(mp4(mp4Track('vide')),0.12),{pcm:new Uint8Array(0),sampleRate:SAMPLE_RATE});
+});
 test('audio decoding automatically normalizes rendered PCM and retains the full planned duration',async t=>{
   const left=Float32Array.of(0,0.125,0.25,0),right=Float32Array.of(0,-0.125,-0.25,0),calls=mockAudio(t,{left,right});
   const pcm=await decodePcm(mp4(mp4Track('vide'),mp4Track('soun')),4/SAMPLE_RATE);
@@ -161,6 +243,16 @@ test('offline PCM rendering cancels before startRendering settles',{timeout:1000
   const decoding=decodePcm(mp4(mp4Track('vide'),mp4Track('soun')),0.12,{signal:controller.signal});
   await started.promise;controller.abort();await assert.rejects(decoding,{name:'AbortError'});
   assert.equal(calls.closed,1);render.reject(new Error('late render failure'));
+});
+test('PCM8 cancellation interrupts source decode and closes its AudioContext',{timeout:1000},async t=>{
+  const controller=new AbortController(),decode=deferred(),started=deferred(),calls=mockPcm8Audio(t,{decode(){started.resolve();return decode.promise;}});
+  const decoding=decodePcm8Source(mp4(aacTrack(44100)),0.12,{signal:controller.signal});
+  await started.promise;controller.abort();await assert.rejects(decoding,{name:'AbortError'});assert.equal(calls.closed,1);decode.reject(new Error('late decode failure'));
+});
+test('PCM8 cancellation interrupts offline rendering promptly',{timeout:1000},async t=>{
+  const controller=new AbortController(),render=deferred(),started=deferred(),calls=mockPcm8Audio(t,{render(){started.resolve();return render.promise;}});
+  const decoding=decodePcm8Source(mp4(aacTrack(44100)),0.12,{signal:controller.signal});
+  await started.promise;controller.abort();await assert.rejects(decoding,{name:'AbortError'});assert.equal(calls.closed,1);render.reject(new Error('late render failure'));
 });
 test('container titles are ASCII and fit the64-byte field',()=>{
   assert.equal(asciiTitle('Café 🌞.mp4'),'Cafe');assert.equal(asciiTitle('😀.webm'),'MY VIDEO');assert.equal(asciiTitle('x'.repeat(100)+'.mp4').length,63);

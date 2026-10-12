@@ -1,6 +1,6 @@
 import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
-import {MupPlayer} from './preview-player.mjs?v=a6729b77ebe488a6';
-import {videoPlan,asciiTitle,decodePcm,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=81de3bb75e9c558f';
+import {MupPlayer} from './preview-player.mjs?v=6fb2d3e599591c82';
+import {videoPlan,asciiTitle,decodePcm,decodePcm8Source,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=0dd23ebe63904142';
 import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=f2dd967349f8b8a2';
 import {ConversionProgress} from './conversion-progress.mjs?v=ff2c0e223da601a2';
 const $=id=>document.getElementById(id);
@@ -111,6 +111,8 @@ function clearOutput() {
 }
 function setBusy(value) {
   busy=value;$('choose-video').disabled=value;$('video-file').disabled=value;
+  $('encode').disabled=value||!selected||!plan;
+  $('audio-format').disabled=value;
   $('drop-zone').classList.toggle('busy',value);
 }
 async function readyPool() {
@@ -175,10 +177,28 @@ async function selectFile(file) {
     plan=videoPlan(decoder.duration,decoder.videoWidth,decoder.videoHeight);selected=file;
     $('comparison').hidden=false;
     $('file-details').textContent=`${file.name} · ${timeLabel(decoder.duration)} · ${sizeLabel(file.size)}`;
+    resultStatus('Video ready. Choose the audio format, then press Encode.');
+  } catch(error) {
+    selected=null;plan=null;
+    clearOutput();
+    if(error.name==='AbortError'||signal.aborted)resultStatus('Cancelled. Choose a video to try again.');
+    else resultStatus(error.message,{error:true});
+  } finally {
+    abortController?.abort();
+    abortController=null;setBusy(false);
+    if(conversionDialog.open)conversionDialog.close();
+  }
+}
+async function encodeSelected() {
+  if(busy||!selected||!plan)return;
+  pauseOriginal();clearOutput();resultStatus('');
+  abortController=new AbortController();const signal=abortController.signal;
+  setBusy(true);
+  try {
     await convertSelected(signal);
   } catch(error) {
     clearOutput();
-    if(error.name==='AbortError'||signal.aborted)resultStatus('Cancelled. Choose a video to try again.');
+    if(error.name==='AbortError'||signal.aborted)resultStatus('Cancelled. Press Encode to try again.');
     else resultStatus(error.message,{error:true});
   } finally {
     abortController?.abort();
@@ -186,6 +206,13 @@ async function selectFile(file) {
     if(conversionDialog.open)conversionDialog.close();
   }
 }
+$('encode').addEventListener('click',encodeSelected);
+$('audio-format').addEventListener('change',()=>{
+  if(selected&&!busy) {
+    clearOutput();
+    resultStatus('Audio format updated. Press Encode when ready.');
+  }
+});
 $('choose-video').addEventListener('click',()=>{$('video-file').value='';$('video-file').click();});
 $('video-file').addEventListener('change',event=>selectFile(event.target.files[0]));
 const drop=$('drop-zone');
@@ -225,12 +252,17 @@ async function convertSelected(signal) {
     if(!hasLut()&&!standardEncoding)throw new DOMException('Color table loading was cancelled.','AbortError');
   }
   await awaitAbort(readyPool(),signal);checkAbort(signal);status('Preparing audio…');
-  const pcm=await decodePcm(selected,plan.duration,{signal});
+  let audioFormat=document.querySelector('input[name="audio-format"]:checked').value;
+  const audio=audioFormat==='pcm8'
+    ?await decodePcm8Source(selected,plan.duration,{signal})
+    :{pcm:await decodePcm(selected,plan.duration,{signal}),sampleRate:22085};
+  const {pcm,sampleRate}=audio;
+  if(audioFormat==='pcm8'&&!pcm.byteLength)audioFormat='pcm16';
   checkAbort(signal);
   encoder=new WorkerClient(assetUrl('./encoder-worker.mjs'));
   status('Preparing…');
   await encoder.call('init',{url:wasmUrl});checkAbort(signal);
-  await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name)},[pcm.buffer]);
+  await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name),audioFormat,sampleRate},[pcm.buffer]);
   updateProgress(progress.start());
   const pending=[];
   const addChunks=chunks=>{for(const chunk of chunks)parts.push(new Blob([chunk]));};
@@ -272,7 +304,7 @@ async function convertSelected(signal) {
   if(!painted)throw new Error('The MUpic preview could not be displayed.');
   $('download').hidden=false;
   $('conversion-progress').value=progress.complete().value;
-  resultStatus(`Ready · ${sizeLabel(movie.size)}`);
+  resultStatus(`Ready · ${sizeLabel(movie.size)} · ${preview.header.pcm8?'PCM8 HQ':'PCM16'} · ${(preview.header.sampleRate/1000).toLocaleString(undefined,{maximumFractionDigits:3})} kHz`);
 }
 window.addEventListener('pagehide',event=>{
   abortController?.abort();preparationController?.abort();pool?.close();encoder?.close();pauseOriginal();

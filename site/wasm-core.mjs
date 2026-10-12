@@ -11,7 +11,7 @@ export class EncoderCore {
   }
   constructor(exports) {
     this.exports = exports;
-    for (const name of ['memory','mup_alloc','mup_free','mup_quantize','mup_begin','mup_encode_packed',
+    for (const name of ['memory','mup_alloc','mup_free','mup_quantize','mup_begin','mup_begin_pcm8','mup_encode_packed',
       'mup_finish','mup_result_ptr','mup_result_len','mup_output_ptr','mup_output_len','mup_output_clear',
       'mup_error_ptr','mup_error_len','mup_prepare_keys','mup_plan_keys','mup_import_plans',
       'mup_lut_identity','mup_lut_info','mup_lut_patterns','mup_lut_asset_begin','mup_lut_asset_chunk',
@@ -95,9 +95,14 @@ export class EncoderCore {
   }
   abortLutAsset() {this.check(this.exports.mup_lut_asset_abort());}
   resetLut() { this.check(this.exports.mup_lut_reset()); }
-  begin(frameCount,pcm,title) {
+  begin(frameCount,pcm,title,{audioFormat='pcm16',sampleRate=22085}={}) {
+    if(!['pcm16','pcm8'].includes(audioFormat))throw new Error('Unsupported audio format.');
     const titleBytes=new TextEncoder().encode(title), pcmPointer=this.allocate(pcm), titlePointer=this.allocate(titleBytes);
-    try { this.check(this.exports.mup_begin(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength)); }
+    try {
+      this.check(audioFormat==='pcm8'
+        ?this.exports.mup_begin_pcm8(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength,sampleRate)
+        :this.exports.mup_begin(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength));
+    }
     finally { this.free(pcmPointer,pcm.byteLength); this.free(titlePointer,titleBytes.byteLength); }
   }
   frame(packed) {

@@ -9,6 +9,46 @@ import {MupPreview,PALETTE,CONTENT_FPS} from '../site/mup-decoder.mjs';
 const wasmFile=new URL('../site/assets/encoder.wasm',import.meta.url);
 const makeCore=async()=>new EncoderCore((await WebAssembly.instantiate(await readFile(wasmFile),{})).instance.exports);
 const rowFrame=front=>Uint8Array.from({length:36000},(_,i)=>front[(i%180)*256+Math.floor(i/180)]);
+test('PCM8 HQ preserves source rate and stereo signed samples at 44.1 and 48 kHz',async()=>{
+  for(const rate of [44100,48000]) {
+    const core=await makeCore(),frames=8,divider=Math.round(6250000/rate-1.5);
+    const actual=6250000/(divider+1.5),samples=Math.ceil(frames/CONTENT_FPS*actual);
+    const floats=new Uint8Array(samples*8),view=new DataView(floats.buffer);
+    for(let sample=0;sample<samples;sample++) {
+      const signal=Math.sin(sample*2*Math.PI*1000/actual)*0.8;
+      view.setFloat32(sample*8,signal,true);view.setFloat32(sample*8+4,-signal,true);
+    }
+    core.begin(frames,floats,'PCM8 HQ TEST',{audioFormat:'pcm8',sampleRate:rate});
+    const parts=[];for(let i=0;i<frames;i++)parts.push(...core.frame(new Uint8Array(36000)));
+    const done=core.finish(),blob=new Blob([done.prefix,...parts,...done.chunks]);
+    const preview=await MupPreview.open(blob);
+    assert.equal(preview.header.pcm8,true);assert.equal(preview.header.bytesPerSample,2);
+    assert.equal(preview.header.sampleRate,rate);assert.equal(preview.header.divider,divider);
+    assert.equal(preview.header.audioOffset,221184);assert.equal(preview.header.audioHz,actual);
+    assert.ok(preview.audioLengths.every(length=>length%2===0&&length<=40960));
+    const fake={createBuffer(channels,n,sampleRate){return {sampleRate,data:[new Float32Array(n),new Float32Array(n)],getChannelData(i){return this.data[i];}};}};
+    const audio=await preview.audioBuffer(fake);
+    assert.equal(audio.sampleRate,rate);assert.ok(audio.data[0].some(x=>x<0));
+    assert.ok(audio.data[0].every(x=>Math.abs(x)<0.95),'noise shaping retains unclipped headroom');
+    // Independent shaped noise can differ substantially sample-by-sample at
+    // high frequencies; compare the stereo waveform after a short low-pass.
+    for(let start=0;start<992;start+=8) {
+      let sum=0;for(let i=start;i<start+8;i++)sum+=audio.data[0][i]+audio.data[1][i];
+      assert.ok(Math.abs(sum/8)<0.08,'stereo waveform remains independently signed');
+    }
+    await preview.frame(frames-1);assert.ok(preview.state.front.every(x=>x===0));
+  }
+});
+test('PCM8 mode validates metadata and pads absent audio with signed silence',async()=>{
+  const core=await makeCore();
+  assert.throws(()=>core.begin(2,new Uint8Array(),'BAD',{audioFormat:'pcm8',sampleRate:96000}),/8000.*48000/);
+  assert.throws(()=>core.begin(2,new Uint8Array(4),'BAD',{audioFormat:'pcm8',sampleRate:44100}),/stereo|Float32|F32/i);
+  core.begin(2,new Uint8Array(),'SILENT',{audioFormat:'pcm8',sampleRate:44100});
+  const parts=[...core.frame(new Uint8Array(36000)),...core.frame(new Uint8Array(36000))],done=core.finish();
+  const blob=new Blob([done.prefix,...parts,...done.chunks]),preview=await MupPreview.open(blob);
+  const bytes=new Uint8Array(await blob.slice(preview.header.streamOffset+preview.header.audioOffset).arrayBuffer());
+  assert.ok(bytes.every(x=>x===0));
+});
 test('production WASM omits offline LUT generation and validation APIs',async()=>{
   const core=await makeCore();
   for(const name of ['mup_lut_generate','mup_lut_block_identity','mup_lut_candidate_count','mup_lut_validate'])

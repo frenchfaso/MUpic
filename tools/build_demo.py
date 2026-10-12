@@ -61,6 +61,15 @@ def main():
     validate_asset(args.site)
     specs = json.loads((ROOT/'media'/'checksums.json').read_text())['files']
     files = {'MUPIC.PRG': ROOT/'releases'/'MUPIC.PRG'}
+    # The emulator boots the registered PRG before browsing the USB image.
+    # Keep that copy and its integrity metadata aligned with the USB player.
+    manifest_path = args.site/'manifest.json'
+    manifest = json.loads(manifest_path.read_text())
+    player_asset = next(asset for asset in manifest['mupic']['assets'] if asset['path']=='/mupic.prg')
+    player_copy = args.site/'data'/'mupic.prg'
+    player_copy.write_bytes(files['MUPIC.PRG'].read_bytes())
+    player_asset.update(bytes=player_copy.stat().st_size, sha256=sha256_file(player_copy))
+    manifest_path.write_text(json.dumps(manifest,indent=2)+'\n')
     for name, spec in specs.items():
         packed = ROOT/'media'/(name+'.gz')
         if packed.stat().st_size != spec['compressed_bytes'] or sha256_file(packed) != spec['compressed_sha256']:

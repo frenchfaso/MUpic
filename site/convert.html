@@ -5,7 +5,7 @@
   <meta name="theme-color" content="#18182b">
   <meta name="description" content="Convert a local video to MUpic, privately in your browser.">
   <title>Convert · MUpic</title>
-  <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6"><link rel="stylesheet" href="mupic.css?v=a8e271e937ab32a9"><link rel="stylesheet" href="converter.css?v=4370ab94139841df">
+  <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6"><link rel="stylesheet" href="mupic.css?v=a8e271e937ab32a9"><link rel="stylesheet" href="converter.css?v=2bbab6b46dba5a95">
 </head>
 <body data-preset="converter">
 <main>
@@ -18,15 +18,22 @@
       <a href="https://github.com/frenchfaso/MUpic">GitHub</a>
     </nav>
   </header>
+  <fieldset class="audio-format" id="audio-format">
+    <legend>Audio</legend>
+    <label><input type="radio" name="audio-format" value="pcm16" checked> PCM16</label>
+    <label><input type="radio" name="audio-format" value="pcm8"> PCM8 · HQ noise shaping</label>
+    <small>PCM8 keeps the source sample rate (8–48 kHz), using the nearest hardware divider. Audio levels are adjusted automatically.</small>
+  </fieldset>
   <section id="drop-zone" class="drop-zone" aria-label="Choose a local video">
     <span class="drop-icon" aria-hidden="true">↓</span>
     <p>Drop a video</p>
     <button id="choose-video" type="button">Choose a video</button>
-    <small>Conversion starts automatically. Audio is included when present, with its level adjusted automatically. Videos stay on your device.</small>
+    <small>Choose a video and audio format, then press Encode. Audio is included when present, with its level adjusted automatically. Videos stay on your device.</small>
     <input id="video-file" type="file" accept="video/*,.mp4,.webm,.mov,.m4v,.mkv" hidden>
   </section>
   <section class="conversion-panel" aria-label="Conversion">
     <p id="file-details" class="file-details" hidden></p>
+    <button id="encode" type="button" disabled>Encode</button>
     <p id="conversion-result" role="status" aria-live="polite" hidden></p>
   </section>
   <section id="comparison" class="comparison" aria-label="Original and converted video preview" hidden>
@@ -67,6 +74,6 @@
   <progress id="conversion-progress" max="1" aria-label="Conversion progress"></progress>
   <div class="progress-dialog-actions"><button id="cancel" type="button" autofocus>Cancel</button></div>
 </dialog>
-<script type="module" src="converter.mjs?v=82031f8bb6c9495b"></script>
+<script type="module" src="converter.mjs?v=4dbe0979ae41ac01"></script>
 </body>
 </html>

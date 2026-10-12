@@ -17,7 +17,7 @@ RUSTFLAGS = " ".join([
     "-Clink-arg=--strip-all",
 ])
 REQUIRED = {
-    "memory", "mup_alloc", "mup_free", "mup_begin", "mup_quantize",
+    "memory", "mup_alloc", "mup_free", "mup_begin", "mup_begin_pcm8", "mup_pcm8_info", "mup_quantize",
     "mup_encode_packed", "mup_finish", "mup_result_ptr", "mup_result_len",
     "mup_output_ptr", "mup_output_len", "mup_output_clear",
     "mup_preview_ptr", "mup_preview_len", "mup_error_ptr", "mup_error_len",

@@ -7,4 +7,5 @@ pub mod lut;
 mod sd;
 mod wasm;
 
+pub use audio::{prepare_pcm8_hq, AudioConfig, AudioFormat, PCM8_AUDIO_OFFSET};
 pub use core::*;

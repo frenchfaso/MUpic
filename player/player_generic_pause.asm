@@ -61,10 +61,14 @@ prepare_audio_resume:
     sta audio_calc_samples
     lda active_audio_length+1
     sta audio_calc_samples+1
-    .for (var shift=0;shift<2;shift++) {
-        lsr audio_calc_samples+1
-        ror audio_calc_samples
-    }
+    lsr audio_calc_samples+1
+    ror audio_calc_samples
+    lda HEADER+7
+    and #2
+    bne !samples_ready+
+    lsr audio_calc_samples+1
+    ror audio_calc_samples
+!samples_ready:
     lda #0
     sta audio_calc_sum
     sta audio_calc_sum+1
@@ -114,10 +118,14 @@ prepare_audio_resume:
     bne !rounded+
     inc audio_calc_sum+1
 !rounded:
-    .for (var shift=0;shift<2;shift++) {
-        asl audio_calc_sum
-        rol audio_calc_sum+1
-    }
+    asl audio_calc_sum
+    rol audio_calc_sum+1
+    lda HEADER+7
+    and #2
+    bne !bytes_ready+
+    asl audio_calc_sum
+    rol audio_calc_sum+1
+!bytes_ready:
     lda audio_calc_sum
     sta audio_resume_offset
     lda audio_calc_sum+1
@@ -130,9 +138,16 @@ prepare_audio_resume:
     cmp active_audio_length
     bcc !done+
 !clamp:
+    ldx #4
+    lda HEADER+7
+    and #2
+    beq !width+
+    ldx #2
+!width:
+    stx audio_calc_samples
     sec
     lda active_audio_length
-    sbc #4
+    sbc audio_calc_samples
     sta audio_resume_offset
     lda active_audio_length+1
     sbc #0

@@ -3,15 +3,15 @@
   "files": {
     "BUNNY.MUP": {
       "bytes": 417136640,
-      "sha256": "ec35a7ee07cf1884e6c2a8024c3e19ae76b49fcb4291487726a61c710717d3c5",
-      "compressed_bytes": 141217188,
-      "compressed_sha256": "939963b92f78ade6da87ced8212e37cd20be51b803c37dd3151937d121551705"
+      "sha256": "e7cf90d3e01db7ce875665cc5ad733f33da74be25999cc65f7b029630afc29b8",
+      "compressed_bytes": 134539353,
+      "compressed_sha256": "8f904dfbbd69197776eed8e0b9b8430a24373799af62c9ce9aa4e6d2774e4475"
     },
     "CYBER77.MUP": {
       "bytes": 39649280,
-      "sha256": "2ed8c14eeb816a1f1aa519e6b20fcd6843c1cf3e614fbc26291c3dc2cee132e5",
-      "compressed_bytes": 15298195,
-      "compressed_sha256": "dfd22e69df8ff34ca2b29734b7f16581ad04a0f92a33ac0028c8c8492fcc69ff"
+      "sha256": "f927873290a87b77aec75b9f7d052c5cbe3fa6c7ee486ff74f1b16cca6a64c3a",
+      "compressed_bytes": 14474978,
+      "compressed_sha256": "7ad0b9fc56e3c24a2af49ce24c935103e987403e4b4593305669632c77459268"
     }
   }
 }

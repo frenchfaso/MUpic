@@ -27,7 +27,6 @@
 .const PREFETCH_HEAD_BYTES_PER_ROW=11
 .const PREFETCH_TAIL_BYTES_PER_ROW=2
 .const AUDIO_VOICE_VOLUME=63
-.const AUDIO_BLOCK_OFFSET=225280
 .const STREAM_BLOCK_BYTES=262144
 .const CACHE_SLOT_BANKS=4
 .const CACHE_CHUNK_BYTES=1024
@@ -1363,16 +1362,31 @@ generic_audio_length:
     sta $df01
     lda active_audio_length+2
     bne !bad+
+    ldx #$90 // PCM16 reserves 36 KiB; PCM8 reserves 40 KiB.
+    lda HEADER+7
+    and #2
+    beq !limit+
+    ldx #$a0
+!limit:
+    stx bootstrap_length
     lda active_audio_length+1
-    cmp #$90
+    cmp bootstrap_length
     bcc !bounded+
     bne !bad+
     lda active_audio_length
     bne !bad+
 !bounded:
     lda active_audio_length
+    ldx HEADER+7
+    cpx #3
+    bne !pcm16+
+    and #1 // signed PCM8 stereo frames occupy two bytes.
+    beq !aligned+
+    bne !bad+
+!pcm16:
     and #3
     bne !bad+
+!aligned:
     lda active_audio_length
     ora active_audio_length+1
     beq !bad+
@@ -1382,6 +1396,120 @@ generic_audio_length:
     sta fatal_error
     rts
 #import "player_generic_pause.asm"
+// Sampler setup lives in resident RAM, leaving the raster IRQ below $ff00.
+audio_prepare:
+    jsr generic_audio_length
+    lda fatal_error
+    beq !length_valid+
+    jmp audio_stop
+!length_valid:
+    lda audio_resume_active
+    bne !continuation+
+    lda #0
+    sta audio_tick_count
+!continuation:
+    lda #0
+    sta $df20
+    sta $df40
+    sta $df21
+    sta $df41
+    lda #$ff
+    sta $df3f
+    .for (var voice=0;voice<2;voice++) {
+        .var base=$df20+voice*$20
+        // MUP9 keeps PCM in the selected 256 KiB REU slot. Header offsets
+        // differ by sample format; resume and right-channel offsets are bytes.
+        // Sampler reads return status/version, so address arithmetic stays RAM.
+        lda HEADER+36
+        clc
+        adc audio_resume_offset
+        sta audio_calc_sum
+        lda HEADER+37
+        adc audio_resume_offset+1
+        sta audio_calc_sum+1
+        lda HEADER+38
+        adc #0
+        sta audio_calc_sum+2
+        .if (voice==1) {
+            ldx #2
+            lda HEADER+7
+            and #2
+            beq !width+
+            dex
+!width:
+            txa
+            clc
+            adc audio_calc_sum
+            sta audio_calc_sum
+            lda audio_calc_sum+1
+            adc #0
+            sta audio_calc_sum+1
+            lda audio_calc_sum+2
+            adc #0
+            sta audio_calc_sum+2
+        }
+        lda cache_read_bank
+        .for (var banks=CACHE_SLOT_BANKS;banks>1;banks=banks/2) { asl }
+        clc
+        adc #CACHE_BANK
+        adc audio_calc_sum+2
+        sta base+5
+        lda audio_calc_sum+1
+        sta base+6
+        lda audio_calc_sum
+        sta base+7
+        lda #1
+        sta base+4
+        lda active_audio_length+2
+        sta base+9
+        lda active_audio_length+1
+        ldx active_audio_length
+        pha
+        txa
+        sec
+        sbc audio_resume_offset
+        tax
+        pla
+        sbc audio_resume_offset+1
+        sta base+10
+        txa
+        sta base+11
+        lda HEADER+33
+        sta base+14
+        lda HEADER+32
+        sta base+15
+        lda #(voice==0 ? 0 : 15)
+        sta base+2
+    }
+    lda #0
+    sta audio_resume_offset
+    sta audio_resume_offset+1
+    sta audio_resume_active
+    rts
+audio_start:
+    lda fatal_error
+    bne !done+
+    ldx #$51 // enabled PCM16 with a four-byte interleaved stride.
+    lda #AUDIO_VOICE_VOLUME
+    ldy HEADER+7
+    cpy #3
+    bne !format+
+    lda #32 // PCM8 at unity gain matches the HQ noise-shaping preview.
+    ldx #$41 // signed PCM8 with a two-byte interleaved stride.
+!format:
+    sta $df21
+    sta $df41
+    stx $df20
+    stx $df40
+!done:
+    rts
+audio_stop:
+    lda #0
+    sta $df20
+    sta $df40
+    sta $df21
+    sta $df41
+    rts
 .label generic_resident_end=*
 .assert "Generic resident exceeds free high RAM", *<=$d000, true
 
@@ -1797,80 +1925,6 @@ buffered_blank_update:
     lda #$35
     sta $01
     rts
-audio_prepare:
-    jsr generic_audio_length
-    lda audio_resume_active
-    bne !continuation+
-    lda #0
-    sta audio_tick_count
-!continuation:
-    lda #0
-    sta $df20
-    sta $df40
-    sta $df21
-    sta $df41
-    lda #$ff
-    sta $df3f
-    .for (var voice=0;voice<2;voice++) {
-        .var base=$df20+voice*$20
-        .var address=AUDIO_BLOCK_OFFSET+voice*2
-        lda #1
-        sta base+4
-        lda cache_read_bank
-        .for (var banks=CACHE_SLOT_BANKS;banks>1;banks=banks/2) { asl }
-        clc
-        adc #(CACHE_BANK+((address>>16)&255))
-        sta base+5
-        lda #((address>>8)&255)
-        clc
-        adc audio_resume_offset+1
-        sta base+6
-        lda #<address
-        clc
-        adc audio_resume_offset
-        sta base+7
-        lda active_audio_length+2
-        sta base+9
-        lda active_audio_length+1
-        ldx active_audio_length
-        pha
-        txa
-        sec
-        sbc audio_resume_offset
-        tax
-        pla
-        sbc audio_resume_offset+1
-        sta base+10
-        txa
-        sta base+11
-        lda HEADER+33
-        sta base+14
-        lda HEADER+32
-        sta base+15
-        lda #(voice==0 ? 0 : 15)
-        sta base+2
-    }
-    lda #0
-    sta audio_resume_offset
-    sta audio_resume_offset+1
-    sta audio_resume_active
-    rts
-audio_start:
-    lda #AUDIO_VOICE_VOLUME
-    sta $df21
-    sta $df41
-    lda #$51 // enable, 16-bit, stride four bytes
-    sta $df20
-    sta $df40
-    rts
-audio_stop:
-    lda #0
-    sta $df20
-    sta $df40
-    sta $df21
-    sta $df41
-    rts
-
 .label irq_program_end = *
 .label program_end = *
 .assert "Buffered IRQ overlaps the FF00 REU trigger", * <= $ff00, true
