@@ -3,6 +3,8 @@ import {MupPlayer} from './preview-player.mjs?v=6fb2d3e599591c82';
 import {videoPlan,asciiTitle,decodePcm,decodePcm8Source,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=0dd23ebe63904142';
 import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=f2dd967349f8b8a2';
 import {ConversionProgress} from './conversion-progress.mjs?v=ff2c0e223da601a2';
+import { ensureIsolation } from './isolation.mjs?v=26c03e13fa61303e';
+await ensureIsolation();
 const $=id=>document.getElementById(id);
 const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-preview');
 const context=canvas.getContext('2d',{alpha:false});

@@ -32,6 +32,8 @@ Run the PRG from the Ultimate file browser. Arrow keys select, Return plays, Lef
 
 The web demo silently preloads about nine seconds of both movies during startup and maintains that reserve for the playing movie within its 16 MiB browser cache. Audio starts automatically when browser policy permits; otherwise the first click, tap or key on the page enables it.
 
+The local server enables COOP/COEP directly. On static hosts such as GitHub Pages, a local service worker enables isolation with one automatic refresh on the first visit, allowing the SID worker pool and shared audio ring. Video streaming and the saved color table retain their existing caches; unsupported browsers keep the serial fallback.
+
 Both demo movies use stereo PCM8 with HQ noise shaping at their source rates: 44.1 kHz for Big Buck Bunny and 48 kHz for CYBER77. Their video frames, timing and titles are unchanged.
 
 ## Build and run locally
