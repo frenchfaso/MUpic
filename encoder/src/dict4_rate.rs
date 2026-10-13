@@ -70,6 +70,7 @@ impl Prepared {
         }
         Self { distance }
     }
+    #[cfg(test)]
     pub(super) fn project<F>(
         &self,
         before: &[u8],
@@ -80,12 +81,29 @@ impl Prepared {
     where
         F: Fn(&[u8], &[u8]) -> usize,
     {
+        self.project_with_plan(before, target, budget, |before, after| {
+            (cost(before, after), ())
+        })
+        .map(|(after, ())| after)
+    }
+    pub(super) fn project_with_plan<P, F>(
+        &self,
+        before: &[u8],
+        target: &[u8],
+        budget: usize,
+        cost: F,
+    ) -> Result<(Vec<u8>, P), String>
+    where
+        F: Fn(&[u8], &[u8]) -> (usize, P),
+    {
         if before.len() != FRAME || target.len() != FRAME || budget == 0 {
             return Err("SD projection requires two whole frames and positive budget".into());
         }
-        if cost(before, target) <= budget {
-            return Ok(target.to_vec());
+        let (target_cost, target_plan) = cost(before, target);
+        if target_cost <= budget {
+            return Ok((target.to_vec(), target_plan));
         }
+        drop(target_plan);
         let mut frequency: HashMap<u32, (usize, usize)> = HashMap::new();
         for c in 0..COLS {
             for y in (0..ROWS).step_by(4) {
@@ -148,27 +166,29 @@ impl Prepared {
             output
         };
         let all = render(changes.len());
-        let all_cost = cost(before, &all);
+        let (all_cost, all_plan) = cost(before, &all);
         if all_cost > budget || all == before {
             return Err(format!("SD rate control: admissible word replacements reach {all_cost} slots, budget {budget}; refusing a whole-frame hold or unchecked output"));
         }
         let mut low = 0usize;
         let mut high = changes.len();
         let mut after = all;
+        let mut plan = all_plan;
         // Cost can have small discontinuities when RAW/dictionary choices
         // change. Retain an explicitly verified feasible upper endpoint.
         while high > low + 1 {
             let middle = (low + high) / 2;
             let candidate = render(middle);
-            let candidate_cost = cost(before, &candidate);
+            let (candidate_cost, candidate_plan) = cost(before, &candidate);
             if candidate_cost <= budget && candidate != before {
                 high = middle;
                 after = candidate;
+                plan = candidate_plan;
             } else {
                 low = middle;
             }
         }
-        Ok(after)
+        Ok((after, plan))
     }
 }
 
@@ -204,6 +224,42 @@ mod tests {
             .project(&before, &target[..FRAME - 1], 100, |_, _| 99)
             .is_err());
         assert!(metric.project(&before, &target, 0, |_, _| 0).is_err());
+    }
+
+    #[test]
+    fn failed_binary_candidates_cannot_replace_the_winning_plan() {
+        use std::cell::RefCell;
+
+        let before = vec![0; FRAME];
+        let mut target = before.clone();
+        for c in 1..COLS - 1 {
+            for row in 0..ROWS / 4 {
+                let value =
+                    0x2222_2222u32.wrapping_add(((c * 50 + row) as u32).wrapping_mul(0x0101_0101));
+                let at = c * 256 + row * 4;
+                target[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let calls = RefCell::new(Vec::new());
+        let (after, (winning_call, planned_frame)) = Prepared::new(&PALETTE)
+            .project_with_plan(&before, &target, 10, |_, candidate| {
+                let call = calls.borrow().len();
+                calls.borrow_mut().push(candidate.to_vec());
+                // Admit the all-replacements endpoint and first binary probe,
+                // then reject every later probe. The last evaluated plan must
+                // never replace the last admitted plan.
+                (
+                    if matches!(call, 1 | 2) { 9 } else { 11 },
+                    (call, candidate.to_vec()),
+                )
+            })
+            .unwrap();
+        let calls = calls.into_inner();
+        assert!(calls.len() > 3);
+        assert_eq!(winning_call, 2);
+        assert_eq!(after, calls[2]);
+        assert_eq!(planned_frame, after);
+        assert_ne!(after, *calls.last().unwrap());
     }
 
     #[test]

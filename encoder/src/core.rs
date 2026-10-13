@@ -435,11 +435,17 @@ impl Encoder {
             self.initial = exact.clone();
             exact
         } else {
-            let after = self
-                .metric
-                .project(&self.previous, &exact, RATE_BUDGET, sd::peak)?;
+            let (after, plan) = self.metric.project_with_plan(
+                &self.previous,
+                &exact,
+                RATE_BUDGET,
+                |before, after| {
+                    let plan = sd::prepare(before, after);
+                    (plan.peak(), plan)
+                },
+            )?;
             self.adapted_frames += usize::from(after != exact);
-            let (records, peak) = sd::group(&self.previous, Some(&after))?;
+            let (records, peak) = sd::group_prepared(&self.previous, &after, plan)?;
             if peak > RATE_BUDGET {
                 return Err(format!(
                     "Qualified cost model exceeds budget: {peak}/{RATE_BUDGET}"

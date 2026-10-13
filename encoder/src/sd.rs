@@ -200,14 +200,26 @@ fn partition(columns: &[Column]) -> Vec<std::ops::Range<usize>> {
     };
     let mut dp = vec![vec![usize::MAX; n + 1]; TICKS + 1];
     let mut prev = vec![vec![0; n + 1]; TICKS + 1];
-    dp[0][0] = 0;
-    for t in 1..=TICKS {
-        for end in 0..=n {
+    for end in 0..=n {
+        dp[1][end] = score(0, end, true);
+    }
+    // Every later tick only depends on earlier-tick entries at begin <= end.
+    // Solving those ticks together lets one small row reuse the identical
+    // no-reset costs, rather than building a quadratic score table.
+    let mut scores = vec![usize::MAX; n + 1];
+    for end in 0..=n {
+        scores[..=end].fill(usize::MAX);
+        for t in 2..=TICKS {
             for begin in 0..=end {
-                if dp[t - 1][begin] == usize::MAX {
+                // A maximum cannot improve on this previous peak. Equality
+                // must also be skipped: the original first boundary wins ties.
+                if dp[t - 1][begin] >= dp[t][end] {
                     continue;
                 }
-                let peak = dp[t - 1][begin].max(score(begin, end, t == 1));
+                if scores[begin] == usize::MAX {
+                    scores[begin] = score(begin, end, false);
+                }
+                let peak = dp[t - 1][begin].max(scores[begin]);
                 if peak < dp[t][end] {
                     dp[t][end] = peak;
                     prev[t][end] = begin;
@@ -225,14 +237,31 @@ fn partition(columns: &[Column]) -> Vec<std::ops::Range<usize>> {
     parts.reverse();
     parts
 }
-pub(super) fn peak(before: &[u8], after: &[u8]) -> usize {
-    let p = plan(before, after);
-    partition(&p.columns)
-        .into_iter()
+/// Keep the authoritative dictionary and packet split that admitted a frame.
+pub(super) struct Prepared {
+    plan: Plan,
+    parts: Vec<std::ops::Range<usize>>,
+    peak: usize,
+}
+impl Prepared {
+    pub(super) fn peak(&self) -> usize {
+        self.peak
+    }
+}
+pub(super) fn prepare(before: &[u8], after: &[u8]) -> Prepared {
+    let plan = plan(before, after);
+    let parts = partition(&plan.columns);
+    let peak = parts
+        .iter()
         .enumerate()
-        .map(|(tick, range)| cost(&p.columns[range], tick == 0).slots)
+        .map(|(tick, range)| cost(&plan.columns[range.clone()], tick == 0).slots)
         .max()
-        .unwrap()
+        .unwrap();
+    Prepared { plan, parts, peak }
+}
+#[cfg(test)]
+pub(super) fn peak(before: &[u8], after: &[u8]) -> usize {
+    prepare(before, after).peak()
 }
 #[derive(Clone)]
 struct State {
@@ -344,15 +373,34 @@ pub(super) fn group(before: &[u8], after: Option<&[u8]>) -> Result<(Vec<Vec<u8>>
     if before.len() != FRAME || after.is_some_and(|f| f.len() != FRAME) {
         return Err("SD frame must contain 46080 page-stride bytes".into());
     }
+    let prepared = after.map(|target| prepare(before, target));
+    group_from_plan(before, after, prepared)
+}
+pub(super) fn group_prepared(
+    before: &[u8],
+    after: &[u8],
+    prepared: Prepared,
+) -> Result<(Vec<Vec<u8>>, usize), String> {
+    if before.len() != FRAME || after.len() != FRAME {
+        return Err("SD frame must contain 46080 page-stride bytes".into());
+    }
+    group_from_plan(before, Some(after), Some(prepared))
+}
+fn group_from_plan(
+    before: &[u8],
+    after: Option<&[u8]>,
+    prepared: Option<Prepared>,
+) -> Result<(Vec<Vec<u8>>, usize), String> {
     let mut ram = vec![0xaa; 65536];
     for &(at, count, address) in &REGIONS {
         ram[address..address + count].copy_from_slice(&before[at..at + count]);
     }
     let mut decoder = State::new();
-    let plan = after.map(|target| plan(before, target));
-    let parts = plan
-        .as_ref()
-        .map_or_else(|| vec![0..0; TICKS], |p| partition(&p.columns));
+    let expected_peak = prepared.as_ref().map(Prepared::peak);
+    let (plan, parts) = prepared.map_or_else(
+        || (None, vec![0..0; TICKS]),
+        |prepared| (Some(prepared.plan), prepared.parts),
+    );
     let mut packets = Vec::with_capacity(TICKS);
     let mut peak = 0;
     for (tick, range) in parts.into_iter().enumerate() {
@@ -382,6 +430,9 @@ pub(super) fn group(before: &[u8], after: Option<&[u8]>) -> Result<(Vec<Vec<u8>>
     if compact(&ram) != after.unwrap_or(before) {
         return Err("SD reference decoder reconstruction mismatch".into());
     }
+    if expected_peak.is_some_and(|expected| expected != peak) {
+        return Err("SD prepared plan cost mismatch".into());
+    }
     Ok((packets, peak))
 }
 
@@ -389,6 +440,68 @@ pub(super) fn group(before: &[u8], after: Option<&[u8]>) -> Result<(Vec<Vec<u8>>
 mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
+
+    // Frozen packet-building path used before the projection reused its plan.
+    // It deliberately rebuilds and repartitions the winner independently.
+    fn reference_group(before: &[u8], after: &[u8]) -> (Vec<Vec<u8>>, usize) {
+        let plan = plan(before, after);
+        let parts = partition(&plan.columns);
+        let mut packets = Vec::new();
+        let mut peak = 0;
+        for (tick, range) in parts.into_iter().enumerate() {
+            let reset = tick == 0;
+            let complete = tick + 1 == TICKS;
+            let columns = &plan.columns[range];
+            peak = peak.max(cost(columns, reset).slots);
+            let mut payload = vec![
+                u8::from(reset) * 2 + u8::from(complete),
+                columns.len() as u8,
+            ];
+            if reset {
+                payload.extend_from_slice(&plan.lut);
+            }
+            for column in columns {
+                column.append(&mut payload);
+            }
+            packets.push(payload);
+        }
+        (packets, peak)
+    }
+
+    #[test]
+    fn prepared_packets_match_rebuilt_winners_and_reject_mispaired_frames() {
+        let mut before = vec![0; FRAME];
+        for variant in 0..8 {
+            let mut after = before.clone();
+            for c in 1..COLS - 1 {
+                for y in 0..ROWS {
+                    if (c + y + variant) % 7 != 0 {
+                        after[c * 256 + y] = (c * 13 + y * 31 + variant * 97) as u8;
+                    }
+                }
+            }
+            let prepared = prepare(&before, &after);
+            let expected = reference_group(&before, &after);
+            assert_eq!(prepared.peak(), expected.1);
+            assert_eq!(group_prepared(&before, &after, prepared).unwrap(), expected);
+            before = after;
+        }
+        let mut after = before.clone();
+        after[256] ^= 0xff;
+        let prepared = prepare(&before, &after);
+        let mut unrelated = after.clone();
+        unrelated[512] ^= 0xff;
+        assert_eq!(
+            group_prepared(&before, &unrelated, prepared).unwrap_err(),
+            "SD reference decoder reconstruction mismatch"
+        );
+        let mut prepared = prepare(&before, &after);
+        prepared.peak += 1;
+        assert_eq!(
+            group_prepared(&before, &after, prepared).unwrap_err(),
+            "SD prepared plan cost mismatch"
+        );
+    }
 
     #[test]
     fn packets_match_qualified_codec9_fixtures() {
@@ -589,5 +702,146 @@ mod tests {
         assert!(ram[address(1) + ROWS..address(1) + 256]
             .iter()
             .all(|&v| v == 0xaa));
+    }
+}
+
+#[cfg(test)]
+mod partition_parity_tests {
+    use super::*;
+
+    // Frozen implementation from before cost reuse/pruning. In particular,
+    // ascending boundaries and strict < define the encoded packet boundaries.
+    fn original_partition(columns: &[Column]) -> Vec<std::ops::Range<usize>> {
+        let n = columns.len();
+        let mut wire = vec![0; n + 1];
+        let mut cpu = vec![0; n + 1];
+        let mut raw = vec![0; n + 1];
+        for (i, c) in columns.iter().enumerate() {
+            wire[i + 1] = wire[i] + c.wire();
+            cpu[i + 1] = cpu[i] + c.cpu + COL_SETUP;
+            raw[i + 1] = raw[i] + if c.raw { c.target.len() } else { 0 };
+        }
+        let raw_before = |at: usize| {
+            let i = wire.partition_point(|&v| v <= at).saturating_sub(1).min(n);
+            raw[i]
+                + if i < n && columns[i].raw {
+                    at.saturating_sub(wire[i] + 2).min(columns[i].target.len())
+                } else {
+                    0
+                }
+        };
+        let score = |begin: usize, end: usize, reset: bool| {
+            let lut = if reset { LUT_BYTES } else { 0 };
+            let body = lut + wire[end] - wire[begin];
+            let prefix = body.min(PREFETCH * ROWS) / PREFETCH * PREFETCH;
+            let raw_prefix = raw_before(wire[begin] + prefix.saturating_sub(lut)) - raw[begin];
+            RECORD_SETUP + cpu[end] - cpu[begin]
+                + lut * 15
+                + raw_prefix * 15
+                + 63 * (body + 4 - prefix)
+        };
+        let mut dp = vec![vec![usize::MAX; n + 1]; TICKS + 1];
+        let mut prev = vec![vec![0; n + 1]; TICKS + 1];
+        dp[0][0] = 0;
+        for t in 1..=TICKS {
+            for end in 0..=n {
+                for begin in 0..=end {
+                    if dp[t - 1][begin] == usize::MAX {
+                        continue;
+                    }
+                    let peak = dp[t - 1][begin].max(score(begin, end, t == 1));
+                    if peak < dp[t][end] {
+                        dp[t][end] = peak;
+                        prev[t][end] = begin;
+                    }
+                }
+            }
+        }
+        let mut parts = Vec::new();
+        let mut end = n;
+        for t in (1..=TICKS).rev() {
+            let begin = prev[t][end];
+            parts.push(begin..end);
+            end = begin;
+        }
+        parts.reverse();
+        parts
+    }
+
+    fn fixture(n: usize, variant: usize) -> Vec<Column> {
+        let mut rng = 0x7a68_cde1_u32.wrapping_add(variant as u32);
+        (0..n)
+            .map(|index| {
+                rng ^= rng << 13;
+                rng ^= rng >> 17;
+                rng ^= rng << 5;
+                let raw = match variant {
+                    0 => true,
+                    1 => false,
+                    2 => index % 2 == 0,
+                    3 => rng & 1 != 0,
+                    4 => index % 11 == 0,
+                    5 => index % 11 != 0,
+                    _ => (index / 7) % 2 == 0,
+                };
+                let escape_words = if variant < 3 {
+                    0
+                } else {
+                    (rng as usize >> 8) % 51
+                };
+                let mut code = vec![254; WORDS];
+                code[..escape_words].fill(255);
+                let escaped = vec![0; escape_words * 5];
+                let cpu = if raw {
+                    0
+                } else if variant == 1 {
+                    3132
+                } else {
+                    primitive_cycles(&code, escaped.len())
+                };
+                Column {
+                    index,
+                    raw,
+                    code,
+                    escaped,
+                    target: vec![0; ROWS],
+                    cpu,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn optimized_partition_preserves_boundaries_and_peak_across_raw_prefix_edges() {
+        // 13 RAW columns and 50 dictionary columns cross the 2600-byte
+        // prefetch cap; mixed/escaped columns exercise nonmonotone cost steps.
+        let lengths = (0..=16).chain([
+            19, 23, 26, 37, 49, 50, 51, 63, 77, 99, 100, 127, 128, 151, 179, 180,
+        ]);
+        for n in lengths {
+            for variant in 0..7 {
+                let columns = fixture(n, variant);
+                let expected = original_partition(&columns);
+                let actual = partition(&columns);
+                assert_eq!(actual, expected, "n={n}, variant={variant}");
+                let peak = |parts: &[std::ops::Range<usize>]| {
+                    parts
+                        .iter()
+                        .enumerate()
+                        .map(|(tick, range)| cost(&columns[range.clone()], tick == 0).slots)
+                        .max()
+                        .unwrap()
+                };
+                assert_eq!(peak(&actual), peak(&expected));
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_partition_keeps_the_first_equal_cost_boundary() {
+        assert_eq!(partition(&fixture(0, 0)), vec![0..0, 0..0, 0..0]);
+        // The LUT reset cost dominates every possible placement of these RAW
+        // columns. All splits tie, so the original earliest boundaries win.
+        assert_eq!(partition(&fixture(3, 0)), vec![0..0, 0..0, 0..3]);
     }
 }
