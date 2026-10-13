@@ -64,3 +64,49 @@ test('queued batches retain one cache owner and preserve frame order',async()=>{
   assert.equal(peak,1);
   assert.deepEqual(results.map(batch=>new Uint8Array(batch[0])[0]),[3,9]);pool.close();
 });
+test('shared frame work stays ordered and buffers are reused only after consumption',async()=>{
+  const pool=new QuantizerPool(3,'quantizer-worker.mjs',{eager:true,shared:true});
+  pool.sharedLut=new SharedArrayBuffer(4);pool.lutReady=true;
+  for(const client of pool.workers)client.worker.handle=({id,method,args})=>{
+    assert.equal(method,'packShared');
+    const marker=new Uint8Array(args.buffer,args.rgbOffset,216000)[0];
+    setTimeout(()=>{
+      new Uint8Array(args.buffer,args.packedOffset,36000).fill(marker);
+      client.worker.onmessage({data:{id}});
+    },marker===3?5:0);
+  };
+  const make=marker=>new Uint8Array(216000).fill(marker),frames=[3,9,7].map(make);
+  const first=await pool.batch(frames),firstBuffer=first[0].buffer;
+  assert.deepEqual(first.map(frame=>frame[0]),[3,9,7]);
+  assert.ok(first.every(frame=>frame.buffer===firstBuffer));
+  assert.ok(frames.every(frame=>frame.byteLength===216000),'shared capture inputs are not detached');
+  const second=await pool.batch([make(4),make(8),make(6)]);
+  assert.notEqual(second[0].buffer,firstBuffer,'the encoder still owns the first packed batch');
+  pool.releaseBatch(first);
+  const third=await pool.batch([make(2),make(5),make(1)]);
+  assert.equal(third[0].buffer,firstBuffer);
+  assert.deepEqual(second.map(frame=>frame[0]),[4,8,6],'reuse cannot overwrite another leased batch');
+  pool.releaseBatch(second);pool.releaseBatch(third);pool.close();
+});
+test('shared worker errors settle remaining writes before recycling a slab',async()=>{
+  const pool=new QuantizerPool(2,'quantizer-worker.mjs',{eager:true,shared:true});
+  pool.sharedLut=new SharedArrayBuffer(4);pool.lutReady=true;let complete;
+  pool.workers[0].worker.handle=({id})=>queueMicrotask(()=>pool.workers[0].worker.onmessage({data:{id,error:'packing failed'}}));
+  pool.workers[1].worker.handle=({id,args})=>{complete=()=>{
+    new Uint8Array(args.buffer,args.packedOffset,36000).fill(7);
+    pool.workers[1].worker.onmessage({data:{id}});
+  };};
+  const request=pool.batch([new Uint8Array(216000),new Uint8Array(216000)]);
+  const rejected=assert.rejects(request,/packing failed/);
+  await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(pool.freeBuffers.length,0,'a pending worker can still write to the shared slab');
+  complete();await rejected;assert.equal(pool.freeBuffers.length,1);pool.close();
+});
+test('cancelling a shared batch cannot restore buffers to a closed pool',async()=>{
+  const pool=new QuantizerPool(2,'quantizer-worker.mjs',{eager:true,shared:true});
+  pool.sharedLut=new SharedArrayBuffer(4);pool.lutReady=true;
+  const request=pool.batch([new Uint8Array(216000),new Uint8Array(216000)]);
+  const rejected=assert.rejects(request,/cancelled/);
+  await new Promise(resolve=>setImmediate(resolve));pool.close();await rejected;
+  assert.equal(pool.freeBuffers.length,0);
+});

@@ -11,7 +11,7 @@ use std::{
 };
 
 fn help() {
-    println!("MUpic — 16 colors is all you need!\n\nUsage: mupic-encoder INPUT -o OUTPUT.mup [options]\n       mupic-encoder --prepare-lut [--cache-dir PATH]\n\n  --duration SECONDS  Convert a shorter clip (default: whole video)\n  --start SECONDS     Start at this timestamp (default: 0)\n  --threads auto|N    Exact color-search workers (default: auto)\n  --cache-dir PATH    Cache the bundled RGB24 lookup table here\n  --no-cache          Use exact color search without the lookup table\n  --prepare-lut       Populate the lookup cache without converting\n  --audio-format pcm16|pcm8  Audio format (default: pcm16)\n  --gain-db DB        Offline PCM16 gain (default: 0)\n  --title TITLE      Up to 63 ASCII characters (default: input stem)\n  --force            Replace an existing output\n  --help             Show this help\n\nPCM8 keeps the source frequency (8–48 kHz), with HQ Shibata noise shaping\nand automatic gain. The hardware divider approximates the source clock.\nOutput: native SD MUP9, PAL/3 (~16.708 fps), fixed Bayer8x8 Yliluoma author\npreset + neutral guard, 360x200 canvas, 356x200 maximum active picture.\nThe complete RGB24 lookup table is bundled losslessly compressed and\nexpanded into the system user cache; conversion does not generate it.\nRequires FFmpeg and ffprobe on PATH for conversion.");
+    println!("MUpic — 16 colors is all you need!\n\nUsage: mupic-encoder INPUT -o OUTPUT.mup [options]\n       mupic-encoder --prepare-lut [--cache-dir PATH]\n\n  --duration SECONDS  Convert a shorter clip (default: whole video)\n  --start SECONDS     Start at this timestamp (default: 0)\n  --threads auto|N    CPU workers (default: auto)\n  --cache-dir PATH    Cache the bundled RGB24 lookup table here\n  --no-cache          Use exact color search without the lookup table\n  --prepare-lut       Populate the lookup cache without converting\n  --audio-format pcm16|pcm8  Audio format (default: pcm16)\n  --gain-db DB        Offline PCM16 gain (default: 0)\n  --title TITLE      Up to 63 ASCII characters (default: input stem)\n  --force            Replace an existing output\n  --help             Show this help\n\nPCM8 keeps the source frequency (8–48 kHz), with HQ Shibata noise shaping\nand automatic gain. The hardware divider approximates the source clock.\nOutput: native SD MUP9, PAL/3 (~16.708 fps), fixed Bayer8x8 Yliluoma author\npreset + neutral guard, 360x200 canvas, 356x200 maximum active picture.\nThe complete RGB24 lookup table is bundled losslessly compressed and\nexpanded into the system user cache; conversion does not generate it.\nRequires FFmpeg and ffprobe on PATH for conversion.");
 }
 #[derive(Debug)]
 struct Args {
@@ -453,9 +453,7 @@ fn run(args: Args) -> Result<(), String> {
             source
                 .read_exact(bytes)
                 .map_err(|e| format!("Truncated video before frame {done}: {e}"))?;
-            quantizer.preplan(bytes)?;
-            for rgb in bytes.chunks_exact(RGB_BYTES) {
-                let packed = quantizer.pack_plans(rgb);
+            for packed in quantizer.pack_batch(bytes, args.threads)? {
                 encoder.push(&packed)?;
                 output
                     .write_all(&encoder.take_output())

@@ -133,6 +133,45 @@ impl Quantizer {
         self.preplan(rgb)?;
         Ok(self.pack_plans(rgb))
     }
+    /// Pack complete frames in their original order. A full LUT lets native
+    /// workers share immutable plans and Bayer candidates without cache writes.
+    pub fn pack_batch(&mut self, rgb: &[u8], threads: usize) -> Result<Vec<Vec<u8>>, String> {
+        if threads == 0 {
+            return Err("Thread count must be positive".into());
+        }
+        self.preplan(rgb)?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.lut_complete() && threads > 1 && rgb.len() > RGB_BYTES {
+            let lut = &self.lut;
+            let author = &self.author;
+            let frame_count = rgb.len() / RGB_BYTES;
+            let workers = threads.min(frame_count);
+            return std::thread::scope(|scope| {
+                let tasks: Vec<_> = (0..workers)
+                    .map(|worker| {
+                        let start = frame_count * worker / workers * RGB_BYTES;
+                        let end = frame_count * (worker + 1) / workers * RGB_BYTES;
+                        let chunk = &rgb[start..end];
+                        scope.spawn(move || {
+                            chunk
+                                .chunks_exact(RGB_BYTES)
+                                .map(|frame| pack_lut_frame(author, lut, frame))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                let mut frames = Vec::with_capacity(frame_count);
+                for task in tasks {
+                    frames.extend(task.join().map_err(|_| "Frame packing worker failed")?);
+                }
+                Ok(frames)
+            });
+        }
+        Ok(rgb
+            .chunks_exact(RGB_BYTES)
+            .map(|frame| self.pack_plans(frame))
+            .collect())
+    }
     pub fn pack_plans(&mut self, rgb: &[u8]) -> Vec<u8> {
         if !self.lut.is_empty() {
             let mut packed = vec![0; PACKED_BYTES];
@@ -163,6 +202,26 @@ impl Quantizer {
             }
         }
         packed
+    }
+    /// Pack row-major candidate ids using the same Bayer positions and native
+    /// black borders as RGB quantization. This does not populate the RGB cache.
+    pub fn pack_frame_plans(&self, plans: &[u32]) -> Result<Vec<u8>, String> {
+        if plans.len() != VIDEO_WIDTH * VIDEO_HEIGHT
+            || plans
+                .iter()
+                .any(|&plan| plan as usize >= self.author.candidate_count())
+        {
+            return Err("Frame plans must contain 72000 valid candidate ids".into());
+        }
+        Ok(pack_pixels(|x, y| {
+            self.author
+                .colour(plans[y * VIDEO_WIDTH + x] as usize, x, y)
+        }))
+    }
+    /// The verified full RGB24 table can be copied once into shared browser
+    /// memory. Partial tables are not suitable for indexing from other workers.
+    pub fn complete_lut_plans(&self) -> Option<&[u32]> {
+        (self.lut_complete() && self.lut.len() == lut::DOMAIN).then_some(self.lut.as_slice())
     }
     fn lut_has(&self, key: u32) -> bool {
         !self.lut.is_empty() && self.lut[key as usize] != u32::MAX
@@ -243,6 +302,26 @@ impl Quantizer {
     pub fn author_mut(&mut self) -> &mut AuthorDither {
         &mut self.author
     }
+}
+
+fn pack_lut_frame(author: &AuthorDither, lut: &[u32], rgb: &[u8]) -> Vec<u8> {
+    pack_pixels(|x, y| {
+        let offset = (y * VIDEO_WIDTH + x) * 3;
+        let key = (u32::from(rgb[offset]) << 16
+            | u32::from(rgb[offset + 1]) << 8
+            | u32::from(rgb[offset + 2])) as usize;
+        author.colour(lut[key] as usize, x, y)
+    })
+}
+
+fn pack_pixels(mut colour: impl FnMut(usize, usize) -> u8) -> Vec<u8> {
+    let mut packed = vec![0; PACKED_BYTES];
+    for y in 0..VIDEO_HEIGHT {
+        for x in (2..VIDEO_WIDTH - 2).step_by(2) {
+            packed[y * (VIDEO_WIDTH / 2) + x / 2] = colour(x, y) | (colour(x + 1, y) << 4);
+        }
+    }
+    packed
 }
 
 pub fn to_page_frame(packed: &[u8]) -> Result<Vec<u8>, String> {
@@ -660,6 +739,96 @@ mod tests {
         assert_eq!(&stream[AUDIO_OFFSET..AUDIO_OFFSET + length], &pcm[..length]);
         assert!(encoder.peak_slots <= RATE_BUDGET);
         assert_eq!(encoder.preview(), b);
+    }
+    #[test]
+    fn external_frame_plans_preserve_bayer_positions_nibbles_and_black_edges() {
+        let mut q = Quantizer::new(1).unwrap();
+        let colors = [
+            [100, 120, 140],
+            [200, 40, 80],
+            [24, 170, 210],
+            [249, 246, 244],
+        ];
+        let rgb: Vec<u8> = (0..VIDEO_WIDTH * VIDEO_HEIGHT)
+            .flat_map(|pixel| colors[(pixel / VIDEO_WIDTH + pixel % VIDEO_WIDTH) % colors.len()])
+            .collect();
+        let plans: Vec<u32> = q
+            .author_mut()
+            .frame_plans(&rgb)
+            .into_iter()
+            .map(|plan| plan as u32)
+            .collect();
+        // Independent per-pixel packing checks all physical Bayer positions,
+        // including odd/even nibbles and source colors at the guarded edges.
+        let mut reference = vec![0; PACKED_BYTES];
+        for y in 0..VIDEO_HEIGHT {
+            for x in 2..VIDEO_WIDTH - 2 {
+                reference[y * (VIDEO_WIDTH / 2) + x / 2] |=
+                    q.author_mut()
+                        .colour(plans[y * VIDEO_WIDTH + x] as usize, x, y)
+                        << ((x & 1) * 4);
+            }
+        }
+        let worker = Quantizer::new(1).unwrap();
+        assert_eq!(worker.pack_frame_plans(&plans).unwrap(), reference);
+        assert_eq!(worker.lut_allocated_colors(), 0);
+        assert_eq!(worker.author.cached_rgb_count(), 0);
+        assert_eq!(q.quantize(&rgb).unwrap(), reference);
+        assert!(to_page_frame(&reference).is_ok());
+        assert!(q.pack_frame_plans(&plans[..plans.len() - 1]).is_err());
+        let mut invalid = plans;
+        // Reject invalid IDs even at black guard pixels before indexing.
+        invalid[0] = q.author_mut().candidate_count() as u32;
+        assert!(q.pack_frame_plans(&invalid).is_err());
+    }
+    #[test]
+    fn shared_lut_view_is_borrowed_and_requires_a_complete_table() {
+        let mut q = Quantizer::new(1).unwrap();
+        assert!(q.complete_lut_plans().is_none());
+        q.lut = vec![0; lut::DOMAIN];
+        assert!(q.complete_lut_plans().is_none());
+        q.lut_loaded = lut::BLOCK_COUNT;
+        let view = q.complete_lut_plans().unwrap();
+        assert_eq!(view.len(), lut::DOMAIN);
+        assert_eq!(view.as_ptr(), q.lut.as_ptr());
+        q.clear_lut();
+        assert!(q.complete_lut_plans().is_none());
+    }
+    #[test]
+    fn native_full_lut_batch_workers_preserve_frame_order_and_exact_bytes() {
+        let mut q = Quantizer::new(1).unwrap();
+        let colors = [
+            [100, 120, 140],
+            [200, 40, 80],
+            [24, 170, 210],
+            [249, 246, 244],
+        ];
+        let keys: Vec<_> = colors
+            .iter()
+            .map(|c| u32::from(c[0]) << 16 | u32::from(c[1]) << 8 | u32::from(c[2]))
+            .collect();
+        let plans = q.author_mut().plan_keys(&keys).unwrap();
+        q.lut = vec![0; lut::DOMAIN];
+        for (&key, &plan) in keys.iter().zip(&plans) {
+            q.lut[key as usize] = plan;
+        }
+        q.lut_loaded = lut::BLOCK_COUNT;
+        // Seven distinct frame arrangements also exercise uneven batch chunks.
+        let rgb: Vec<u8> = (0..VIDEO_WIDTH * VIDEO_HEIGHT * 7)
+            .flat_map(|pixel| {
+                let frame = pixel / (VIDEO_WIDTH * VIDEO_HEIGHT);
+                let position = pixel % (VIDEO_WIDTH * VIDEO_HEIGHT);
+                colors[(position / (frame + 1) + frame) % colors.len()]
+            })
+            .collect();
+        let scalar = q.pack_batch(&rgb, 1).unwrap();
+        assert!(scalar.windows(2).all(|pair| pair[0] != pair[1]));
+        for threads in [2, 3, 4, 6, 8] {
+            assert_eq!(q.pack_batch(&rgb, threads).unwrap(), scalar);
+        }
+        assert_eq!(q.pack_batch(&rgb[..RGB_BYTES], 4).unwrap(), scalar[..1]);
+        assert!(q.pack_batch(&rgb, 0).is_err());
+        assert!(q.pack_batch(&rgb[..rgb.len() - 1], 4).is_err());
     }
     #[test]
     fn cache_eviction_changes_work_but_preserves_exact_pixels() {

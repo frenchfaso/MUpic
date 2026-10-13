@@ -202,6 +202,7 @@ class FakeWorker {
     else if(method==='prepare')result=(this.ready?new Uint32Array():Uint32Array.of(1,2,3)).buffer;
     else if(method==='plan')result=new Uint32Array(args.keys).map(()=>7).buffer;
     else if(method==='pack')result=[Uint8Array.of(42).buffer];
+    else if(method==='quantizeBatch')result=args.frames.map(()=>Uint8Array.of(42).buffer);
     else throw new Error(`Unexpected RPC: ${method}`);
     queueMicrotask(()=>{if(!this.closed)this.onmessage({data:{id,result}});});
   }
@@ -223,6 +224,18 @@ test('a stopped coordinator after LUT load requests a reload rather than reporti
   pool.workers[0].worker.onerror({message:'Unexpected worker exit'});
   assert.throws(()=>pool.checkOwner(),error=>error.name==='Error'&&/Retry loading the color table/.test(error.message));
   assert.equal(pool.closed,true);
+});
+test('shared allocation failure preserves the verified LUT and serial encoding',async()=>{
+  const pool=new QuantizerPool(3,'worker.mjs',{shared:true});await pool.init('encoder.wasm');
+  const worker=pool.workers[0].worker,send=worker.postMessage.bind(worker);
+  worker.postMessage=message=>{
+    if(message.method==='shareLut')queueMicrotask(()=>worker.onmessage({data:{id:message.id,error:'Shared buffer allocation failed'}}));
+    else send(message);
+  };
+  await pool.loadLut(MANIFEST_URL,{cacheOptions:cacheOptions(new MemoryIndexedDB()),fetch:network().fetch});
+  assert.equal(pool.lutReady,true);assert.equal(pool.shared,false);assert.equal(pool.sharedLut,null);
+  assert.deepEqual(new Uint8Array((await pool.batch([Uint8Array.of(1)]))[0]),Uint8Array.of(42));
+  assert.equal(pool.workers.length,1);pool.close();
 });
 
 test('worker death during cached LUT load preserves storage and avoids a second network request',async()=>{

@@ -1,10 +1,30 @@
-import {EncoderCore} from './wasm-core.mjs?v=8ae769a619a74291';
-let core,frames=[];
+import {EncoderCore} from './wasm-core.mjs?v=f7d118df66d5212e';
+let core,frames=[],sharedLut;
 self.onmessage = async ({data}) => {
   const {id,method,args={}}=data;
   try {
     let result,transfer=[];
-    if(method==='init') { core=await EncoderCore.load(args.url); result={ready:true}; }
+    if(method==='init') {
+      core=await EncoderCore.load(args.url,args.module);
+      if(args.sharedLut)sharedLut=new Uint32Array(args.sharedLut);
+      result={ready:true,module:core.module};
+    }
+    else if(method==='shareLut') {
+      const buffer=core.sharedLut();
+      if(buffer)sharedLut=new Uint32Array(buffer);
+      result=buffer;
+    }
+    else if(method==='packShared') {
+      if(!sharedLut)throw new Error('The shared color table is unavailable.');
+      const rgb=new Uint8Array(args.buffer,args.rgbOffset,216000);
+      const output=new Uint8Array(args.buffer,args.packedOffset,36000);
+      core.packShared(rgb,sharedLut,output);
+    }
+    else if(method==='quantizeBatch') {
+      if(args.frames.length<1||args.frames.length>3||args.frames.some(buffer=>buffer.byteLength!==216000))
+        throw new Error('A planning batch must contain one to three 360x200 RGB frames.');
+      result=args.frames.map(buffer=>core.quantize(new Uint8Array(buffer)).buffer);transfer=result;
+    }
     else if(method==='lutIdentity')result=core.lutIdentity();
     else if(method==='lutInfo')result=core.lutInfo();
     else if(method==='beginLutAsset')core.beginLutAsset(new Uint8Array(args.header));

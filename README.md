@@ -18,11 +18,13 @@ encoder/target/release/mupic-encoder input.mp4 -o movie.mup
 encoder/target/release/mupic-encoder input.mp4 -o movie-pcm8.mup --audio-format pcm8
 ```
 
-Use `--help` for options and `--threads N` to set the native CPU thread count for ordinary color search. The browser selects its fallback worker count automatically.
+Use `--help` for options and `--threads N` to set native CPU workers for color search and frame packing. The browser selects its worker count automatically.
 
 PCM16 at 22.085 kHz remains the default. Select **PCM8 · HQ noise shaping** on the encoder page or use `--audio-format pcm8` in the CLI to preserve the source sample rate (8–48 kHz) with Shibata noise shaping and TPDF dithering. Both use the same Rust quantizer, with automatic headroom to prevent clipping. The Ultimate's nearest hardware divider introduces a small rate rounding; audio sample counts and preview playback follow its actual timing. Unreadable or unsupported source rates are rejected rather than silently changed. PCM8 movies require the current `MUPIC.PRG`; existing PCM16 movies remain compatible. Playback bandwidth is two bytes per stereo sample for PCM8, four for PCM16; MUP cache blocks remain padded to 256 KiB.
 
 The complete table is generated offline and distributed as a losslessly compressed asset. The CLI embeds it; the browser downloads it once and saves it in IndexedDB. Neither requires a lengthy local precalculation. Encoding uses direct lookups in a 64 MiB table, preserving the original positional dithering. The table works for any video decoded to RGB24 with the current palette and algorithm.
+
+With isolation, browser workers share one additional 64 MiB LUT copy and reuse frame buffers, packing up to three frames concurrently. The CLI shares its immutable LUT between native workers. Both retain frame order and the same Rust dithering and compression; browsers without shared memory keep the serial LUT path.
 
 Checksums and an algorithm/palette fingerprint protect loading and cache reuse. The CLI caches the expanded asset in the system user-cache directory (`--cache-dir PATH` overrides it). Use `mupic-encoder --prepare-lut` to warm this cache, or `--no-cache` for ordinary exact color search. Unavailable browser storage still allows acceleration for the current page. Clearing storage requires downloading the compressed asset again. Palette or algorithm changes require regenerating it offline.
 

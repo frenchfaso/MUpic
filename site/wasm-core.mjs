@@ -1,13 +1,14 @@
 /** Minimal adapter around the same Rust exports used by the native encoder. */
 export class EncoderCore {
-  static async load(url) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`The Rust encoder could not be loaded (HTTP ${response.status}).`);
-    let module;
-    try { module = await WebAssembly.compileStreaming(Promise.resolve(response.clone())); }
-    catch { module = await WebAssembly.compile(await response.arrayBuffer()); }
+  static async load(url,module) {
+    if(!module) {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`The Rust encoder could not be loaded (HTTP ${response.status}).`);
+      try { module = await WebAssembly.compileStreaming(Promise.resolve(response.clone())); }
+      catch { module = await WebAssembly.compile(await response.arrayBuffer()); }
+    }
     const instance = await WebAssembly.instantiate(module, {});
-    return new EncoderCore(instance.exports);
+    const core=new EncoderCore(instance.exports);core.module=module;return core;
   }
   constructor(exports) {
     this.exports = exports;
@@ -38,6 +39,28 @@ export class EncoderCore {
       const e=this.exports;
       return this.bytes(e.mup_result_ptr(),e.mup_result_len()).slice();
     } finally { this.free(pointer,rgb.byteLength); }
+  }
+  sharedLut() {
+    const e=this.exports;
+    if(!e.mup_lut_plans_ptr||!e.mup_lut_plans_len||!e.mup_pack_plans)return null;
+    const length=e.mup_lut_plans_len(),pointer=e.mup_lut_plans_ptr();
+    if(length!==67108864||!pointer)return null;
+    const buffer=new SharedArrayBuffer(length);
+    new Uint8Array(buffer).set(this.bytes(pointer,length));
+    return buffer;
+  }
+  packShared(rgb,lut,output) {
+    if(rgb.length!==216000||lut.length!==16777216||output.length!==36000)
+      throw new Error('Invalid shared frame or color table.');
+    const e=this.exports,length=72000*4,pointer=e.mup_alloc(length);
+    if(!pointer)throw new Error('The encoder ran out of memory.');
+    try {
+      const plans=new Uint32Array(e.memory.buffer,pointer,72000);
+      for(let pixel=0,at=0;pixel<plans.length;pixel++,at+=3)
+        plans[pixel]=lut[(rgb[at]<<16)|(rgb[at+1]<<8)|rgb[at+2]];
+      this.check(e.mup_pack_plans(pointer,length));
+      output.set(this.bytes(e.mup_result_ptr(),e.mup_result_len()));
+    }finally{this.free(pointer,length);}
   }
   prepareKeys(rgb) {
     const pointer=this.allocate(rgb);

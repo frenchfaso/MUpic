@@ -1,5 +1,5 @@
 import {loadLutAsset} from './lut-cache.mjs?v=25727af609d67526';
-/** Worker scheduling deliberately needs neither SharedArrayBuffer nor COOP/COEP. */
+/** Exact searches work without isolation; a verified LUT can share frame work. */
 export class WorkerClient {
   constructor(url) {
     this.worker=new Worker(url,{type:'module'});this.pending=new Map();this.serial=0;this.closed=false;
@@ -23,24 +23,28 @@ export class WorkerClient {
   }
 }
 export class QuantizerPool {
-  constructor(count,url,{eager=false}={}) {
+  constructor(count,url,{eager=false,shared=globalThis.crossOriginIsolated===true&&typeof SharedArrayBuffer==='function'}={}) {
     if(!Number.isInteger(count)||count<1)throw new Error('Worker count must be positive.');
     this.count=count;this.url=url;this.closed=false;this.lutReady=false;this.pending=Promise.resolve();
+    this.shared=shared&&count>1;this.sharedLut=null;this.freeBuffers=[];
     this.workers=Array.from({length:eager?count:1},()=>new WorkerClient(url));
   }
   async init(wasmUrl) {
     this.wasmUrl=wasmUrl;
-    try{await Promise.all(this.workers.map(worker=>worker.call('init',{url:wasmUrl})));}
+    try {
+      const results=await Promise.all(this.workers.map(worker=>worker.call('init',{url:wasmUrl})));
+      this.module=results[0]?.module;
+    }
     catch(error){this.close();throw error;}
   }
   checkOwner() {
     if(this.closed||this.workers[0]?.closed){this.close();throw new Error('The encoder worker stopped. Retry loading the color table.');}
   }
-  async ensureWorkers() {
+  async ensureWorkers(count=this.count) {
     this.checkOwner();const additions=[];
     this.workers=this.workers.filter(worker=>!worker.closed);
-    while(this.workers.length<this.count){const worker=new WorkerClient(this.url);this.workers.push(worker);additions.push(worker);}
-    try{await Promise.all(additions.map(worker=>worker.call('init',{url:this.wasmUrl})));}
+    while(this.workers.length<count){const worker=new WorkerClient(this.url);this.workers.push(worker);additions.push(worker);}
+    try{await Promise.all(additions.map(worker=>worker.call('init',{url:this.wasmUrl,module:this.module,sharedLut:this.sharedLut})));}
     catch(error){for(const worker of additions)worker.close(error);throw error;}
   }
   stopLut(){this.loadingController?.abort();}
@@ -64,6 +68,15 @@ export class QuantizerPool {
       if(info.loadedBlocks!==info.blockCount)throw new Error('The color table is incomplete.');
       this.lutReady=true;
       for(const worker of this.workers.slice(1))worker.close();this.workers=[owner];
+      if(this.shared) {
+        try {this.sharedLut=await owner.call('shareLut');}
+        catch(error) {
+          this.checkOwner();
+          if(controller.signal.aborted)throw error;
+          // A device may have room for the LUT but not its shared copy.
+          this.shared=false;
+        }
+      }
       return result;
     }finally{signal?.removeEventListener('abort',abort);this.loadingController=null;}
   }
@@ -72,8 +85,14 @@ export class QuantizerPool {
   }
   async planBatch(frames) {
     this.checkOwner();
+    if(this.sharedLut) {
+      if(frames.length<1||frames.length>3||frames.some(frame=>frame.length!==216000))
+        throw new Error('A planning batch must contain one to three 360x200 RGB frames.');
+      return this.packSharedBatch(frames);
+    }
     const owner=this.workers[0],buffers=frames.map(frame=>
       frame.byteOffset===0&&frame.byteLength===frame.buffer.byteLength?frame.buffer:frame.slice().buffer);
+    if(this.lutReady)return owner.call('quantizeBatch',{frames:buffers},buffers);
     const keys=new Uint32Array(await owner.call('prepare',{frames:buffers},buffers));
     if(keys.length)await this.ensureWorkers();
     const plans=new Uint32Array(keys.length);let next=0;
@@ -86,5 +105,33 @@ export class QuantizerPool {
     }));
     return owner.call('pack',{keys:keys.buffer,plans:plans.buffer},[keys.buffer,plans.buffer]);
   }
-  close(){this.closed=true;this.stopLut();for(const worker of this.workers)worker.close();}
+  async packSharedBatch(frames) {
+    await this.ensureWorkers(Math.min(this.count,frames.length));
+    const bytes=frames.length*(216000+36000);
+    const index=this.freeBuffers.findIndex(buffer=>buffer.byteLength>=bytes);
+    const buffer=index<0?new SharedArrayBuffer(bytes):this.freeBuffers.splice(index,1)[0];
+    const rgbBytes=frames.length*216000,result=[];
+    frames.forEach((frame,i)=>{
+      new Uint8Array(buffer,i*216000,216000).set(frame);
+      result.push(new Uint8Array(buffer,rgbBytes+i*36000,36000));
+    });
+    let next=0;
+    try {
+      const settled=await Promise.allSettled(this.workers.slice(0,frames.length).map(async worker=>{
+        while(next<frames.length) {
+          const i=next++;
+          await worker.call('packShared',{buffer,rgbOffset:i*216000,packedOffset:rgbBytes+i*36000});
+        }
+      }));
+      const failed=settled.find(result=>result.status==='rejected');
+      if(failed)throw failed.reason;
+      return result;
+    }catch(error){if(!this.closed&&this.freeBuffers.length<2)this.freeBuffers.push(buffer);throw error;}
+  }
+  releaseBatch(result) {
+    const buffer=result[0]?.buffer;
+    if(this.sharedLut&&buffer instanceof SharedArrayBuffer&&!this.closed&&this.freeBuffers.length<2)
+      this.freeBuffers.push(buffer);
+  }
+  close(){this.closed=true;this.stopLut();this.freeBuffers=[];this.sharedLut=null;for(const worker of this.workers)worker.close();}
 }

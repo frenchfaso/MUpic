@@ -1,7 +1,7 @@
 import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
 import {MupPlayer} from './preview-player.mjs?v=6fb2d3e599591c82';
 import {videoPlan,asciiTitle,decodePcm,decodePcm8Source,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=0dd23ebe63904142';
-import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=f2dd967349f8b8a2';
+import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=771804d54a1c14b7';
 import {ConversionProgress} from './conversion-progress.mjs?v=ff2c0e223da601a2';
 import { ensureIsolation } from './isolation.mjs?v=26c03e13fa61303e';
 await ensureIsolation();
@@ -263,17 +263,21 @@ async function convertSelected(signal) {
   checkAbort(signal);
   encoder=new WorkerClient(assetUrl('./encoder-worker.mjs'));
   status('Preparing…');
-  await encoder.call('init',{url:wasmUrl});checkAbort(signal);
+  await encoder.call('init',{url:wasmUrl,module:pool.module});checkAbort(signal);
   await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name),audioFormat,sampleRate},[pcm.buffer]);
   updateProgress(progress.start());
   const pending=[];
   const addChunks=chunks=>{for(const chunk of chunks)parts.push(new Blob([chunk]));};
   async function publishOne() {
-    const {result,error}=await pending.shift();if(error)throw error;checkAbort(signal);
-    for(const packed of result) {
-      const encoded=await encoder.call('frame',{packed},[packed]);addChunks(encoded.chunks);
-      updateProgress(progress.encodedFrame(progress.encodedFrames));
-    }
+    const {result,error}=await pending.shift();if(error)throw error;
+    try {
+      checkAbort(signal);
+      for(const packed of result) {
+        const transfer=packed instanceof ArrayBuffer?[packed]:[];
+        const encoded=await encoder.call('frame',{packed},transfer);addChunks(encoded.chunks);
+        updateProgress(progress.encodedFrame(progress.encodedFrames));
+      }
+    }finally{pool.releaseBatch(result);}
   }
   const batchFrames=3;
   for(let first=0;first<plan.frameCount;first+=batchFrames) {
@@ -286,7 +290,7 @@ async function convertSelected(signal) {
     pending.push((async()=>{
       try {
         const result=await pool.batch(frames);
-        checkAbort(signal);
+        if(signal.aborted){pool.releaseBatch(result);checkAbort(signal);}
         for(let index=first;index<last;index++)updateProgress(progress.quantizedFrame(index));
         return {result};
       } catch(error){return {error};}

@@ -138,6 +138,18 @@ pub extern "C" fn mup_quantize(pointer: usize, length: usize) -> i32 {
         Ok(())
     })
 }
+/// Row-major u32LE candidate ids; the core owns Bayer dithering and borders.
+#[no_mangle]
+pub extern "C" fn mup_pack_plans(pointer: usize, length: usize) -> i32 {
+    operation(|r| {
+        if length != VIDEO_WIDTH * VIDEO_HEIGHT * std::mem::size_of::<u32>() {
+            return Err("Frame plans must contain 72000 valid candidate ids".into());
+        }
+        let plans = r.input_u32(pointer, length)?;
+        r.result = r.quantizer()?.pack_frame_plans(&plans)?;
+        Ok(())
+    })
+}
 #[no_mangle]
 pub extern "C" fn mup_prepare_keys(pointer: usize, length: usize) -> i32 {
     operation(|r| {
@@ -199,6 +211,28 @@ pub extern "C" fn mup_lut_info() -> i32 {
         .flat_map(u32::to_le_bytes)
         .collect();
         Ok(())
+    })
+}
+/// Borrowed verified LUT view. Copy it before any LUT import/reset or memory
+/// growth, which can invalidate the pointer or the JavaScript typed-array view.
+#[no_mangle]
+pub extern "C" fn mup_lut_plans_ptr() -> usize {
+    RUNTIME.with(|r| {
+        r.borrow()
+            .quantizer
+            .as_ref()
+            .and_then(Quantizer::complete_lut_plans)
+            .map_or(0, |plans| plans.as_ptr() as usize)
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_lut_plans_len() -> usize {
+    RUNTIME.with(|r| {
+        r.borrow()
+            .quantizer
+            .as_ref()
+            .and_then(Quantizer::complete_lut_plans)
+            .map_or(0, std::mem::size_of_val)
     })
 }
 #[no_mangle]

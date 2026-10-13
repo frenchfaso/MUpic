@@ -142,12 +142,21 @@ test('the portable LUT asset preserves exact Rust packing and complete MUP outpu
   assert.equal(Buffer.from(header.subarray(64,96)).toString('hex'),owner.lutPatternFingerprint(),'native/WASM plan patterns must agree');
   assert.equal(owner.lutInfo().loadedBlocks,4096);
   assert.equal(owner.exports.mup_lut_generate,undefined,'the browser must not generate LUT colors');
+  const shared=owner.sharedLut(),worker=await makeCore(),plans=new Uint32Array(shared),packed=new Uint8Array(36000);
+  assert.equal(shared.byteLength,67108864);
+  assert.equal(worker.sharedLut(),null,'a worker without a verified complete LUT must not publish one');
+  assert.equal(worker.lutInfo().loadedBlocks,0,'shared workers need no private LUT copy');
   const rgb=new Uint8Array(216000);
   for(const color of [[0,0,101],[0,8,8],[131,79,36],PALETTE[12],PALETTE[7],[123,122,125],[255,255,254]]) {
     for(let pixel=0;pixel<72000;pixel++)rgb.set(color,pixel*3);
     assert.equal(owner.prepareKeys(rgb).length,0);
     assert.deepEqual(owner.quantize(rgb),reference.quantize(rgb),'all 64 Bayer positions and black side borders');
+    worker.packShared(rgb,plans,packed);
+    assert.deepEqual(packed,owner.quantize(rgb),'shared plans use the same Rust Bayer packing');
   }
+  assert.throws(()=>worker.packShared(rgb.subarray(3),plans,packed),/Invalid shared/);
+  assert.throws(()=>worker.packShared(rgb,plans.subarray(1),packed),/Invalid shared/);
+  assert.throws(()=>worker.packShared(rgb,plans,packed.subarray(1)),/Invalid shared/);
   const encoded=[await makeCore(),await makeCore()],parts=[[],[]],pcm=new Uint8Array(11000);
   encoded.forEach(core=>core.begin(2,pcm,'EXACT LUT PARITY'));
   for(const color of [[0,0,101],[0,0,127]]) {

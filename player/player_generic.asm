@@ -1490,13 +1490,14 @@ audio_start:
     lda fatal_error
     bne !done+
     ldx #$51 // enabled PCM16 with a four-byte interleaved stride.
-    lda #AUDIO_VOICE_VOLUME
     ldy HEADER+7
     cpy #3
     bne !format+
-    lda #32 // PCM8 at unity gain matches the HQ noise-shaping preview.
     ldx #$41 // signed PCM8 with a two-byte interleaved stride.
 !format:
+    // The sampler expands signed PCM8 into the high byte of PCM16.
+    // Both formats use the same volume multiplier; HQ headroom is in the MUP.
+    lda #AUDIO_VOICE_VOLUME
     sta $df21
     sta $df41
     stx $df20

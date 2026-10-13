@@ -213,7 +213,9 @@ class PcmPlayer(unittest.TestCase):
                                              maximum - resume)
                             self.assertEqual(int.from_bytes(memory[base + 14:base + 16], "big"), divider)
                             self.assertEqual(memory.written(base), control)
-                            self.assertEqual(memory.written(base + 1), 32 if flags == 3 else 63)
+                            # Signed PCM8 is expanded into the sampler's high
+                            # byte; changing sample width must not reduce gain.
+                            self.assertEqual(memory.written(base + 1), 63)
                             self.assertEqual(memory.written(base + 2), voice * 15)
                         self.assertEqual(self.get(memory, "audio_tick_count"), 19)
                         self.assertEqual(self.get(memory, "audio_resume_active"), 0)
@@ -227,7 +229,7 @@ class PcmPlayer(unittest.TestCase):
         for address in [0xDF20, 0xDF40]:
             memory[address] = 0x41
         for address in [0xDF21, 0xDF41]:
-            memory[address] = 32
+            memory[address] = 63
         self.call(cpu, "audio_prepare")
         self.call(cpu, "audio_start")
         self.assertEqual(self.get(memory, "fatal_error"), 7)
