@@ -756,28 +756,18 @@ lz_prepare_next:
     sta lz_prefetch_rows
     bne !prepared+
 !partial:
-    // Small quiet records have ample slack; repeated subtraction avoids
-    // a512-byte division table. Busy records take the constant full path.
+    // A bounded binary divide keeps preparation cheap even just below
+    // the full-prefix threshold. Preserve the parser's established layout.
     lda record_remaining
     sta lz_prefetch_count
     lda record_remaining+1
     sta lz_prefetch_count+1
-!divide:
-    lda lz_prefetch_count+1
-    bne !subtract+
-    lda lz_prefetch_count
-    cmp #PREFETCH_BYTES_PER_ROW
-    bcc !remainder+
-!subtract:
-    sec
-    lda lz_prefetch_count
-    sbc #PREFETCH_BYTES_PER_ROW
-    sta lz_prefetch_count
-    lda lz_prefetch_count+1
-    sbc #0
-    sta lz_prefetch_count+1
-    inc lz_prefetch_rows
-    jmp !divide-
+lz_prefix_divide_call:
+    jsr lz_prefix_divide
+    jmp !remainder+
+    // The original subtraction loop occupied35 bytes. Unexecuted padding
+    // keeps decoder branches, validation tables and cycle models aligned.
+    .fill 35-(*-lz_prefix_divide_call), $ea
 !remainder:
     sec
     lda record_remaining
@@ -1229,6 +1219,31 @@ switch_cache_bank:
     rts
 
 dict_literal_length_valid: .fill 256, (i<=DICT_MAX_LITERAL_BYTES && mod(i,5)==0 ? 0 : 1)
+
+// For a partial prefix (<2600 bytes), eight trial subtractions yield the
+// quotient0..199 and remainder0..12. X is preserved for existing callers.
+lz_prefix_divide:
+    txa
+    pha
+    .for (var bit=7;bit>=0;bit--) {
+        .var amount=PREFETCH_BYTES_PER_ROW*(1<<bit)
+        sec
+        lda lz_prefetch_count
+        sbc #<amount
+        tax
+        lda lz_prefetch_count+1
+        sbc #>amount
+        bcc !next+
+        sta lz_prefetch_count+1
+        stx lz_prefetch_count
+        lda lz_prefetch_rows
+        ora #(1<<bit)
+        sta lz_prefetch_rows
+!next:
+    }
+    pla
+    tax
+    rts
 .label low_program_end = *
 .assert "Wide resident program overlaps page framebuffer", * <= $1800, true
 

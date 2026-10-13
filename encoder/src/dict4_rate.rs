@@ -5,6 +5,11 @@ use std::collections::HashMap;
 const FRAME: usize = 46080;
 const COLS: usize = 180;
 const ROWS: usize = 200;
+// Quantize individual palette distances before adding pixels. This preserves
+// perceptual precision while making equal word errors and their ordering exact
+// across native libm and WebAssembly floating-point implementations.
+const DISTANCE_SCALE: f64 = 1_000_000_000_000.0;
+const FORBIDDEN: u64 = u64::MAX;
 
 fn read_word(frame: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(frame[at..at + 4].try_into().unwrap())
@@ -30,39 +35,40 @@ fn oklab(rgb: [u8; 3]) -> [f64; 3] {
         0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
     ]
 }
-fn word_error(a: u32, b: u32, distance: &[Vec<f64>]) -> f64 {
+fn word_error(a: u32, b: u32, distance: &[Vec<u64>]) -> u64 {
     let aa = a.to_le_bytes();
     let bb = b.to_le_bytes();
     (0..4)
         .map(|k| distance[aa[k] as usize][bb[k] as usize])
-        .sum()
+        .fold(0, u64::saturating_add)
 }
 #[derive(Clone)]
 struct Change {
     at: usize,
     value: u32,
-    error: f64,
+    error: u64,
 }
 
 /// Reuse the palette metric across transitions in the streaming encoder.
 pub(super) struct Prepared {
-    distance: Vec<Vec<f64>>,
+    distance: Vec<Vec<u64>>,
 }
 impl Prepared {
     pub(super) fn new(palette: &[[u8; 3]; 16]) -> Self {
         let labs = palette.map(oklab);
-        let mut colour_distance = [[0.0; 16]; 16];
+        let mut colour_distance = [[0; 16]; 16];
         for a in 0..16 {
             for b in 0..16 {
-                colour_distance[a][b] = (0..3).map(|k| (labs[a][k] - labs[b][k]).powi(2)).sum();
+                let squared: f64 = (0..3).map(|k| (labs[a][k] - labs[b][k]).powi(2)).sum();
+                colour_distance[a][b] = (squared * DISTANCE_SCALE).round() as u64;
             }
         }
-        let mut distance = vec![vec![0.0; 256]; 256];
+        let mut distance = vec![vec![0; 256]; 256];
         for (a, row) in distance.iter_mut().enumerate() {
             for (b, d) in row.iter_mut().enumerate() {
                 // Preserve the existing neutral guard per pixel, including mixed words.
                 *d = if (grey(a & 15) && !grey(b & 15)) || (grey(a >> 4) && !grey(b >> 4)) {
-                    f64::INFINITY
+                    FORBIDDEN
                 } else {
                     colour_distance[a & 15][b & 15] + colour_distance[a >> 4][b >> 4]
                 };
@@ -119,7 +125,7 @@ impl Prepared {
         entries.sort_by_key(|(_, (n, order))| (std::cmp::Reverse(*n), *order));
         entries.truncate(254);
         let dictionary = entries.iter().map(|(value, _)| *value).collect::<Vec<_>>();
-        let mut nearest: HashMap<u32, (u32, f64)> = HashMap::new();
+        let mut nearest: HashMap<u32, (u32, u64)> = HashMap::new();
         let mut changes = Vec::new();
         for c in 0..COLS {
             for y in (0..ROWS).step_by(4) {
@@ -130,20 +136,20 @@ impl Prepared {
                     continue;
                 }
                 let &mut (mut value, mut error) = nearest.entry(wanted).or_insert_with(|| {
-                    let mut best = (wanted, f64::INFINITY);
+                    let mut best = (wanted, FORBIDDEN);
                     for &candidate in &dictionary {
                         let e = word_error(wanted, candidate, &self.distance);
                         if e < best.1 {
                             best = (candidate, e);
                         }
-                        if e == 0.0 {
+                        if e == 0 {
                             break;
                         }
                     }
                     best
                 });
                 // Exact dictionary words already have the cheapest lossless code.
-                if error == 0.0 {
+                if error == 0 {
                     continue;
                 }
                 let old_error = word_error(wanted, old, &self.distance);
@@ -152,12 +158,12 @@ impl Prepared {
                     value = old;
                     error = old_error;
                 }
-                if error.is_finite() && value != wanted {
+                if error != FORBIDDEN && value != wanted {
                     changes.push(Change { at, value, error });
                 }
             }
         }
-        changes.sort_by(|a, b| a.error.total_cmp(&b.error).then(a.at.cmp(&b.at)));
+        changes.sort_by_key(|change| (change.error, change.at));
         let render = |count: usize| {
             let mut output = target.to_vec();
             for change in &changes[..count] {
@@ -197,6 +203,48 @@ mod tests {
     use super::*;
     use crate::{sd, PALETTE, RATE_BUDGET};
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn palette_metric_is_portable_and_preserves_neutral_guard() {
+        let metric = Prepared::new(&PALETTE);
+        let mut hash = Sha256::new();
+        for row in &metric.distance {
+            for distance in row {
+                hash.update(distance.to_le_bytes());
+            }
+        }
+        assert_eq!(
+            format!("{:x}", hash.finalize()),
+            "465358775525fcd5e1f4d7be72bca1110db5e574abc2b992d1d111bf1733f39c"
+        );
+        assert_eq!(
+            word_error(0x1111_1111, 0x2222_2222, &metric.distance),
+            FORBIDDEN
+        );
+        assert_ne!(
+            word_error(0x2222_2222, 0x1111_1111, &metric.distance),
+            FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn equal_pixel_errors_keep_word_ties_exact() {
+        let metric = Prepared::new(&PALETTE);
+        // These four words selected different, equally close dictionary entries
+        // on native/WASM in a real frame because floating sums broke exact ties.
+        for (wanted, first, second) in [
+            ([89, 180, 86, 153], [89, 187, 91, 187], [91, 187, 91, 155]),
+            ([89, 41, 89, 43], [89, 155, 89, 187], [89, 187, 89, 155]),
+            ([57, 201, 91, 155], [91, 187, 91, 155], [89, 187, 91, 187]),
+            ([89, 140, 89, 132], [89, 187, 89, 155], [89, 155, 89, 187]),
+        ] {
+            let wanted = u32::from_le_bytes(wanted);
+            let first = word_error(wanted, u32::from_le_bytes(first), &metric.distance);
+            let second = word_error(wanted, u32::from_le_bytes(second), &metric.distance);
+            assert_ne!(first, FORBIDDEN);
+            assert_eq!(first, second);
+        }
+    }
 
     #[test]
     fn already_fitting_transition_is_byte_identical() {
@@ -277,12 +325,13 @@ mod tests {
         let actual = Prepared::new(&PALETTE)
             .project(&before, &target, RATE_BUDGET, sd::peak)
             .unwrap();
-        // Recorded from the original codec9 rate-control path before refactoring.
+        // Calibrated player costs and portable integer perceptual ordering.
         assert_eq!(
             format!("{:x}", Sha256::digest(&actual)),
-            "b4f5f109946e3d2c0138b8795b6469af17e443a0fd1db45e829e76ec8b93d017"
+            "e8d94934916551478fcd44cd4894eae5016699dd748b802981afffb7e6501472"
         );
-        assert_eq!(sd::peak(&before, &actual), 424806);
+        assert_eq!(sd::peak(&before, &actual), 428511);
+        assert!(sd::peak(&before, &actual) <= RATE_BUDGET);
         assert!(actual != target && actual != before);
         assert!(actual[..256].iter().all(|&v| v == 0));
         assert!(actual[(COLS - 1) * 256..].iter().all(|&v| v == 0));

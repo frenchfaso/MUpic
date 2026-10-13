@@ -69,7 +69,7 @@ test('the real Rust WASM quantizes hardware colors and emits independently decod
     const e=encoder.exports;previews.push(encoder.bytes(e.mup_preview_ptr(),e.mup_preview_len()).slice());
   }
   const finished=encoder.finish();parts.push(...finished.chunks);
-  assert.equal(finished.stats.receivedFrames,frames);assert.ok(finished.stats.peakSlots<=425000);
+  assert.equal(finished.stats.receivedFrames,frames);assert.ok(finished.stats.peakSlots<=(110-2)*63*63);
   const blob=new Blob([finished.prefix,...parts]),preview=await MupPreview.open(blob);
   assert.equal(preview.header.frameCount,frames);assert.equal(preview.header.divider,281);
   for(const frame of [0,1,7,4,2,6]){await preview.frame(frame);assert.deepEqual(rowFrame(preview.state.front),previews[frame],`frame${frame} post-rate-control`);}

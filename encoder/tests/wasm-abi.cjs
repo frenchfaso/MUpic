@@ -61,7 +61,7 @@ function crc32(bytes) {
     assert.deepEqual(stream.subarray(block * 262144 + 225280, block * 262144 + 225280 + n), pcm.subarray(pcmCursor, pcmCursor + n));
     pcmCursor += n;
   }
-  assert.equal(record, 24); assert.equal(e.mup_received_frames(), 8); assert.ok(e.mup_peak_slots() <= 425000);
+  assert.equal(record, 24); assert.equal(e.mup_received_frames(), 8); assert.ok(e.mup_peak_slots() <= (110-2)*63*63);
   assert.equal(e.mup_finish(), 1);
   console.log(JSON.stringify({ passed: true, wasmPath, imports: 0, frames: 8, records: record, blocks: 2, bytes: file.length, peakSlots: e.mup_peak_slots() }));
 })().catch(error => { console.error(error); process.exit(1); });

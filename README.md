@@ -32,11 +32,13 @@ Copy `movie.mup` and `MUPIC.PRG` to a FAT32 USB stick. Use PAL, 64 MHz, HDMI SD 
 
 Run the PRG from the Ultimate file browser. Arrow keys select, Return plays, Left goes up a directory, Space pauses, and RUN/STOP returns to the list. EOF returns to the browser. Playback uses two 256 KiB REU cache slots. Physical hardware validation remains outstanding.
 
+The shared encoder budgets each of the three PAL ticks per picture against the current player assembly: instruction paths, page crossings, prefetched bytes, REU transfers and preparation of the next record. It balances the three packets before simplifying picture details. The limit is 428,652 turbo slots per tick, retaining two raster lines for service work and timing variation. These costs are checked in the vendored emulator; USB delivery and physical sampler/DDR contention are not certified. Use the current player with newly encoded movies; it also plays existing MUP9 files.
+
 The web demo silently preloads about nine seconds of both movies during startup and maintains that reserve for the playing movie within its 16 MiB browser cache. Audio starts automatically when browser policy permits; otherwise the first click, tap or key on the page enables it.
 
 The local server enables COOP/COEP directly. On static hosts such as GitHub Pages, a local service worker enables isolation with one automatic refresh on the first visit, allowing the SID worker pool and shared audio ring. Video streaming and the saved color table retain their existing caches; unsupported browsers keep the serial fallback.
 
-Both demo movies use stereo PCM8 with HQ noise shaping at their source rates: 44.1 kHz for Big Buck Bunny and 48 kHz for CYBER77. Their video frames, timing and titles are unchanged.
+Both demo movies are encoded with the current cycle-budget planner and use stereo PCM8 with HQ noise shaping at their source rates: 44.1 kHz for Big Buck Bunny and 48 kHz for CYBER77.
 
 ## Build and run locally
 
@@ -76,5 +78,7 @@ node encoder/tests/pcm8-parity.cjs
 ```
 
 The CLI checks need FFmpeg and the release encoder built above; disk tests need mtools. Encoder sources live in `encoder/`, assembly in `player/`, emulator sources in `demo/emulator/`, browser code in `site/`, and build tools in `tools/`.
+
+Player timing tests additionally need `py65` and the assembled `build/player/` (override with `MUPIC_PLAYER_BUILD`). Rust tests pin the assembly sources: after player changes, recalibrate instruction costs and rerun the assembled timing tests before updating that fingerprint. Timing harnesses and instrumentation are excluded from production builds.
 
 GPL-3.0; see [LICENSE](LICENSE) and [CREDITS](CREDITS.md) for authors, media attribution and third-party licenses.

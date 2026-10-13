@@ -2,7 +2,7 @@ name: Encoder checks
 on:
   push:
     branches: [main]
-    paths: ['encoder/**', 'site/**', 'tests/**', 'tools/**', '.github/workflows/ci.yml']
+    paths: ['encoder/**', 'player/**', 'site/**', 'tests/**', 'tools/**', '.github/workflows/ci.yml']
   pull_request:
   workflow_dispatch:
 permissions:

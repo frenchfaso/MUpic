@@ -17,7 +17,9 @@ pub const CACHE_BYTES: usize = 262144;
 pub const AUDIO_OFFSET: usize = 225280;
 pub const FRAME_TICKS: usize = 3;
 pub const CACHE_TICKS: usize = 20;
-pub const RATE_BUDGET: usize = 425000;
+// 110 full PAL lines remain after scanout. Retain two lines for IRQ return,
+// main-loop service and timing variation; the model includes next-record work.
+pub const RATE_BUDGET: usize = (110 - 2) * 63 * 63;
 pub const AUDIO_RATE: u32 = 22085;
 pub const AUDIO_DIVIDER: u16 = 281;
 pub const MAX_FRAMES: usize = 65535 / FRAME_TICKS;
@@ -440,7 +442,10 @@ impl Encoder {
                 &exact,
                 RATE_BUDGET,
                 |before, after| {
-                    let plan = sd::prepare(before, after);
+                    // The last content frame is followed by empty display holds.
+                    // Other following frames have not entered the stream yet.
+                    let following_body = (self.received + 1 == self.frames).then_some(0);
+                    let plan = sd::prepare_at(before, after, self.ticks_in_block, following_body);
                     (plan.peak(), plan)
                 },
             )?;
@@ -530,7 +535,7 @@ impl Encoder {
                 self.frames, self.received
             ));
         }
-        let (holds, peak) = sd::group(&self.previous, None)?;
+        let (holds, peak) = sd::holds(&self.previous, self.ticks_in_block)?;
         self.peak_slots = self.peak_slots.max(peak);
         for record in holds {
             self.packet(&record)?;

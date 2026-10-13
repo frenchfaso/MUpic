@@ -1,4 +1,5 @@
 //! Native SD codec9: deterministic dictionary/SKIP/RAW planner and reference decoder.
+use crate::sd_timing as timing;
 use std::collections::HashMap;
 
 const FRAME: usize = 46080;
@@ -9,8 +10,6 @@ const PREFETCH: usize = 13;
 const TICKS: usize = 3;
 const REGIONS: [(usize, usize, usize); 2] = [(0, 2048, 0xe000), (2048, 44032, 0x1800)];
 const LUT_BYTES: usize = 1024;
-const COL_SETUP: usize = 500;
-const RECORD_SETUP: usize = 5000;
 fn address(c: usize) -> usize {
     if c < 8 {
         0xe000 + c * 256
@@ -27,23 +26,6 @@ fn compact(ram: &[u8]) -> Vec<u8> {
 fn word(bytes: &[u8]) -> [u8; 4] {
     bytes.try_into().unwrap()
 }
-fn primitive_cycles(code: &[u8], escaped: usize) -> usize {
-    let dictionary = code.iter().filter(|&&v| v < 254).count();
-    let control = code.len() - dictionary;
-    // Measured NMOS primitive instruction counts, including RTS and all SMC.
-    // Worst source alignment adds max(47,escaped_bytes-1). Each taken BCS is
-    // conservatively allowed one extra cycle for an unknown final code page.
-    33 + 16 * code.len()
-        + 45 * dictionary
-        + 14 * control
-        + control
-        + if escaped > 0 {
-            4 + 62 * (escaped / 5)
-        } else {
-            0
-        }
-        + (code.len() - 1).max(escaped.saturating_sub(1))
-}
 #[derive(Clone, Debug)]
 struct Column {
     index: usize,
@@ -51,7 +33,8 @@ struct Column {
     code: Vec<u8>,
     escaped: Vec<u8>,
     target: Vec<u8>,
-    cpu: usize,
+    primitive: timing::Primitive,
+    suffix_slots: usize,
 }
 impl Column {
     fn body_len(&self) -> usize {
@@ -128,15 +111,22 @@ fn plan(before: &[u8], after: &[u8]) -> Plan {
                 escaped.extend(&target[at..at + 4]);
             }
         }
-        let cpu = primitive_cycles(&code, escaped.len());
-        let raw = 63 * (2 + WORDS + escaped.len()) + cpu + COL_SETUP >= 63 * (2 + ROWS) + COL_SETUP;
+        let primitive = timing::Primitive::new(&code, escaped.len());
+        let dictionary_cost = timing::column(&primitive, escaped.len(), false, c, 2, 0, 0);
+        let raw_cost = timing::column(&primitive, escaped.len(), true, c, 2, 0, 0);
+        let raw = dictionary_cost.slots() >= raw_cost.slots();
         columns.push(Column {
             index: c,
             raw,
             code,
             escaped,
             target: target.to_vec(),
-            cpu: if raw { 0 } else { cpu },
+            primitive,
+            suffix_slots: if raw {
+                raw_cost.slots()
+            } else {
+                dictionary_cost.slots()
+            },
         });
     }
     Plan { lut, columns }
@@ -146,118 +136,303 @@ struct Cost {
     body: usize,
     slots: usize,
 }
+// Costs below cover the current packet after scanout. Reading/preparing the
+// next header is charged to this tick, where the player actually performs it.
 fn cost(columns: &[Column], reset: bool) -> Cost {
-    let mut body = if reset { LUT_BYTES } else { 0 };
-    for c in columns {
-        body += c.wire();
+    let body = usize::from(reset) * LUT_BYTES + columns.iter().map(Column::wire).sum::<usize>();
+    let prefix = body.min(PREFETCH * ROWS) / PREFETCH * PREFETCH;
+    let mut slots = timing::RECORD_CPU;
+    let mut at = 0;
+    if reset {
+        slots += timing::lut(prefix).slots();
+        at = LUT_BYTES;
     }
-    let prefix = (body.min(PREFETCH * ROWS) / PREFETCH) * PREFETCH;
-    let mut at = if reset { LUT_BYTES } else { 0 };
-    let mut raw_prefix = 0;
-    for c in columns {
-        at += 2;
-        if c.raw {
-            raw_prefix += prefix.saturating_sub(at).min(c.target.len());
+    for column in columns {
+        slots += timing::column(
+            &column.primitive,
+            column.escaped.len(),
+            column.raw,
+            column.index,
+            at + 2,
+            prefix,
+            body - at,
+        )
+        .slots();
+        at += column.wire();
+    }
+    Cost { body, slots }
+}
+
+struct Costs<'a> {
+    columns: &'a [Column],
+    wire: Vec<usize>,
+    suffix: Vec<usize>,
+    // Only columns wholly inside the 2600-byte prefetch can enter these sums.
+    // The total cache is bounded by 51 entries per starting column.
+    buffered: Vec<Vec<isize>>,
+    header_residues: Vec<Vec<usize>>,
+    long_bodies: Vec<usize>,
+    full_prefix: Vec<isize>,
+    reset_prefix: isize,
+}
+impl<'a> Costs<'a> {
+    fn new(columns: &'a [Column]) -> Self {
+        let mut wire = vec![0; columns.len() + 1];
+        let mut suffix = wire.clone();
+        let mut long_bodies = wire.clone();
+        let mut header_residues = vec![Vec::new(); 256];
+        for (index, column) in columns.iter().enumerate() {
+            header_residues[wire[index] & 255].push(index);
+            wire[index + 1] = wire[index] + column.wire();
+            suffix[index + 1] = suffix[index] + column.suffix_slots;
+            long_bodies[index + 1] = long_bodies[index] + usize::from(column.body_len() >= 256);
         }
-        at += c.body_len();
+        let buffered = (0..=columns.len())
+            .map(|begin| {
+                let mut sums = vec![0];
+                for (index, column) in columns.iter().enumerate().skip(begin) {
+                    let at = wire[index] - wire[begin];
+                    if at + column.wire() > PREFETCH * ROWS {
+                        break;
+                    }
+                    // A large feed with low byte 2 removes the three variable
+                    // feed comparisons; the physical source phase remains exact.
+                    let full = timing::column(
+                        &column.primitive,
+                        column.escaped.len(),
+                        column.raw,
+                        column.index,
+                        at + 2,
+                        at + 1026,
+                        0,
+                    )
+                    .slots();
+                    sums.push(sums.last().unwrap() + full as isize - column.suffix_slots as isize);
+                }
+                sums
+            })
+            .collect();
+        let mut costs = Self {
+            columns,
+            wire,
+            suffix,
+            buffered,
+            header_residues,
+            long_bodies,
+            full_prefix: vec![0; columns.len() + 1],
+            reset_prefix: 0,
+        };
+        for begin in 0..=columns.len() {
+            costs.full_prefix[begin] =
+                costs.correction(begin, columns.len(), false, PREFETCH * ROWS);
+        }
+        costs.reset_prefix = costs.correction(0, columns.len(), true, PREFETCH * ROWS);
+        costs
     }
-    let cpu = RECORD_SETUP
-        + columns.iter().map(|c| c.cpu + COL_SETUP).sum::<usize>()
-        + usize::from(reset) * LUT_BYTES * 15
-        + raw_prefix * 15;
-    Cost {
-        body,
-        slots: cpu + 63 * (body + 4 - prefix),
+    fn body(&self, begin: usize, end: usize, reset: bool) -> usize {
+        usize::from(reset) * LUT_BYTES + self.wire[end] - self.wire[begin]
+    }
+    fn first_after(&self, begin: usize, end: usize, limit: Option<usize>) -> usize {
+        limit.map_or(begin, |limit| {
+            begin + self.wire[begin..end].partition_point(|&at| at <= limit)
+        })
+    }
+    fn residue_count(&self, residue: usize, begin: usize, end: usize) -> usize {
+        let positions = &self.header_residues[residue & 255];
+        positions.partition_point(|&index| index < end)
+            - positions.partition_point(|&index| index < begin)
+    }
+    fn correction(&self, begin: usize, end: usize, reset: bool, prefix: usize) -> isize {
+        let reset_bytes = usize::from(reset) * LUT_BYTES;
+        if prefix <= reset_bytes {
+            return 0;
+        }
+        // Reset adds four whole pages, so cached source phases are unchanged.
+        debug_assert_eq!(LUT_BYTES % 256, 0);
+        let limit = self.wire[begin] + prefix - reset_bytes;
+        let full_end = begin + self.wire[begin + 1..end + 1].partition_point(|&at| at <= limit);
+        let mut correction = self.buffered[begin][full_end - begin];
+        let small_header = self.first_after(begin, full_end, limit.checked_sub(256));
+        let short_body = self.first_after(begin, full_end, limit.checked_sub(258));
+        let long_body = self.first_after(begin, full_end, limit.checked_sub(514));
+        let short_count =
+            full_end - short_body - (self.long_bodies[full_end] - self.long_bodies[short_body]);
+        let long_count = self.long_bodies[full_end] - self.long_bodies[long_body];
+        correction += (8 * (full_end - small_header)
+            + 8 * (self.residue_count(limit, begin, full_end)
+                + self.residue_count(limit.wrapping_sub(1), begin, full_end))
+            + 9 * (short_count + long_count)) as isize;
+        // Only one column can cross the prefetch boundary; retain its complete
+        // instruction model, including mixed RAM/REU copies and page crossings.
+        if full_end < end && self.wire[full_end] < limit {
+            let column = &self.columns[full_end];
+            let at = self.wire[full_end] - self.wire[begin] + reset_bytes;
+            let actual = timing::column(
+                &column.primitive,
+                column.escaped.len(),
+                column.raw,
+                column.index,
+                at + 2,
+                prefix,
+                0,
+            )
+            .slots();
+            correction += actual as isize - column.suffix_slots as isize;
+        }
+        correction
+    }
+    fn score(&self, begin: usize, end: usize, reset: bool) -> usize {
+        let body = self.body(begin, end, reset);
+        let prefix = body.min(PREFETCH * ROWS) / PREFETCH * PREFETCH;
+        let correction = if prefix == PREFETCH * ROWS {
+            if reset {
+                self.reset_prefix
+            } else {
+                self.full_prefix[begin]
+            }
+        } else {
+            self.correction(begin, end, reset, prefix)
+        };
+        let lut = if reset {
+            timing::lut(prefix).slots()
+        } else {
+            0
+        };
+        (timing::RECORD_CPU + lut + self.suffix[end] - self.suffix[begin])
+            .checked_add_signed(correction)
+            .unwrap()
     }
 }
-fn partition(columns: &[Column]) -> Vec<std::ops::Range<usize>> {
+fn switching(first_tick: usize, tick: usize) -> bool {
+    (first_tick + tick + 1).is_multiple_of(crate::CACHE_TICKS)
+}
+fn next_cost(body: Option<usize>, switch_cache: bool) -> usize {
+    body.map_or_else(
+        || timing::max_next_prepare(switch_cache),
+        |body| timing::next_prepare(body, switch_cache),
+    )
+    .slots()
+}
+fn partition(
+    columns: &[Column],
+    first_tick: usize,
+    following_body: Option<usize>,
+) -> Vec<std::ops::Range<usize>> {
     let n = columns.len();
-    // Cumulative wire/CPU/raw lengths make candidate range costs O(log n).
-    // This matters when the modern encoder tries several perceptual thresholds.
-    let mut wire = vec![0; n + 1];
-    let mut cpu = vec![0; n + 1];
-    let mut raw = vec![0; n + 1];
-    for (i, c) in columns.iter().enumerate() {
-        wire[i + 1] = wire[i] + c.wire();
-        cpu[i + 1] = cpu[i] + c.cpu + COL_SETUP;
-        raw[i + 1] = raw[i] + if c.raw { c.target.len() } else { 0 };
-    }
-    let raw_before = |at: usize| {
-        let i = wire.partition_point(|&v| v <= at).saturating_sub(1).min(n);
-        raw[i]
-            + if i < n && columns[i].raw {
-                at.saturating_sub(wire[i] + 2).min(columns[i].target.len())
-            } else {
-                0
+    let costs = Costs::new(columns);
+    let first = (0..=n)
+        .map(|end| costs.score(0, end, true))
+        .collect::<Vec<_>>();
+    let last_prepare = next_cost(following_body, switching(first_tick, 2));
+    // A real split supplies an upper bound before enumeration. Add one so the
+    // ascending search still selects the first equally good split itself.
+    let first_guess = n / 3;
+    let second_guess = 2 * n / 3;
+    let seed = (first[first_guess]
+        + next_cost(
+            Some(costs.body(first_guess, second_guess, false)),
+            switching(first_tick, 0),
+        ))
+    .max(
+        costs.score(first_guess, second_guess, false)
+            + next_cost(
+                Some(costs.body(second_guess, n, false)),
+                switching(first_tick, 1),
+            ),
+    )
+    .max(costs.score(second_guess, n, false) + last_prepare);
+    let mut best = seed + 1;
+    let mut cuts = (0, 0);
+    // With only three ticks, enumerate the two boundaries directly. Lookahead
+    // couples neighbouring records, so the old independent-tick DP is invalid.
+    // Keep ascending second/first boundaries and strict improvement for ties.
+    for second in 0..=n {
+        let third = costs.score(second, n, false) + last_prepare;
+        if third >= best {
+            continue;
+        }
+        let middle_prepare =
+            next_cost(Some(costs.body(second, n, false)), switching(first_tick, 1));
+        for (first_cut, &first_decode) in first[..=second].iter().enumerate() {
+            let initial = first_decode
+                + next_cost(
+                    Some(costs.body(first_cut, second, false)),
+                    switching(first_tick, 0),
+                );
+            if initial >= best {
+                continue;
             }
-    };
-    let score = |begin: usize, end: usize, reset: bool| {
-        let lut = if reset { LUT_BYTES } else { 0 };
-        let body = lut + wire[end] - wire[begin];
-        let prefix = body.min(PREFETCH * ROWS) / PREFETCH * PREFETCH;
-        let raw_prefix = raw_before(wire[begin] + prefix.saturating_sub(lut)) - raw[begin];
-        RECORD_SETUP + cpu[end] - cpu[begin] + lut * 15 + raw_prefix * 15 + 63 * (body + 4 - prefix)
-    };
-    let mut dp = vec![vec![usize::MAX; n + 1]; TICKS + 1];
-    let mut prev = vec![vec![0; n + 1]; TICKS + 1];
-    for end in 0..=n {
-        dp[1][end] = score(0, end, true);
-    }
-    // Every later tick only depends on earlier-tick entries at begin <= end.
-    // Solving those ticks together lets one small row reuse the identical
-    // no-reset costs, rather than building a quadratic score table.
-    let mut scores = vec![usize::MAX; n + 1];
-    for end in 0..=n {
-        scores[..=end].fill(usize::MAX);
-        for t in 2..=TICKS {
-            for begin in 0..=end {
-                // A maximum cannot improve on this previous peak. Equality
-                // must also be skipped: the original first boundary wins ties.
-                if dp[t - 1][begin] >= dp[t][end] {
-                    continue;
-                }
-                if scores[begin] == usize::MAX {
-                    scores[begin] = score(begin, end, false);
-                }
-                let peak = dp[t - 1][begin].max(scores[begin]);
-                if peak < dp[t][end] {
-                    dp[t][end] = peak;
-                    prev[t][end] = begin;
-                }
+            let middle = costs.score(first_cut, second, false) + middle_prepare;
+            let peak = initial.max(middle).max(third);
+            if peak < best {
+                best = peak;
+                cuts = (first_cut, second);
             }
         }
     }
-    let mut parts = Vec::new();
-    let mut end = n;
-    for t in (1..=TICKS).rev() {
-        let begin = prev[t][end];
-        parts.push(begin..end);
-        end = begin;
-    }
-    parts.reverse();
-    parts
+    vec![0..cuts.0, cuts.0..cuts.1, cuts.1..n]
+}
+fn planned_peak(
+    columns: &[Column],
+    parts: &[std::ops::Range<usize>],
+    first_tick: usize,
+    reset_first: bool,
+    following_body: Option<usize>,
+) -> usize {
+    let records = parts
+        .iter()
+        .enumerate()
+        .map(|(tick, range)| cost(&columns[range.clone()], reset_first && tick == 0))
+        .collect::<Vec<_>>();
+    records
+        .iter()
+        .enumerate()
+        .map(|(tick, record)| {
+            record.slots
+                + next_cost(
+                    records
+                        .get(tick + 1)
+                        .map(|next| next.body)
+                        .or(following_body),
+                    switching(first_tick, tick),
+                )
+        })
+        .max()
+        .unwrap()
 }
 /// Keep the authoritative dictionary and packet split that admitted a frame.
 pub(super) struct Prepared {
     plan: Plan,
     parts: Vec<std::ops::Range<usize>>,
     peak: usize,
+    first_tick: usize,
+    following_body: Option<usize>,
 }
 impl Prepared {
     pub(super) fn peak(&self) -> usize {
         self.peak
     }
 }
-pub(super) fn prepare(before: &[u8], after: &[u8]) -> Prepared {
+pub(super) fn prepare_at(
+    before: &[u8],
+    after: &[u8],
+    first_tick: usize,
+    following_body: Option<usize>,
+) -> Prepared {
     let plan = plan(before, after);
-    let parts = partition(&plan.columns);
-    let peak = parts
-        .iter()
-        .enumerate()
-        .map(|(tick, range)| cost(&plan.columns[range.clone()], tick == 0).slots)
-        .max()
-        .unwrap();
-    Prepared { plan, parts, peak }
+    let parts = partition(&plan.columns, first_tick, following_body);
+    let peak = planned_peak(&plan.columns, &parts, first_tick, true, following_body);
+    Prepared {
+        plan,
+        parts,
+        peak,
+        first_tick,
+        following_body,
+    }
+}
+#[cfg(test)]
+pub(super) fn prepare(before: &[u8], after: &[u8]) -> Prepared {
+    prepare_at(before, after, 0, None)
 }
 #[cfg(test)]
 pub(super) fn peak(before: &[u8], after: &[u8]) -> usize {
@@ -369,12 +544,19 @@ fn decode(ram: &mut [u8], state: &mut State, payload: &[u8]) -> Result<bool, Str
     *state = next;
     Ok(flags & 1 != 0)
 }
-pub(super) fn group(before: &[u8], after: Option<&[u8]>) -> Result<(Vec<Vec<u8>>, usize), String> {
+#[cfg(test)]
+fn group(before: &[u8], after: Option<&[u8]>) -> Result<(Vec<Vec<u8>>, usize), String> {
     if before.len() != FRAME || after.is_some_and(|f| f.len() != FRAME) {
         return Err("SD frame must contain 46080 page-stride bytes".into());
     }
-    let prepared = after.map(|target| prepare(before, target));
-    group_from_plan(before, after, prepared)
+    let prepared = after.map(|target| prepare_at(before, target, 0, None));
+    group_from_plan(before, after, prepared, 0)
+}
+pub(super) fn holds(before: &[u8], first_tick: usize) -> Result<(Vec<Vec<u8>>, usize), String> {
+    if before.len() != FRAME {
+        return Err("SD frame must contain 46080 page-stride bytes".into());
+    }
+    group_from_plan(before, None, None, first_tick)
 }
 pub(super) fn group_prepared(
     before: &[u8],
@@ -384,12 +566,13 @@ pub(super) fn group_prepared(
     if before.len() != FRAME || after.len() != FRAME {
         return Err("SD frame must contain 46080 page-stride bytes".into());
     }
-    group_from_plan(before, Some(after), Some(prepared))
+    group_from_plan(before, Some(after), Some(prepared), 0)
 }
 fn group_from_plan(
     before: &[u8],
     after: Option<&[u8]>,
     prepared: Option<Prepared>,
+    holds_tick: usize,
 ) -> Result<(Vec<Vec<u8>>, usize), String> {
     let mut ram = vec![0xaa; 65536];
     for &(at, count, address) in &REGIONS {
@@ -397,18 +580,30 @@ fn group_from_plan(
     }
     let mut decoder = State::new();
     let expected_peak = prepared.as_ref().map(Prepared::peak);
-    let (plan, parts) = prepared.map_or_else(
-        || (None, vec![0..0; TICKS]),
-        |prepared| (Some(prepared.plan), prepared.parts),
+    let (plan, parts, first_tick, following_body) = prepared.map_or_else(
+        || (None, vec![0..0; TICKS], holds_tick, Some(0)),
+        |prepared| {
+            (
+                Some(prepared.plan),
+                prepared.parts,
+                prepared.first_tick,
+                prepared.following_body,
+            )
+        },
+    );
+    let peak = planned_peak(
+        plan.as_ref().map_or(&[][..], |p| &p.columns),
+        &parts,
+        first_tick,
+        after.is_some(),
+        following_body,
     );
     let mut packets = Vec::with_capacity(TICKS);
-    let mut peak = 0;
     for (tick, range) in parts.into_iter().enumerate() {
         let reset = after.is_some() && tick == 0;
         let complete = after.is_some() && tick + 1 == TICKS;
         let columns = plan.as_ref().map_or(&[][..], |p| &p.columns[range]);
         let cost = cost(columns, reset);
-        peak = peak.max(cost.slots);
         let mut payload = vec![
             u8::from(reset) * 2 + u8::from(complete),
             columns.len() as u8,
@@ -445,14 +640,13 @@ mod tests {
     // It deliberately rebuilds and repartitions the winner independently.
     fn reference_group(before: &[u8], after: &[u8]) -> (Vec<Vec<u8>>, usize) {
         let plan = plan(before, after);
-        let parts = partition(&plan.columns);
+        let parts = partition(&plan.columns, 0, None);
         let mut packets = Vec::new();
-        let mut peak = 0;
+        let peak = planned_peak(&plan.columns, &parts, 0, true, None);
         for (tick, range) in parts.into_iter().enumerate() {
             let reset = tick == 0;
             let complete = tick + 1 == TICKS;
             let columns = &plan.columns[range];
-            peak = peak.max(cost(columns, reset).slots);
             let mut payload = vec![
                 u8::from(reset) * 2 + u8::from(complete),
                 columns.len() as u8,
@@ -505,10 +699,10 @@ mod tests {
 
     #[test]
     fn packets_match_qualified_codec9_fixtures() {
-        // Recorded from the original codec9 encoder before removing legacy paths.
+        // Fixed lossless transitions with the calibrated lookahead planner.
         let fixtures = [
             (
-                280540,
+                277830,
                 [3730, 3278, 3278],
                 [
                     "48bff77fcaca593ac47df84888e609dcaf1ac1f3fe4a3d113472f3ec313a1cff",
@@ -517,7 +711,7 @@ mod tests {
                 ],
             ),
             (
-                676372,
+                676320,
                 [11992, 12122, 12122],
                 [
                     "5ebdf690af5830d81925ce8ddbde46ea90de7581dc6aab8a901a1b2d0d65fc41",
@@ -552,49 +746,9 @@ mod tests {
             }
             assert_eq!(
                 group(&after, None).unwrap(),
-                (vec![vec![0, 0]; TICKS], 5252)
+                (vec![vec![0, 0]; TICKS], 1144)
             );
         }
-    }
-
-    #[test]
-    fn partition_matches_brute_force_and_counts_prefetched_raw_bytes() {
-        let cols = (0..12)
-            .map(|i| Column {
-                index: i,
-                raw: i % 2 == 0,
-                code: vec![254; WORDS],
-                escaped: Vec::new(),
-                target: vec![0; ROWS],
-                cpu: if i % 2 == 0 { 0 } else { 2000 + i * 97 },
-            })
-            .collect::<Vec<_>>();
-        let parts = partition(&cols);
-        let got = parts
-            .iter()
-            .enumerate()
-            .map(|(i, r)| cost(&cols[r.clone()], i == 0).slots)
-            .max()
-            .unwrap();
-        let mut brute = usize::MAX;
-        for a in 0..=cols.len() {
-            for b in a..=cols.len() {
-                brute = brute.min(
-                    cost(&cols[..a], true)
-                        .slots
-                        .max(cost(&cols[a..b], false).slots)
-                        .max(cost(&cols[b..], false).slots),
-                );
-            }
-        }
-        assert_eq!(got, brute);
-        assert_eq!(parts[0].start, 0);
-        assert_eq!(parts[TICKS - 1].end, cols.len());
-        assert_eq!(cost(&[], true).slots, 21242);
-        // Body202, prefix195, of which193 bytes are RAW data (headers excluded).
-        assert_eq!(cost(&cols[..1], false).slots, 5500 + 193 * 15 + 11 * 63);
-        assert_eq!(primitive_cycles(&[0; WORDS], 0), 3132);
-        assert_eq!(primitive_cycles(&[254; WORDS], 0), 1632);
     }
 
     #[test]
@@ -706,67 +860,8 @@ mod tests {
 }
 
 #[cfg(test)]
-mod partition_parity_tests {
+mod timing_partition_tests {
     use super::*;
-
-    // Frozen implementation from before cost reuse/pruning. In particular,
-    // ascending boundaries and strict < define the encoded packet boundaries.
-    fn original_partition(columns: &[Column]) -> Vec<std::ops::Range<usize>> {
-        let n = columns.len();
-        let mut wire = vec![0; n + 1];
-        let mut cpu = vec![0; n + 1];
-        let mut raw = vec![0; n + 1];
-        for (i, c) in columns.iter().enumerate() {
-            wire[i + 1] = wire[i] + c.wire();
-            cpu[i + 1] = cpu[i] + c.cpu + COL_SETUP;
-            raw[i + 1] = raw[i] + if c.raw { c.target.len() } else { 0 };
-        }
-        let raw_before = |at: usize| {
-            let i = wire.partition_point(|&v| v <= at).saturating_sub(1).min(n);
-            raw[i]
-                + if i < n && columns[i].raw {
-                    at.saturating_sub(wire[i] + 2).min(columns[i].target.len())
-                } else {
-                    0
-                }
-        };
-        let score = |begin: usize, end: usize, reset: bool| {
-            let lut = if reset { LUT_BYTES } else { 0 };
-            let body = lut + wire[end] - wire[begin];
-            let prefix = body.min(PREFETCH * ROWS) / PREFETCH * PREFETCH;
-            let raw_prefix = raw_before(wire[begin] + prefix.saturating_sub(lut)) - raw[begin];
-            RECORD_SETUP + cpu[end] - cpu[begin]
-                + lut * 15
-                + raw_prefix * 15
-                + 63 * (body + 4 - prefix)
-        };
-        let mut dp = vec![vec![usize::MAX; n + 1]; TICKS + 1];
-        let mut prev = vec![vec![0; n + 1]; TICKS + 1];
-        dp[0][0] = 0;
-        for t in 1..=TICKS {
-            for end in 0..=n {
-                for begin in 0..=end {
-                    if dp[t - 1][begin] == usize::MAX {
-                        continue;
-                    }
-                    let peak = dp[t - 1][begin].max(score(begin, end, t == 1));
-                    if peak < dp[t][end] {
-                        dp[t][end] = peak;
-                        prev[t][end] = begin;
-                    }
-                }
-            }
-        }
-        let mut parts = Vec::new();
-        let mut end = n;
-        for t in (1..=TICKS).rev() {
-            let begin = prev[t][end];
-            parts.push(begin..end);
-            end = begin;
-        }
-        parts.reverse();
-        parts
-    }
 
     fn fixture(n: usize, variant: usize) -> Vec<Column> {
         let mut rng = 0x7a68_cde1_u32.wrapping_add(variant as u32);
@@ -779,69 +874,126 @@ mod partition_parity_tests {
                     0 => true,
                     1 => false,
                     2 => index % 2 == 0,
-                    3 => rng & 1 != 0,
-                    4 => index % 11 == 0,
-                    5 => index % 11 != 0,
-                    _ => (index / 7) % 2 == 0,
+                    _ => rng & 1 != 0,
                 };
-                let escape_words = if variant < 3 {
+                let escapes = if variant < 3 {
                     0
                 } else {
                     (rng as usize >> 8) % 51
                 };
                 let mut code = vec![254; WORDS];
-                code[..escape_words].fill(255);
-                let escaped = vec![0; escape_words * 5];
-                let cpu = if raw {
-                    0
-                } else if variant == 1 {
-                    3132
-                } else {
-                    primitive_cycles(&code, escaped.len())
-                };
+                code[..escapes].fill(255);
+                if variant == 1 {
+                    code.fill(0);
+                }
+                let escaped = vec![0; escapes * 5];
+                let primitive = timing::Primitive::new(&code, escaped.len());
+                let suffix_slots =
+                    timing::column(&primitive, escaped.len(), raw, index, 2, 0, 0).slots();
                 Column {
                     index,
                     raw,
                     code,
                     escaped,
                     target: vec![0; ROWS],
-                    cpu,
+                    primitive,
+                    suffix_slots,
                 }
             })
             .collect()
     }
 
     #[test]
-    fn optimized_partition_preserves_boundaries_and_peak_across_raw_prefix_edges() {
-        // 13 RAW columns and 50 dictionary columns cross the 2600-byte
-        // prefetch cap; mixed/escaped columns exercise nonmonotone cost steps.
-        let lengths = (0..=16).chain([
-            19, 23, 26, 37, 49, 50, 51, 63, 77, 99, 100, 127, 128, 151, 179, 180,
-        ]);
-        for n in lengths {
+    fn cached_ranges_match_full_player_cost_across_prefetch_edges() {
+        for n in [0, 1, 8, 12, 13, 16, 49, 50, 51, 100, 180] {
             for variant in 0..7 {
                 let columns = fixture(n, variant);
-                let expected = original_partition(&columns);
-                let actual = partition(&columns);
-                assert_eq!(actual, expected, "n={n}, variant={variant}");
-                let peak = |parts: &[std::ops::Range<usize>]| {
-                    parts
-                        .iter()
-                        .enumerate()
-                        .map(|(tick, range)| cost(&columns[range.clone()], tick == 0).slots)
-                        .max()
-                        .unwrap()
-                };
-                assert_eq!(peak(&actual), peak(&expected));
+                let costs = Costs::new(&columns);
+                for end in 0..=n {
+                    assert_eq!(
+                        costs.score(0, end, true),
+                        cost(&columns[..end], true).slots,
+                        "reset n={n},variant={variant},end={end}"
+                    );
+                    for begin in 0..=end {
+                        assert_eq!(
+                            costs.score(begin, end, false),
+                            cost(&columns[begin..end], false).slots,
+                            "n={n},variant={variant},range={begin}..{end}"
+                        );
+                    }
+                }
             }
         }
     }
 
     #[test]
-    fn optimized_partition_keeps_the_first_equal_cost_boundary() {
-        assert_eq!(partition(&fixture(0, 0)), vec![0..0, 0..0, 0..0]);
-        // The LUT reset cost dominates every possible placement of these RAW
-        // columns. All splits tie, so the original earliest boundaries win.
-        assert_eq!(partition(&fixture(3, 0)), vec![0..0, 0..0, 0..3]);
+    fn partition_is_optimal_with_next_header_work_and_cache_switches() {
+        for n in 0..=16 {
+            for variant in 0..4 {
+                let columns = fixture(n, variant);
+                for first_tick in [0, 17, 18, 19] {
+                    for following_body in [None, Some(0)] {
+                        let mut expected = (usize::MAX, 0, 0);
+                        for second in 0..=n {
+                            for first in 0..=second {
+                                let parts = [0..first, first..second, second..n];
+                                let peak = planned_peak(
+                                    &columns,
+                                    &parts,
+                                    first_tick,
+                                    true,
+                                    following_body,
+                                );
+                                if peak < expected.0 {
+                                    expected = (peak, first, second);
+                                }
+                            }
+                        }
+                        let actual = partition(&columns, first_tick, following_body);
+                        assert_eq!(
+                            actual,
+                            vec![0..expected.1, expected.1..expected.2, expected.2..n],
+                            "n={n},variant={variant},tick={first_tick}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn last_tick_reserves_unknown_lookahead_and_cache_marker() {
+        let columns = fixture(80, 2);
+        let parts = partition(&columns, 17, None);
+        let ticks = parts
+            .iter()
+            .enumerate()
+            .map(|(tick, range)| cost(&columns[range.clone()], tick == 0))
+            .collect::<Vec<_>>();
+        let expected = (ticks[0].slots + timing::next_prepare(ticks[1].body, false).slots())
+            .max(ticks[1].slots + timing::next_prepare(ticks[2].body, false).slots())
+            .max(ticks[2].slots + timing::max_next_prepare(true).slots());
+        assert_eq!(planned_peak(&columns, &parts, 17, true, None), expected);
+        assert!(timing::max_next_prepare(true).slots() > timing::max_next_prepare(false).slots());
+    }
+
+    #[test]
+    fn final_frame_reclaims_unknown_lookahead_and_holds_include_cache_switch() {
+        let columns = fixture(80, 2);
+        for first_tick in [0, 17, 18, 19] {
+            let unknown = partition(&columns, first_tick, None);
+            let final_frame = partition(&columns, first_tick, Some(0));
+            assert!(
+                planned_peak(&columns, &final_frame, first_tick, true, Some(0))
+                    <= planned_peak(&columns, &unknown, first_tick, true, None)
+            );
+            let (packets, peak) = holds(&vec![0; FRAME], first_tick).unwrap();
+            assert_eq!(packets, vec![vec![0, 0]; TICKS]);
+            assert_eq!(
+                peak,
+                timing::RECORD_CPU + timing::next_prepare(0, first_tick >= 17).slots()
+            );
+        }
     }
 }
