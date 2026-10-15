@@ -21,12 +21,12 @@ impl Cost {
 
 // buffered_blank_update entry, apply-buffered-record setup, optional reset
 // state, prefix cursor publication, record completion and return. Includes
-// cache-cursor/record-index carries and the longer record-count comparison.
+// the cache-cursor carry. End-of-movie checks run only at block markers.
 // Column loops, LUT transfer and lookahead are charged separately.
 // At most nine consume-length calls take their nine-cycle low-byte comparison:
 // four minimum-size (52-byte) columns fit in the final 255 bytes, plus one
 // longer body or the LUT can need the comparison. Reserve it once per packet.
-pub(super) const RECORD_CPU: usize = 280 + 9 * 9;
+pub(super) const RECORD_CPU: usize = 241 + 9 * 9;
 
 fn page_reads(low: usize, count: usize) -> usize {
     (low + count).saturating_sub(256)
@@ -245,7 +245,7 @@ pub(super) fn next_prepare(body: usize, switch_cache: bool) -> Cost {
     };
     Cost {
         // One cache cursor carry; a switch also allows a block-index carry.
-        cpu: cpu + 5 + usize::from(switch_cache) * 276,
+        cpu: cpu + 5 + usize::from(switch_cache) * 301,
         dma_bytes: if switch_cache { 8 } else { 4 },
     }
 }
@@ -276,7 +276,7 @@ mod tests {
         }
         assert_eq!(
             format!("{:x}", digest.finalize()),
-            "656d44e35c2a9324d2fd81784557dd61542d11891a59bb11b6ab740f9b87904a",
+            "365e7ca846c5fa22532176aa104020224b5028448652ee2c2ea7f71ae7bd1b29",
             "Player assembly changed: rerun assembled decoder timing calibration"
         );
     }
@@ -320,16 +320,16 @@ mod tests {
         // Order: reset, RAW, columns, escaped words, skipped words, next body,
         // cache switch, measured turbo slots (including REU DMA stalls).
         let cases = [
-            (false, false, 0, 0, 0, 2587, false, 1079),
-            (true, false, 0, 0, 0, 2587, true, 16811),
-            (true, false, 1, 0, 0, 1024, false, 21152),
-            (false, false, 1, 10, 0, 1024, false, 7591),
-            (false, false, 30, 10, 0, 2600, false, 150882),
-            (true, false, 60, 10, 0, 2587, true, 551953),
-            (false, true, 1, 0, 0, 1024, false, 4968),
-            (false, true, 30, 0, 0, 2587, true, 273740),
-            (true, true, 30, 0, 0, 2600, false, 338155),
-            (true, false, 80, 0, 40, 2587, false, 377432),
+            (false, false, 0, 0, 0, 2587, false, 1055),
+            (true, false, 0, 0, 0, 2587, true, 16812),
+            (true, false, 1, 0, 0, 1024, false, 21128),
+            (false, false, 1, 10, 0, 1024, false, 7567),
+            (false, false, 30, 10, 0, 2600, false, 150858),
+            (true, false, 60, 10, 0, 2587, true, 551954),
+            (false, true, 1, 0, 0, 1024, false, 4944),
+            (false, true, 30, 0, 0, 2587, true, 273741),
+            (true, true, 30, 0, 0, 2600, false, 338131),
+            (true, false, 80, 0, 40, 2587, false, 377408),
         ];
         for (reset, raw, count, escapes, skips, next, switch, measured) in cases {
             let escaped = escapes * 5;

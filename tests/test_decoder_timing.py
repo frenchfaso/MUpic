@@ -121,16 +121,16 @@ class DecoderTiming(unittest.TestCase):
         # vendored emulator. Includes prefix-only, suffix, crossing, RAW,
         # literals, SKIP, dictionary reset and bank-marker lookahead paths.
         cases = [
-            (False, False, 0, 0, 0, 2587, False, 1079),
-            (True, False, 0, 0, 0, 2587, True, 16811),
-            (True, False, 1, 0, 0, 1024, False, 21152),
-            (False, False, 1, 10, 0, 1024, False, 7591),
-            (False, False, 30, 10, 0, 2600, False, 150882),
-            (True, False, 60, 10, 0, 2587, True, 551953),
-            (False, True, 1, 0, 0, 1024, False, 4968),
-            (False, True, 30, 0, 0, 2587, True, 273740),
-            (True, True, 30, 0, 0, 2600, False, 338155),
-            (True, False, 80, 0, 40, 2587, False, 377432),
+            (False, False, 0, 0, 0, 2587, False, 1055),
+            (True, False, 0, 0, 0, 2587, True, 16812),
+            (True, False, 1, 0, 0, 1024, False, 21128),
+            (False, False, 1, 10, 0, 1024, False, 7567),
+            (False, False, 30, 10, 0, 2600, False, 150858),
+            (True, False, 60, 10, 0, 2587, True, 551954),
+            (False, True, 1, 0, 0, 1024, False, 4944),
+            (False, True, 30, 0, 0, 2587, True, 273741),
+            (True, True, 30, 0, 0, 2600, False, 338131),
+            (True, False, 80, 0, 40, 2587, False, 377408),
         ]
         for reset, raw, count, escapes, skips, next_body, switch, expected in cases:
             with self.subTest(reset=reset, raw=raw, count=count, escapes=escapes,
@@ -164,9 +164,61 @@ class DecoderTiming(unittest.TestCase):
                                            ('record_remaining', len(body), 2),
                                            ('cache_cursor', 4, 2), ('cache_ready', 1, 1)]:
                     self.put(memory, name, value, width)
-                memory[self.symbols['record_count_compare_high'] + 1] = 0xFF
-                memory[self.symbols['record_count_compare_low'] + 1] = 0xFF
+                self.put(memory, 'active_stream_blocks', 2, 2)
                 cpu = TimedMPU(memory=memory)
                 self.call(cpu, 'buffered_blank_update')
                 self.assertEqual(memory[self.symbols['fatal_error']], 0)
                 self.assertEqual(cpu.processorCycles + 63 * memory.dma_bytes, expected)
+
+    def test_continuous_playback_crosses_the_old_refresh_limit(self):
+        records = 65538  # First PAL frame beyond the former 16-bit limit.
+        blocks = (records + 19) // 20
+        memory = DecoderMemory()
+        memory[self.origin:self.origin + len(self.core) - 2] = self.core[2:]
+        memory[1] = 0x35
+        self.put(memory, 'active_stream_blocks', blocks, 2)
+        cpu = TimedMPU(memory=memory)
+
+        def fill(block):
+            bank = block % 2
+            count = min(20, records - block * 20)
+            data = b'\x02\0\0\0' * count + bytes(4)
+            at = 0x100000 + bank * 262144
+            memory.reu[at:at + len(data)] = data
+            memory[self.symbols['cache_ready'] + bank] = 1
+
+        fill(0)
+        fill(1)
+        self.call(cpu, 'lz_prepare_next')
+        for tick in range(records):
+            self.call(cpu, 'buffered_blank_update')
+            self.assertEqual(self.get(memory, 'fatal_error'), 0)
+            self.assertEqual(self.get(memory, 'playback_ended'), int(tick + 1 == records))
+            if self.get(memory, 'pending_refill_mask'):
+                upcoming = self.get(memory, 'cache_read_block', 2) + 1
+                if upcoming < blocks:
+                    fill(upcoming)
+                self.put(memory, 'pending_refill_mask', 0)
+        self.assertEqual(self.get(memory, 'cache_read_block', 2), blocks)
+        self.assertEqual(self.get(memory, 'lz_record_prepared'), 0)
+
+    def test_block_marker_end_checks_at_large_block_indices(self):
+        for block in (0, 254, 255, 256, 3276, 3277, 16382):
+            for last in (False, True):
+                memory = DecoderMemory()
+                memory[self.origin:self.origin + len(self.core) - 2] = self.core[2:]
+                memory[1] = 0x35
+                self.put(memory, 'active_stream_blocks', block + (1 if last else 2), 2)
+                self.put(memory, 'cache_read_block', block, 2)
+                self.put(memory, 'cache_read_bank', block % 2)
+                self.put(memory, 'cache_ready', 0x101, 2)
+                other = 0x100000 + (1 - block % 2) * 262144
+                memory.reu[other:other + 4] = b'\x02\0\0\0'
+                cpu = TimedMPU(memory=memory)
+                self.call(cpu, 'lz_prepare_next')
+                self.assertEqual(self.get(memory, 'playback_ended'), int(last))
+                self.assertEqual(self.get(memory, 'cache_read_block', 2), block + 1)
+                self.assertEqual(self.get(memory, 'pending_refill_mask'), 0 if last else 1 << (block % 2))
+                self.assertEqual(self.get(memory, 'audio_pending_start'), 0 if last else 1)
+                self.assertEqual(self.get(memory, 'lz_record_prepared'), 0 if last else 1)
+                self.assertEqual(memory.dma_bytes, 4 if last else 8)

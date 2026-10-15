@@ -789,7 +789,7 @@ mod tests {
         // Fixed lossless transitions with the calibrated lookahead planner.
         let fixtures = [
             (
-                277830,
+                277791,
                 [3730, 3278, 3278],
                 [
                     "48bff77fcaca593ac47df84888e609dcaf1ac1f3fe4a3d113472f3ec313a1cff",
@@ -798,7 +798,7 @@ mod tests {
                 ],
             ),
             (
-                676320,
+                676281,
                 [11992, 12122, 12122],
                 [
                     "5ebdf690af5830d81925ce8ddbde46ea90de7581dc6aab8a901a1b2d0d65fc41",
@@ -833,7 +833,7 @@ mod tests {
             }
             assert_eq!(
                 group(&after, None).unwrap(),
-                (vec![vec![0, 0]; TICKS], 1144)
+                (vec![vec![0, 0]; TICKS], 1105)
             );
         }
     }

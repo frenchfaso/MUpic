@@ -16,7 +16,7 @@ Everything happens in your browser. Your video stays on your device, and its pro
 
 Choose **PCM16** for full-resolution audio, or **PCM8 HQ** for lighter audio with carefully shaped dithering. Both keep the source sample rate. Volume is adjusted automatically; silent videos work too.
 
-Start with a short clip! The current player supports up to **21:47 in PAL** or **18:15 in NTSC** per movie. This comes from its internal playback counter, regardless of USB capacity.
+Start with a short clip! Movies can now run beyond the old 18–22 minute limit: only the **FAT32 limit of 4 GiB per file** remains (about **109 minutes PAL** or **91 minutes NTSC**). Use the latest player for longer movies; your existing MUP files still work. Long conversions also need enough free memory and storage.
 
 ## Showtime
 

@@ -95,7 +95,7 @@ class PcmPlayer(unittest.TestCase):
         cpu.sp = 0xFD
         cpu.memory[0x1FE] = 0xFE
         cpu.memory[0x1FF] = 0x0F
-        for _ in range(200000):
+        for _ in range(1000000):
             cpu.step()
             if cpu.pc == 0x0FFF:
                 return
@@ -108,6 +108,54 @@ class PcmPlayer(unittest.TestCase):
         if not cpu.p & 1:
             self.call(cpu, "browser_validate_counts")
         return not cpu.p & 1
+
+    def movie_header(self, frames, profile=0, flags=1):
+        header = self.header(flags, profile)
+        records = frames * header[20]
+        blocks = (records + 19) // 20
+        initial = ((256 + blocks * 3 + 255) // 256) * 256
+        stream = ((initial + 46080 + 65535) // 65536) * 65536
+        for offset, value in [(24, records), (28, blocks), (48, initial),
+                              (56, stream), (60, blocks * 262144),
+                              (64, stream + blocks * 262144), (68, frames)]:
+            struct.pack_into('<I', header, offset, value)
+        struct.pack_into('<H', header, 72, records - (blocks - 1) * 20)
+        return header
+
+    def test_long_movie_headers_and_invalid_count_overflows(self):
+        for profile in range(5):
+            ticks = 4 if profile >= 3 else 3
+            for frames in (2, 65535 // ticks, 65535 // ticks + 1, 65536,
+                           16383 * 20 // ticks):
+                for flags in (0, 1, 3):
+                    header = self.movie_header(frames, profile, flags)
+                    with self.subTest(profile=profile, frames=frames, flags=flags):
+                        self.assertTrue(self.validate(header))
+                        for offset, width, delta in [(24, 4, 1), (24, 4, 1 << 24),
+                                                     (28, 4, 1 << 16), (68, 4, 1),
+                                                     (68, 4, 1 << 24), (68, 4, 1 << 23),
+                                                     (72, 2, 1)]:
+                            bad = header.copy()
+                            value = int.from_bytes(bad[offset:offset + width], 'little') + delta
+                            bad[offset:offset + width] = value.to_bytes(width, 'little')
+                            self.assertFalse(self.validate(bad), (offset, delta))
+
+    def test_large_file_size_metadata_remains_readable(self):
+        for blocks in (1, 3277, 6400, 6401, 16383):
+            cpu, memory = self.machine()
+            header = self.movie_header(blocks * 20 // 3)
+            memory[0x500:0x600] = header
+            self.put(memory, 'browser_list_ptr', 0x3A00, 2)
+            self.call(cpu, 'browser_format_metadata')
+            size = struct.unpack_from('<I', header, 64)[0]
+            tenths = (size * 10 + 524288) // 1048576
+            unit = 'MiB'
+            if tenths >= 10000:
+                tenths = (tenths + 512) // 1024
+                unit = 'GiB'
+            expected = f'{tenths // 10:3}.{tenths % 10}{unit}'.encode()
+            self.assertEqual(memory[0x3A06:0x3A0E], expected)
+            self.assertEqual(memory[0x3A0E], 0)
 
     def test_headers_require_matching_format_offsets(self):
         for flags in range(256):
@@ -156,13 +204,14 @@ class PcmPlayer(unittest.TestCase):
         for profile, ticks, clock in [(0, 19656, 985248), (1, 19656, 985248),
                                       (2, 19656, 985248), (3, 17095, 1022730),
                                       (4, 17095, 1022730)]:
-            for records in (3, 20, 502, 1795, 32760, 65532):
+            for records in (3, 20, 502, 1795, 32760, 65532, 65536, 196608, 327660):
                 cpu, memory = self.machine(profile=profile)
                 struct.pack_into("<I", memory, 0x518, records)
                 self.put(memory, "browser_list_ptr", 0x3A00, 2)
                 self.call(cpu, "browser_format_metadata")
                 seconds = (records * ticks + clock // 2) // clock
-                expected = f"{seconds // 60:02}:{seconds % 60:02}".encode()
+                expected = (f"{seconds // 3600}h{seconds // 60 % 60:02}m" if seconds >= 3600
+                            else f"{seconds // 60:02}:{seconds % 60:02}").encode()
                 self.assertEqual(memory[0x3A00:0x3A05], expected)
                 self.assertEqual(memory[0x3A0F], profile)
 
@@ -209,7 +258,7 @@ class PcmPlayer(unittest.TestCase):
     def test_length_table_checks_whole_stereo_frames_and_capacity(self):
         for flags, maximum, step, profile in [(1, 36864, 4, 0), (3, 40960, 2, 0),
                                                (1, 77824, 4, 1), (1, 77824, 4, 4)]:
-            for block in [0, 255, 256, 1590, 3276]:
+            for block in [0, 255, 256, 1590, 3276, 3277, 16382]:
                 for length, valid in [(step, True), (maximum - step, True),
                                       (maximum, True), (0, False),
                                       (step - 1, False), (maximum + step, False),
@@ -223,7 +272,8 @@ class PcmPlayer(unittest.TestCase):
         for flags, step, lengths in [(1, 4, [4, 35252, 35256, 36864, 65532, 65536, 76800, 77824]),
                                      (3, 2, [2, 35254, 38402, 40960])]:
             for block, blocks, ticks in [(0, 1591, 20), (255, 256, 9),
-                                         (256, 1591, 20), (1590, 1591, 9)]:
+                                         (256, 1591, 20), (1590, 1591, 9),
+                                         (16382, 16383, 20)]:
                 for length in lengths:
                     for elapsed in range(ticks + 1):
                         with self.subTest(flags=flags, block=block, length=length,

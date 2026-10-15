@@ -1018,8 +1018,7 @@ browser_validate_header:
     bne !pcm8_valid+
     jmp !bad+
 !pcm8_valid:
-    lda HEADER+26
-    ora HEADER+27
+    lda HEADER+27
     ora HEADER+30
     ora HEADER+31
     beq !check_next+
@@ -1027,6 +1026,7 @@ browser_validate_header:
 !check_next:
     lda HEADER+24
     ora HEADER+25
+    ora HEADER+26
     bne !check_next+
     jmp !bad+
 !check_next:
@@ -1061,12 +1061,6 @@ browser_validate_header:
     beq !check_next+
     jmp !bad+
 !check_next:
-    lda HEADER+24
-    sta active_record_count
-    sta record_count_compare_low+1
-    lda HEADER+25
-    sta active_record_count+1
-    sta record_count_compare_high+1
     lda HEADER+28
     sta active_stream_blocks
     lda HEADER+29
@@ -1166,85 +1160,88 @@ browser_header_values_end:
 browser_profile_width: .byte <356,<360,<360,<360,<360
 browser_profile_ticks: .byte 3,3,3,4,4
 
-// Semantic counts are checked before any payload DMA. Divider/geometry and
-// canonical offsets are validated separately; these divisions run only at OPEN.
+// Validate identities in bounded time at OPEN: records=(blocks-1)*20+tail,
+// records=frames*ticks. The FAT32 block bound keeps records within 24 bits.
+// No per-refresh counter is needed by playback.
 browser_validate_counts:
-    lda HEADER+24
-    sta bootstrap_length
-    lda HEADER+25
-    sta bootstrap_length+1
-    lda #0
-    sta bootstrap_offset
-    sta bootstrap_offset+1
-!divide_twenty:
-    lda bootstrap_length+1
-    bne !subtract_twenty+
-    lda bootstrap_length
-    cmp #21
-    bcc !twenty_remainder+
-!subtract_twenty:
     sec
-    lda bootstrap_length
-    sbc #20
+    lda HEADER+28
+    sbc #1
     sta bootstrap_length
-    lda bootstrap_length+1
+    lda HEADER+29
     sbc #0
     sta bootstrap_length+1
-    inc bootstrap_offset
-    bne !divide_twenty-
-    inc bootstrap_offset+1
-    jmp !divide_twenty-
-!twenty_remainder:
-    lda bootstrap_length
-    cmp HEADER+72
-    bne !bad+
-    inc bootstrap_offset
-    bne !blocks+
-    inc bootstrap_offset+1
-!blocks:
-    lda bootstrap_offset
-    cmp HEADER+28
-    bne !bad+
-    lda bootstrap_offset+1
-    cmp HEADER+29
-    bne !bad+
-    lda HEADER+24
-    sta bootstrap_length
-    lda HEADER+25
-    sta bootstrap_length+1
     lda #0
-    sta bootstrap_offset
-    sta bootstrap_offset+1
-!divide_three:
-    lda bootstrap_length+1
-    bne !subtract_three+
+    sta bootstrap_length+2
+    .for (var part=0;part<3;part++) {
+        lda bootstrap_length+part
+        sta bootstrap_offset+part
+    }
+    // x20 = (x4 + x) x4.
+    jsr browser_count_times_four
+    clc
+    .for (var part=0;part<3;part++) {
+        lda bootstrap_length+part
+        adc bootstrap_offset+part
+        sta bootstrap_length+part
+    }
+    jsr browser_count_times_four
+    clc
     lda bootstrap_length
-    cmp HEADER+20
-    bcc !three_remainder+
-!subtract_three:
-    sec
-    lda bootstrap_length
-    sbc HEADER+20
+    adc HEADER+72
     sta bootstrap_length
     lda bootstrap_length+1
-    sbc #0
+    adc #0
     sta bootstrap_length+1
-    inc bootstrap_offset
-    bne !divide_three-
-    inc bootstrap_offset+1
-    jmp !divide_three-
-!three_remainder:
-    lda bootstrap_length
+    lda bootstrap_length+2
+    adc #0
+    sta bootstrap_length+2
+    jsr browser_compare_records
+    bcs !bad+
+    // Reject the fourth frame byte before multiplying, preventing wrapping.
+    lda HEADER+71
     bne !bad+
-    lda HEADER+70
-    ora HEADER+71
-    bne !bad+
-    lda bootstrap_offset
-    cmp HEADER+68
-    bne !bad+
-    lda bootstrap_offset+1
-    cmp HEADER+69
-    bne !bad+
+    .for (var part=0;part<3;part++) {
+        lda HEADER+68+part
+        sta bootstrap_length+part
+    }
+    asl bootstrap_length
+    rol bootstrap_length+1
+    rol bootstrap_length+2
+    bcs !bad+
+    lda HEADER+20
+    cmp #4
+    beq !four+
+    clc
+    .for (var part=0;part<3;part++) {
+        lda bootstrap_length+part
+        adc HEADER+68+part
+        sta bootstrap_length+part
+    }
+    bcs !bad+
+    jmp browser_compare_records
+!four:
+    asl bootstrap_length
+    rol bootstrap_length+1
+    rol bootstrap_length+2
+    bcs !bad+
+    jmp browser_compare_records
+!bad:
+    sec
+    rts
+browser_count_times_four:
+    .for (var bit=0;bit<2;bit++) {
+        asl bootstrap_length
+        rol bootstrap_length+1
+        rol bootstrap_length+2
+    }
+    rts
+browser_compare_records:
+    .for (var part=0;part<3;part++) {
+        lda bootstrap_length+part
+        cmp HEADER+24+part
+        bne !bad+
+    }
     clc
     rts
 !bad:

@@ -11,9 +11,10 @@ test('portrait and4:3 sources retain aspect ratio and centered black bars',()=>{
     {frameCount:undefined,duration:undefined,estimatedBytes:undefined,width:113,height:200,left:123,top:0});
   const plan=videoPlan(1,640,480);assert.equal(plan.width,267);assert.equal(plan.height,200);assert.equal(plan.left,46);
 });
-test('player frame-count limits reject oversized or empty videos',()=>{
+test('FAT32 size limit rejects oversized or empty videos',()=>{
   assert.equal(videoPlan(MAX_FRAMES/CONTENT_FPS,356,200).frameCount,MAX_FRAMES);
-  assert.throws(()=>videoPlan((MAX_FRAMES+1)/CONTENT_FPS,356,200),/21 minutes/);
+  assert.equal(videoPlan(MAX_FRAMES/CONTENT_FPS,356,200).estimatedBytes,4294836224);
+  assert.throws(()=>videoPlan((MAX_FRAMES+1)/CONTENT_FPS,356,200),/FAT32/);
   assert.throws(()=>videoPlan(0,356,200),/duration/);assert.throws(()=>videoPlan(0.03,356,200),/0.12/);
 });
 test('audio gain saturates signed16-bit samples and interleaves stereo',()=>{
@@ -189,12 +190,12 @@ test('PCM16 preserves source rate and the shared hardware clock without browser-
   assert.deepEqual(Array.from({length:4},(_,i)=>view.getFloat32(i*4,true)),[0.25,-0.5,-0.75,0.125]);
 });
 test('profile plans use shared fitting, cadence and per-profile duration limits',()=>{
-  const profile={id:4,fps:1022730/(65*263*4),ticks:4,maxFrames:16383},fit={left:0,top:15,width:360,height:169};
+  const profile={id:4,fps:1022730/(65*263*4),ticks:4,maxFrames:81915},fit={left:0,top:15,width:360,height:169};
   const plan=videoPlan(2,1920,1080,{profile,fit});
   assert.equal(plan.frameCount,30);assert.equal(plan.duration,30/profile.fps);
   for(const key of ['left','top','width','height'])assert.equal(plan[key],fit[key]);
   assert.equal(plan.estimatedBytes,65536+6*262144);
-  assert.throws(()=>videoPlan((profile.maxFrames+1)/profile.fps,1920,1080,{profile,fit}),/profile supports/);
+  assert.throws(()=>videoPlan((profile.maxFrames+1)/profile.fps,1920,1080,{profile,fit}),/FAT32/);
 });
 test('audio decoding automatically normalizes rendered PCM and retains the full planned duration',async t=>{
   const left=Float32Array.of(0,0.125,0.25,0),right=Float32Array.of(0,-0.125,-0.25,0),calls=mockAudio(t,{left,right});

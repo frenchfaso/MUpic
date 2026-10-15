@@ -30,7 +30,6 @@
 .const STREAM_BLOCK_BYTES=262144
 .const CACHE_SLOT_BANKS=4
 .const CACHE_CHUNK_BYTES=1024
-.const VIDEO_RECORD_COUNT=1
 .const AUDIO_RATE_DIVIDER=0
 .const HEADER=$0500
 .const SELECTED_PATH=$0600
@@ -81,6 +80,9 @@
 .label hardware_standard=$0731 // 0=PAL, 1=NTSC, 255=unsupported raster timing
 .label audio_calc_samples_high=$0735
 .label browser_metadata_clock=$0736 // u24 browsing-only divisor
+.label browser_duration_high=$0739 // fifth numerator byte, browser only
+.label browser_multiplier_high=$073a // third refresh-count byte
+.label browser_factor_high=$073b // fifth multiplication byte
 .const DIRECTORY_METADATA=$3a00 // 96 cached, formatted 16-byte rows; inside overlay
 .const DIRECTORY_ENTRIES=$4400
 .const DIRECTORY_CAPACITY=96
@@ -134,7 +136,6 @@
 .label dict_literal_bytes = $85
 .label scanout_row = $0406
 .label fatal_error = $0417
-.label record_index = $0408
 .label playback_ended = $0416
 .label uci_busy = $0420
 .label uci_fill_bank = $0421
@@ -163,7 +164,6 @@
 .label eof_audio_stopped = $048f
 .label file_open = $04aa
 .label keyboard_scan_scratch = $04ab
-.label active_record_count = $04b4
 
 .assert "Isolated canvas must be360x200", WIDE_WIDTH==360 && WIDE_HEIGHT==200, true
 .assert "Isolated bitmap must contain180 full-page columns", FRAME_BYTES==COLUMNS*256 && COLUMNS==180, true
@@ -719,7 +719,8 @@ lz_prepare_next:
     ora raw_header+1
     bne !record+
     jsr switch_cache_bank
-    jmp !ready-
+    bcc !ready-
+    rts
 !record:
     lda raw_header+2
     sta record_flags
@@ -1178,28 +1179,27 @@ record_complete:
     beq !consumed+
     jmp record_malformed
 !consumed:
-    lda #0
-    sta lz_record_prepared
-    inc record_index
-    bne !updated+
-    inc record_index+1
-!updated:
-    lda record_index+1
-record_count_compare_high:
-    cmp #>VIDEO_RECORD_COUNT
-    bcc !lookahead+
+    // The existing zero-length block marker ends the last block as well.
+    // No global refresh counter or end comparison runs for normal records.
+    jmp lz_prepare_next
+switch_cache_bank:
+    inc cache_read_block
+    bne !block_advanced+
+    inc cache_read_block+1
+!block_advanced:
+    lda cache_read_block+1
+    cmp active_stream_blocks+1
+    bcc !next+
     bne !ended+
-    lda record_index
-record_count_compare_low:
-    cmp #<VIDEO_RECORD_COUNT
-    bcc !lookahead+
+    lda cache_read_block
+    cmp active_stream_blocks
+    bcc !next+
 !ended:
     lda #1
     sta playback_ended
+    sec
     rts
-!lookahead:
-    jmp lz_prepare_next
-switch_cache_bank:
+!next:
     ldx cache_read_bank
     lda #0
     sta cache_ready,x
@@ -1209,18 +1209,18 @@ switch_cache_bank:
     txa
     eor #1
     sta cache_read_bank
-    inc cache_read_block
-    bne !block_advanced+
-    inc cache_read_block+1
-!block_advanced:
     lda #1
     sta audio_pending_start
     lda #0
     sta cache_cursor
     sta cache_cursor+1
     .if (CACHE_SLOT_BANKS>1) { sta cache_cursor_high }
+    clc
     rts
 
+// Keep the calibrated indexed-read and prefix-division page alignments.
+.assert "Block EOF handling overlaps calibrated lookup table", *<=$1445, true
+.fill $1445-*, 0
 dict_literal_length_valid: .fill 256, (i<=DICT_MAX_LITERAL_BYTES && mod(i,5)==0 ? 0 : 1)
 
 // For a partial prefix (<2600 bytes), eight trial subtractions yield the

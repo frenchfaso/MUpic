@@ -53,7 +53,7 @@ export function readMupHeader(raw, fileBytes) {
     initialOffset: u32(48), initialBytes: u32(52), streamOffset: u32(56),
     streamBytes: u32(60), fileBytes: u32(64), frameCount: u32(68), lastTicks: u16(72), sampleRate: u32(76),
   };
-  require(header.recordCount >= 2*profile.ticks && header.recordCount <= 65535 && header.recordCount % profile.ticks === 0 &&
+  require(header.recordCount >= 2*profile.ticks && header.blockCount <= 16383 && header.recordCount % profile.ticks === 0 &&
     header.frameCount === header.recordCount / profile.ticks && header.blockCount === Math.ceil(header.recordCount / 20),
     'Invalid MUP frame count.');
   require(header.ticksPerBlock === 20 && header.audioOffset === (header.pcm8?221184:profileId?184320:AUDIO_OFFSET) && header.blockBytes === BLOCK_BYTES &&

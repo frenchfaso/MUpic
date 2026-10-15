@@ -92,6 +92,8 @@ browser_format_metadata:
     sta browser_multiplier
     lda HEADER+25
     sta browser_multiplier+1
+    lda HEADER+26
+    sta browser_multiplier_high
     ldx #0
     lda HEADER+80
     cmp #3
@@ -111,13 +113,16 @@ browser_format_metadata:
     lda #0
     sta browser_factor+2
     sta browser_factor+3
+    sta browser_factor_high
+    sta browser_duration_high
     sta browser_number
     sta browser_number+1
     sta browser_number+2
     sta browser_number+3
-    ldx #16
+    ldx #24
 !multiply:
-    lsr browser_multiplier+1
+    lsr browser_multiplier_high
+    ror browser_multiplier+1
     ror browser_multiplier
     bcc !shift+
     clc
@@ -126,11 +131,15 @@ browser_format_metadata:
         adc browser_factor+part
         sta browser_number+part
     }
+    lda browser_duration_high
+    adc browser_factor_high
+    sta browser_duration_high
 !shift:
     asl browser_factor
     rol browser_factor+1
     rol browser_factor+2
     rol browser_factor+3
+    rol browser_factor_high
     dex
     bne !multiply-
     ldx #0
@@ -152,10 +161,15 @@ browser_format_metadata:
     lda browser_number+3
     adc #0
     sta browser_number+3
+    lda browser_duration_high
+    adc #0
+    sta browser_duration_high
     lda #0
     sta browser_factor
     sta browser_factor+1
 !seconds:
+    lda browser_duration_high
+    bne !subtract+
     lda browser_number+3
     bne !subtract+
     lda browser_number+2
@@ -183,6 +197,9 @@ browser_format_metadata:
     lda browser_number+3
     sbc #0
     sta browser_number+3
+    lda browser_duration_high
+    sbc #0
+    sta browser_duration_high
     inc browser_factor
     bne !seconds-
     inc browser_factor+1
@@ -209,12 +226,37 @@ browser_format_metadata:
 !time:
     ldy #0
     lda browser_multiplier
+    cmp #60
+    bcc !short_time+
+    // Keep the existing five-character column for hour-long movies: 1h49m.
+    ldx #48
+!hours:
+    inx
+    sec
+    sbc #60
+    cmp #60
+    bcs !hours-
+    pha
+    txa
+    sta (browser_list_ptr),y
+    iny
+    lda #104
+    sta (browser_list_ptr),y
+    iny
+    pla
+    jsr browser_two_digits
+    lda #109
+    sta (browser_list_ptr),y
+    iny
+    jmp !time_done+
+!short_time:
     jsr browser_two_digits
     lda #58
     sta (browser_list_ptr),y
     iny
     lda browser_factor
     jsr browser_two_digits
+!time_done:
     lda #0
     sta (browser_list_ptr),y
 
@@ -264,6 +306,30 @@ browser_format_metadata:
     ror browser_number
     dex
     bne !divide_sixteen-
+    // Above 999.9 MiB, use GiB to retain the eight-character size column.
+    lda #77
+    sta browser_factor_high
+    lda browser_number+1
+    cmp #>10000
+    bcc !size_unit+
+    bne !gib+
+    lda browser_number
+    cmp #<10000
+    bcc !size_unit+
+!gib:
+    clc
+    lda browser_number+1
+    adc #2 // round(tenths MiB / 1024)
+    sta browser_number+1
+    ldx #10
+!divide_gib:
+    lsr browser_number+1
+    ror browser_number
+    dex
+    bne !divide_gib-
+    lda #71
+    sta browser_factor_high
+!size_unit:
     lda #0
     sta browser_leading
     sta browser_digits
@@ -321,7 +387,7 @@ browser_format_metadata:
     adc #48
     sta (browser_list_ptr),y
     iny
-    lda #77 // MiB, ASCII; browser_print performs mixed-case screen conversion.
+    lda browser_factor_high // MiB or GiB, ASCII; converted by browser_print.
     sta (browser_list_ptr),y
     iny
     lda #105

@@ -22,7 +22,10 @@ pub const CACHE_TICKS: usize = 20;
 pub const RATE_BUDGET: usize = (110 - 2) * 63 * 63;
 pub const AUDIO_RATE: u32 = 22085;
 pub const AUDIO_DIVIDER: u16 = 281;
-pub const MAX_FRAMES: usize = 65535 / FRAME_TICKS;
+// A FAT32 file has u32 byte offsets. Even with the largest prefix (128 KiB),
+// 16,383 cache blocks fit; the next block would exceed the file-size limit.
+pub const MAX_STREAM_BLOCKS: usize = u32::MAX as usize / CACHE_BYTES;
+pub const MAX_FRAMES: usize = MAX_STREAM_BLOCKS * CACHE_TICKS / FRAME_TICKS;
 pub const PALETTE: [[u8; 3]; 16] = [
     [0, 0, 0],
     [247, 247, 247],
@@ -46,17 +49,7 @@ pub fn content_fps() -> f64 {
     985248.0 / (63.0 * 312.0 * FRAME_TICKS as f64)
 }
 pub fn frame_count(seconds: f64) -> Result<usize, String> {
-    if !seconds.is_finite() || seconds <= 0.0 {
-        return Err("Duration must be positive and finite".into());
-    }
-    let frames = (seconds * content_fps()).ceil() as usize;
-    if !(2..=MAX_FRAMES).contains(&frames) {
-        return Err(format!(
-            "The player supports 2..={MAX_FRAMES} frames (up to {:.1} minutes)",
-            MAX_FRAMES as f64 / content_fps() / 60.0
-        ));
-    }
-    Ok(frames)
+    VideoProfile::LegacyPalSd.frame_count(seconds)
 }
 
 /// Bayer positions are physical canvas positions and never depend on time.
@@ -661,6 +654,72 @@ fn stream_offset_profile(frames: usize, ticks: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn long_movie_prefixes_and_audio_tables_fit_fat32_for_every_profile() {
+        for id in 0..=4 {
+            let profile = VideoProfile::try_from(id).unwrap();
+            let ticks = profile.frame_ticks();
+            let max = profile.max_frames();
+            assert!(Encoder::with_profile(
+                max + 1,
+                vec![],
+                String::new(),
+                AudioConfig::default(),
+                profile
+            )
+            .is_err());
+            for frames in [65535 / ticks + 1, 6401 * CACHE_TICKS / ticks, max] {
+                for format in [AudioFormat::Pcm16, AudioFormat::Pcm8] {
+                    let audio = if id == 0 && format == AudioFormat::Pcm16 {
+                        AudioConfig::default()
+                    } else {
+                        AudioConfig::source(format, 48000).unwrap()
+                    };
+                    let mut encoder =
+                        Encoder::with_profile(frames, vec![], "Long movie".into(), audio, profile)
+                            .unwrap();
+                    // Exercise finalization at a late checkpoint without storing
+                    // or hashing gigabytes of synthetic preceding video blocks.
+                    encoder.initial = vec![0; PAGE_FRAME_BYTES];
+                    encoder.previous = encoder.initial.clone();
+                    encoder.received = frames;
+                    encoder.total_ticks = (frames - 1) * ticks;
+                    encoder.block_count = encoder.total_ticks / CACHE_TICKS;
+                    encoder.ticks_in_block = encoder.total_ticks % CACHE_TICKS;
+                    let prefix = encoder.finish().unwrap();
+                    let word =
+                        |at| u32::from_le_bytes(prefix[at..at + 4].try_into().unwrap()) as usize;
+                    let records = frames * ticks;
+                    let blocks = records.div_ceil(CACHE_TICKS);
+                    assert_eq!(word(24), records);
+                    assert_eq!(word(28), blocks);
+                    assert_eq!(word(68), frames);
+                    assert_eq!(word(56), prefix.len());
+                    assert_eq!(word(64), prefix.len() + blocks * CACHE_BYTES);
+                    assert!(word(64) <= u32::MAX as usize);
+                    let mut total_audio = 0;
+                    for block in 0..blocks {
+                        let at = 256 + block * 3;
+                        let length = usize::from(prefix[at])
+                            | usize::from(prefix[at + 1]) << 8
+                            | usize::from(prefix[at + 2]) << 16;
+                        assert!(length <= CACHE_BYTES - audio.audio_offset());
+                        assert_eq!(length % audio.bytes_per_frame(), 0);
+                        total_audio += length;
+                    }
+                    assert_eq!(
+                        total_audio,
+                        audio.sample_at_tick_profile(records, profile) * audio.bytes_per_frame()
+                    );
+                    if frames == max {
+                        assert_eq!(blocks, MAX_STREAM_BLOCKS);
+                        assert_eq!(prefix.len(), 131072);
+                        assert_eq!(word(64), 4_294_836_224);
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn all_profiles_keep_full_width_cadence_and_source_rate_audio_across_cache_boundaries() {
         for id in 1..=4 {

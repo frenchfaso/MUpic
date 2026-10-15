@@ -85,7 +85,7 @@ impl VideoProfile {
         crate::VIDEO_WIDTH - self.guard_pixels() * 2
     }
     pub fn max_frames(self) -> usize {
-        65535 / self.frame_ticks()
+        crate::MAX_STREAM_BLOCKS * crate::CACHE_TICKS / self.frame_ticks()
     }
     pub fn rate_budget(self) -> usize {
         // Same two-line service reserve as the PAL player; NTSC's shorter
@@ -103,7 +103,7 @@ impl VideoProfile {
         let frames = (seconds * self.content_fps()).ceil() as usize;
         if !(2..=self.max_frames()).contains(&frames) {
             return Err(format!(
-                "The selected profile supports 2..={} frames",
+                "The selected profile supports 2..={} frames within the FAT32 file-size limit",
                 self.max_frames()
             ));
         }

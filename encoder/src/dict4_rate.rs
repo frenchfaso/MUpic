@@ -330,7 +330,7 @@ mod tests {
             format!("{:x}", Sha256::digest(&actual)),
             "e8d94934916551478fcd44cd4894eae5016699dd748b802981afffb7e6501472"
         );
-        assert_eq!(sd::peak(&before, &actual), 428511);
+        assert_eq!(sd::peak(&before, &actual), 428472);
         assert!(sd::peak(&before, &actual) <= RATE_BUDGET);
         assert!(actual != target && actual != before);
         assert!(actual[..256].iter().all(|&v| v == 0));

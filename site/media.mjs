@@ -1,23 +1,28 @@
-import {CONTENT_FPS} from './mup-decoder.mjs?v=bf988c9a98d52290';
+import {CONTENT_FPS} from './mup-decoder.mjs?v=83abc0a9567c0b09';
 export const SAMPLE_RATE = 22085;
-export const MAX_FRAMES = 21845;
+export const MAX_FRAMES = Math.floor(16383*20/3);
+function movieBytes(frames,ticks) {
+  const blocks=Math.ceil(frames*ticks/20);
+  const initial=Math.ceil((256+blocks*3)/256)*256;
+  return Math.ceil((initial+46080)/65536)*65536+blocks*262144;
+}
 export function videoPlan(duration,width,height,options) {
   if(!Number.isFinite(duration) || duration<=0 || width<=0 || height<=0) throw new Error('This video has no readable duration or picture.');
   if(options) {
     const {profile,fit}=options;
     const frameCount=Math.ceil(duration*profile.fps);
     if(frameCount<2)throw new Error(`Please choose a video at least ${(2/profile.fps).toFixed(2)} seconds long.`);
-    if(frameCount>profile.maxFrames)throw new Error(`This profile supports videos up to about ${Math.floor(profile.maxFrames/profile.fps/60)} minutes. Split this video with the native CLI.`);
+    if(frameCount>profile.maxFrames)throw new Error(`This video would exceed the FAT32 limit of 4 GiB per MUP file. Choose a shorter clip.`);
     return {...fit,profile,fps:profile.fps,frameCount,duration:frameCount/profile.fps,
-      estimatedBytes:65536+Math.ceil(frameCount*profile.ticks/20)*262144};
+      estimatedBytes:movieBytes(frameCount,profile.ticks)};
   }
   const frameCount=Math.ceil(duration*CONTENT_FPS);
   if(frameCount<2) throw new Error('Please choose a video at least 0.12 seconds long.');
-  if(frameCount>MAX_FRAMES) throw new Error('The current C64 player supports videos up to about 21 minutes 47 seconds. Split this video with the native CLI.');
+  if(frameCount>MAX_FRAMES) throw new Error('This video would exceed the FAT32 limit of 4 GiB per MUP file. Choose a shorter clip.');
   const scale=Math.min(356/width,200/height),drawWidth=Math.max(1,Math.min(356,Math.round(width*scale))),drawHeight=Math.max(1,Math.min(200,Math.round(height*scale)));
   return {frameCount,duration:frameCount/CONTENT_FPS,width:drawWidth,height:drawHeight,
     left:2+Math.floor((356-drawWidth)/2),top:Math.floor((200-drawHeight)/2),
-    estimatedBytes:65536+Math.ceil(frameCount*3/20)*262144};
+    estimatedBytes:movieBytes(frameCount,3)};
 }
 export function asciiTitle(name) {
   return name.replace(/\.[^.]+$/,'').normalize('NFKD').replace(/[^\x20-\x7e]/g,'').trim().slice(0,63) || 'MY VIDEO';
