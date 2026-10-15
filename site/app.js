@@ -1,7 +1,7 @@
 import { CrtPresenter } from "./gpu.js";
 import { GamepadInput } from "./gamepad.js";
 import { KeyPulseQueue, NativeKeyboardInput } from "./mobile-keyboard.mjs?v=8ec35fb998bd6ffd";
-import { ensureIsolation } from "./isolation.mjs?v=26c03e13fa61303e";
+import { ensureIsolation } from "./isolation.mjs?v=06da8c01bd989f1c";
 await ensureIsolation();
 function assetUrl(name) {
   const url = new URL(name, import.meta.url);

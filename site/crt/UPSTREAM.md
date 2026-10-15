@@ -20,10 +20,23 @@ Sources:
 - [Guest Advanced PAL](https://github.com/libretro/slang-shaders/blob/master/crt/crt-guest-advanced-pal.slangp)
 - [CyberLab's stated 1702 inspiration](https://forums.libretro.com/t/cyberlab-death-to-pixels-shader-preset-packs/35606/745)
 
-`UPSTREAM.json` records the exact upstream commit, every resource and its
-SHA-256. `tools/vendor_guest1702.py` in the Wolf64 workspace reproduces this
-subset using the recorded commit. Upstream resources have not been edited.
-The main Guest CRT passes are GPL-2.0-or-later; individual resources retain
-their original licence headers. `COPYING-GPL-2.0.txt` contains the licence.
-The surrounding emulator is GPL-3.0-or-later. Shader files must accompany
-the executable; macOS bundles include them under `Contents/Resources/shaders`.
+`UPSTREAM.json` pins libretro/slang-shaders commit
+`0b3ff0b240f82f4cb5e5d0117f8f2080e2764cf7` and the hashes of all 23 original
+resources. [source.tar.gz](source.tar.gz) includes those unmodified resources,
+the independent preset, all per-file notices, and the Rust WGSL exporter from
+UE2-C64U-WebRust. The main Guest CRT passes are GPL-2.0-or-later; the exporter
+and its browser sampling adaptation are GPL-3.0-or-later. Individual source
+headers remain authoritative; see also [COPYING-GPL-2.0.txt](COPYING-GPL-2.0.txt).
+
+To rebuild, extract the archive, then run from its parent directory:
+
+```sh
+cargo run --release --manifest-path crt-export/Cargo.toml --bin ue2-crt-export -- crt-export/guest1702/1702-pal.slangp output-crt
+```
+
+The browser loads the generated WGSL, lookup textures and `guest1702.json`.
+`contract.json` is embedded in the emulator WASM; regenerate that module with
+`tools/build_emulator_wasm.py` after changing the shaders or preset. Native
+compiler dependencies are build tools, not part of the browser runtime. The
+archive preserves the original exporter and source metadata; dependency
+resolution is not fully locked, so a new build is not guaranteed byte-identical.

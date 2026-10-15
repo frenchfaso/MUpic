@@ -13,37 +13,41 @@
       "sha256": "9e9813c2ecb4b4eea940eed2b7c0079d4b86fd050aeae573ebe9ac3af59c8753"
     },
     {
-      "url": "data/roms/basic.901226-01.bin",
       "path": "/roms/basic.901226-01.bin",
       "bytes": 8192,
       "sha256": "89878cea0a268734696de11c4bae593eaaa506465d2029d619c0e0cbccdfa62d",
       "aliases": [
         "/roms/basic.bin"
-      ]
+      ],
+      "source": "/flash.bin",
+      "offset": 3039208
     },
     {
-      "url": "data/roms/kernal.901227-03.bin",
       "path": "/roms/kernal.901227-03.bin",
       "bytes": 8192,
       "sha256": "83c60d47047d7beab8e5b7bf6f67f80daa088b7a6a27de0d7e016f6484042721",
       "aliases": [
         "/roms/kernal.bin"
-      ]
+      ],
+      "source": "/flash.bin",
+      "offset": 3158430
     },
     {
-      "url": "data/roms/characters.901225-01.bin",
       "path": "/roms/characters.901225-01.bin",
       "bytes": 4096,
       "sha256": "fd0d53b8480e86163ac98998976c72cc58d5dd8eb824ed7b829774e74213b420",
       "aliases": [
         "/roms/characters.bin"
-      ]
+      ],
+      "source": "/flash.bin",
+      "offset": 3154334
     },
     {
-      "url": "data/roms/chars.bin",
       "path": "/roms/chars.bin",
       "bytes": 2048,
-      "sha256": "e0774c6d7398acd1bb6038fee676cb3a3b49e65d27042c3a05f6df25892d1b74"
+      "sha256": "e0774c6d7398acd1bb6038fee676cb3a3b49e65d27042c3a05f6df25892d1b74",
+      "source": "/flash.bin",
+      "offset": 3047400
     }
   ],
   "mupic": {

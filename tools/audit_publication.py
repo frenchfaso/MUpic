@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Audit the exact public Git payload, including the two authorized LFS movies."""
-import argparse, hashlib, json, re, subprocess
+"""Audit the exact public Git payload, including the two declared LFS movies."""
+import argparse, hashlib, json, re, subprocess, tarfile
 from pathlib import Path
 from package_lut import validate_asset
 ROOT=Path(__file__).resolve().parent.parent
@@ -47,6 +47,26 @@ def main():
     if len(flash)!=16<<20 or flash[0xfe8000:]!=b'\xff'*0x18000:raise ValueError('Private flash configuration pages were not erased')
     for name in ['LICENSE','CREDITS.md','demo/emulator/LICENSE','demo/emulator/vendor/trx64-core/LICENSE','demo/emulator/vendor/resid-rs/LICENSE']:
         if not (ROOT/name).exists():raise ValueError(f'Missing third-party license: {name}')
+    notices=(ROOT/'site/licenses/rust-dependencies.txt').read_text()
+    for name in ['encoder/Cargo.lock','demo/emulator/Cargo.lock']:
+        digest=hashlib.sha256((ROOT/name).read_bytes()).hexdigest()
+        if f'{name} SHA-256: {digest}' not in notices:
+            raise ValueError('Dependency notices are stale; run tools/collect_licenses.py')
+    for name in ['GPL-3.0.txt','LGPL-2.1.txt','coi-serviceworker-MIT.txt','rust-standard-library.html','ultimate-firmware.txt']:
+        if not (ROOT/'site/licenses'/name).is_file():raise ValueError(f'Missing runtime notice: {name}')
+    with tarfile.open(ROOT/'site/crt/source.tar.gz') as archive:
+        upstream=json.loads((ROOT/'site/crt/UPSTREAM.json').read_text())
+        for name,spec in upstream['files'].items():
+            data=archive.extractfile('crt-export/guest1702/'+name).read()
+            if len(data)!=spec['bytes'] or hashlib.sha256(data).hexdigest()!=spec['sha256']:
+                raise ValueError(f'CRT corresponding source mismatch: {name}')
+    # ROMs must stay derivable from the single pinned flash snapshot.
+    manifest=json.loads((ROOT/'site/manifest.json').read_text())
+    for entry in manifest['core']:
+        if entry.get('source')=='/flash.bin':
+            data=flash[entry['offset']:entry['offset']+entry['bytes']]
+            if len(data)!=entry['bytes'] or hashlib.sha256(data).hexdigest()!=entry['sha256']:
+                raise ValueError(f'Embedded ROM mismatch: {entry["path"]}')
     result={'status':'passed','repository':'frenchfaso/MUpic','public_git_files':len(entries),
             'git_payload_bytes':git_bytes,'authorized_lfs_payload_bytes':lfs_bytes,
             'flash_configuration_pages':'erased','secret_scan':'passed','files':entries}

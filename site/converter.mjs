@@ -3,7 +3,7 @@ import {MupPlayer} from './preview-player.mjs?v=ba45601c5bfd1eb3';
 import {videoPlan,asciiTitle,decodePcmSource,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=99d5e4f3a5b246a4';
 import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=e358799a317c3c0d';
 import {ConversionProgress} from './conversion-progress.mjs?v=ff2c0e223da601a2';
-import { ensureIsolation } from './isolation.mjs?v=26c03e13fa61303e';
+import { ensureIsolation } from './isolation.mjs?v=06da8c01bd989f1c';
 await ensureIsolation();
 const $=id=>document.getElementById(id);
 const original=$('original-video'),decoder=$('decode-video'),canvas=$('mup-preview');

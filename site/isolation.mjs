@@ -1,3 +1,5 @@
+// Response-header approach: coi-serviceworker, Copyright (c) 2021 Guido Zuidhof.
+// MIT notice: licenses/coi-serviceworker-MIT.txt. Project-specific adaptation.
 // Static hosts cannot set COOP/COEP. Wrap same-origin responses without caching
 // or buffering their bodies; streaming movies and the LUT keep their own caches.
 export function isolatedResponse(response) {

@@ -1,6 +1,6 @@
 import "./wasm.js";
 import { RemoteDisk } from "./remote-disk.js?v=19b858e4a836d6d0";
-import { fetchBytes } from "./fetch-bytes.mjs";
+import { registerBootAssets } from "./boot-assets.mjs?v=a48fef4225291e3a";
 import { EmulatedKeys } from "./emulated-keys.mjs?v=aca3ab369e0476a1";
 const { instantiateUE2 } = globalThis.UE2Wasm;
 const wasmUrl = new URL("./ue2_web.wasm", import.meta.url);
@@ -116,21 +116,9 @@ async function start(options) {
     shader: new TextDecoder().decode(module.HEAPU8.subarray(shaderPtr, shaderPtr + module._ue2_crt_shader_len())),
     params: Array.from(module.HEAPF32.subarray(paramsPtr >>> 2, (paramsPtr >>> 2) + module._ue2_crt_params_len())),
   });
-  const entries = [...manifest.core, ...manifest.mupic.assets];
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (typeof entry.url !== "string" || (entry.aliases !== undefined && !Array.isArray(entry.aliases))) throw new Error("Invalid file manifest entry.");
-    const paths = [entry.path, ...(entry.aliases || [])];
-    if (paths.some(path => typeof path !== "string" || !path.startsWith("/") || path.split("/").includes(".."))) throw new Error("Invalid file path in the manifest.");
-    const bytes = await fetchBytes(entry.url, (loaded, total) => send("download", {
-      file: entry.path, index: i + 1, count: entries.length, loaded, total,
-    }));
-    if (bytes.length !== entry.bytes) throw new Error(`${entry.path}: size mismatch.`);
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-    if (Array.from(digest, b => b.toString(16).padStart(2, "0")).join("") !== entry.sha256)
-      throw new Error(`${entry.path}: SHA-256 mismatch.`);
-    for (const path of paths) module.registerFile(path, bytes);
-  }
+  await registerBootAssets([...manifest.core, ...manifest.mupic.assets],
+    (path, bytes) => module.registerFile(path, bytes),
+    progress => send("download", progress));
   send("state", { state: "booting", message: "Booting firmware…" });
   if (!module._ue2_remote_disk || module._ue2_remote_disk(remoteDisk.bytes) !== 0)
     throw new Error(errorText());

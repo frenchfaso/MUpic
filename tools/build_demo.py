@@ -15,6 +15,7 @@ def version_browser_entrypoints(site):
         ('app.js', 'isolation.mjs'),
         ('converter.mjs', 'isolation.mjs'),
         ('worker.js', 'remote-disk.js'),
+        ('worker.js', 'boot-assets.mjs'),
         ('worker.js', 'emulated-keys.mjs'),
         ('app.js', 'mobile-keyboard.mjs'),
         ('worker-pool.mjs', 'lut-cache.mjs'),

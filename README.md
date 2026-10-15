@@ -16,7 +16,7 @@ Everything happens in your browser. Your video stays on your device, and its pro
 
 Choose **PCM16** for full-resolution audio, or **PCM8 HQ** for lighter audio with carefully shaped dithering. Both keep the source sample rate. Volume is adjusted automatically; silent videos work too.
 
-Start with a short clip! A single movie can be about 21 minutes long in PAL, or 18 minutes in NTSC.
+Start with a short clip! The current player supports up to **21:47 in PAL** or **18:15 in NTSC** per movie. This comes from its internal playback counter, regardless of USB capacity.
 
 ## Showtime
 
@@ -47,4 +47,4 @@ For tinkering, see [encoder](encoder/), [player](player/), [build tools](tools/)
 
 The people behind Ultimate, UPIC, the emulator and the other projects that make this little adventure possible. Meet them in the **[credits](CREDITS.md)**.
 
-Open source under **[GPL-3.0](LICENSE)**. Playback profiles are emulator-tested; verification on a physical Ultimate is still pending.
+Original code under **[GPL-3.0-only](LICENSE)**; third-party components keep their own licenses. Playback profiles are emulator-tested; verification on a physical Ultimate is still pending.
