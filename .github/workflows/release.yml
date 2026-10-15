@@ -9,7 +9,7 @@ permissions:
   contents: read
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 env:
   CARGO_INCREMENTAL: '0'
   RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v0.0.0-test.{0}', github.run_number) }}

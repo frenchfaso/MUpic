@@ -69,7 +69,11 @@ try {
   // Rotation is metadata, not encoded pixels. The CLI must fit the displayed
   // portrait orientation, including on distributions shipping FFprobe 4.4.
   const rotatedVideo=path.join(temporary,'rotated.mp4'), rotatedOutput=path.join(temporary,'rotated.mup');
-  run(['-i',video,'-c','copy','-metadata:s:v:0','rotate=90','-y',rotatedVideo]);
+  const ffmpegHelp=execFileSync('ffmpeg',['-hide_banner','-h','full'],{maxBuffer:8*1024*1024});
+  const rotationArgs=ffmpegHelp.includes('-display_rotation')
+    ? ['-display_rotation:v:0','90','-i',video,'-c','copy']
+    : ['-i',video,'-c','copy','-metadata:s:v:0','rotate=90'];
+  run([...rotationArgs,'-y',rotatedVideo]);
   execFileSync(binary,[rotatedVideo,'-o',rotatedOutput,'--duration','0.1',
     '--threads','2','--cache-dir',path.join(temporary,'cache'),'--title','CLI WASM parity'],
     {stdio:['ignore','pipe','inherit']});
