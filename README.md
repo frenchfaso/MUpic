@@ -32,7 +32,9 @@ No Ultimate handy? The **[browser demo](https://frenchfaso.github.io/MUpic/)** i
 
 ## Prefer the terminal?
 
-With Rust and FFmpeg installed:
+Versioned player and CLI downloads appear in **[GitHub Releases](https://github.com/frenchfaso/MUpic/releases)**. CLI packages include the color table; install **FFmpeg** separately, with `ffmpeg` and `ffprobe` on PATH.
+
+To build the CLI yourself, with Rust and FFmpeg installed:
 
 ```sh
 cargo build --locked --release --manifest-path encoder/Cargo.toml
@@ -42,6 +44,8 @@ encoder/target/release/mupic-encoder input.mp4 -o movie.mup
 Defaults: **PAL · HD · PCM16**. Run with `--help` for audio, video profiles and trimming. The CLI and browser use the same encoder.
 
 For tinkering, see [encoder](encoder/), [player](player/), [build tools](tools/) and [tests](tests/).
+
+Releases are built and tested automatically when a `vMAJOR.MINOR.PATCH` tag is pushed. **Release builds** can also be run manually in Actions to check all platforms without publishing.
 
 ## Made possible thanks to…
 

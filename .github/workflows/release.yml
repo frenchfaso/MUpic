@@ -1,0 +1,146 @@
+name: Release builds
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['encoder/**', 'player/**', 'releases/**', 'site/assets/encoder.wasm', 'site/assets/rgb24-lut*', 'site/licenses/**', 'tools/package_release.py', 'tools/build_player.py', 'tools/assemble.py', 'tests/test_*player.py', 'tests/test_decoder_timing.py', 'tests/test_release.py', '.github/workflows/release.yml', '.gitattributes', 'LICENSE', 'CREDITS.md']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_INCREMENTAL: '0'
+  RELEASE_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('v0.0.0-test.{0}', github.run_number) }}
+jobs:
+  cli:
+    name: CLI (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: macos-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: windows-x64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            extension: .exe
+    defaults:
+      run:
+        shell: bash
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.0'
+          targets: ${{ matrix.target }}
+      - name: Use the static Windows runtime
+        if: runner.os == 'Windows'
+        run: echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
+      - name: Install FFmpeg for tests only
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            case "$RUNNER_OS" in
+              Linux) sudo apt-get update && sudo apt-get install -y ffmpeg ;;
+              macOS) brew install ffmpeg ;;
+              Windows) choco install ffmpeg --yes --no-progress ;;
+            esac
+          fi
+          ffmpeg -version
+          ffprobe -version
+      - name: Test and build the production CLI
+        run: |
+          cargo test --release --locked --manifest-path encoder/Cargo.toml --target ${{ matrix.target }}
+          cargo build --release --locked --manifest-path encoder/Cargo.toml --target ${{ matrix.target }} --bin mupic-encoder
+      - name: Package and test the extracted executable
+        run: >-
+          python tools/package_release.py
+          --binary encoder/target/${{ matrix.target }}/release/mupic-encoder${{ matrix.extension }}
+          --platform ${{ matrix.platform }} --version "$RELEASE_VERSION" --commit "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: build/release/*
+          if-no-files-found: error
+          retention-days: 7
+  player:
+    name: Player and release checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Fetch the verified KickAssembler 5.25 toolchain
+        run: |
+          mkdir -p build/kickassembler
+          curl --fail --location --retry 3 https://theweb.dk/KickAssembler/KickAssembler.zip -o build/KickAssembler.zip
+          echo '9ef752c12b25f64b55bafecfabf23dfc90a8216b1a293548b2147ed7c15f55a6  build/KickAssembler.zip' | sha256sum --check
+          unzip -j build/KickAssembler.zip KickAss.jar KickAss.cfg -d build/kickassembler
+      - name: Build and verify the distributed player
+        run: |
+          python tools/build_player.py --kickass build/kickassembler/KickAss.jar
+          cmp build/player/MUPIC.PRG releases/MUPIC.PRG
+          cmp build/player/MUPIC.PRG site/data/mupic.prg
+          python -m pip install py65==1.2.0
+          python -m unittest discover -s tests -p 'test_*player.py'
+          python -m unittest discover -s tests -p test_decoder_timing.py
+          python -m unittest discover -s tests -p test_release.py
+          mkdir -p build/release
+          cp build/player/MUPIC.PRG build/release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-player
+          path: build/release/MUPIC.PRG
+          if-no-files-found: error
+          retention-days: 7
+  publish:
+    name: Publish tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [cli, player]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: build/release
+          merge-multiple: true
+      - name: Check the complete release and write checksums
+        run: python tools/package_release.py --collect --version "$RELEASE_VERSION" --commit "$GITHUB_SHA"
+      - name: Publish only after every platform passes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          args=()
+          if [[ "$RELEASE_VERSION" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_VERSION" build/release/* --verify-tag \
+            --title "MUpic $RELEASE_VERSION" --notes-file build/release-notes.md "${args[@]}"

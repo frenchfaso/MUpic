@@ -1,3 +1,4 @@
 media/BUNNY.MUP.gz filter=lfs diff=lfs merge=lfs -text
 media/CYBER77.MUP.gz filter=lfs diff=lfs merge=lfs -text
 *.rs text eol=lf
+*.asm text eol=lf
