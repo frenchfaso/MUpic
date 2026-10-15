@@ -263,19 +263,21 @@ fn run(args: Args) -> Result<(), String> {
         .filter(|&(a, b)| a > 0 && b > 0)
         .unwrap_or((1, 1));
     // FFmpeg autorotates decoded video; use the same displayed orientation.
+    // The stream list also works with FFprobe 4.4; selecting generic
+    // side_data would unnecessarily decode every frame on older versions.
     let rotation = probe(
         &args.input,
         &[
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream_side_data=rotation",
+            "stream_side_data_list",
             "-of",
-            "default=nw=1:nk=1",
+            "default=nw=1",
         ],
     )?
     .lines()
-    .find_map(|line| line.parse::<i32>().ok())
+    .find_map(|line| line.strip_prefix("rotation=")?.parse::<i32>().ok())
     .unwrap_or(0)
     .rem_euclid(180);
     let (width, height, sar_num, sar_den) = if rotation == 90 {

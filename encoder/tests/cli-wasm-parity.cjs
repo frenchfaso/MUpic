@@ -66,5 +66,17 @@ try {
   rgb=run(['-ss','0','-i',video,'-an','-vf',`tpad=stop_mode=clone:stop_duration=${seconds},fps=${fps},scale=360:169:flags=lanczos,setsar=1,pad=360:200:0:15:black,format=rgb24`,'-frames:v',String(count),'-f','rawvideo','-pix_fmt','rgb24','pipe:1']);
   pcm=run(['-ss','0','-i',video,'-map','0:a:0','-vn','-af',`atrim=duration=${seconds},apad=whole_dur=${seconds},asetrate=${48000*(divider+2)},aresample=6250000,asetrate=${Math.round(actualRate)}`,'-ac','2','-f','f32le','pipe:1']);
   assert.deepEqual(encode(),ntsc,'NTSC four-record CLI/WASM whole-file parity');
-  console.log(JSON.stringify({passed:true,profiles:[2,3],palBytes:encoded.length,ntscBytes:ntsc.length,sha256:createHash('sha256').update(encoded).digest('hex'),peakSlots:e.mup_peak_slots()}));
+  // Rotation is metadata, not encoded pixels. The CLI must fit the displayed
+  // portrait orientation, including on distributions shipping FFprobe 4.4.
+  const rotatedVideo=path.join(temporary,'rotated.mp4'), rotatedOutput=path.join(temporary,'rotated.mup');
+  run(['-i',video,'-c','copy','-metadata:s:v:0','rotate=90','-y',rotatedVideo]);
+  execFileSync(binary,[rotatedVideo,'-o',rotatedOutput,'--duration','0.1',
+    '--threads','2','--cache-dir',path.join(temporary,'cache'),'--title','CLI WASM parity'],
+    {stdio:['ignore','pipe','inherit']});
+  const rotated=fs.readFileSync(rotatedOutput);
+  profileId=2; count=rotated.readUInt32LE(68); fps=985248/(63*312*3); seconds=count/fps;
+  rgb=run(['-ss','0','-i',rotatedVideo,'-an','-vf',`tpad=stop_mode=clone:stop_duration=${seconds},fps=${fps},scale=120:200:flags=lanczos,setsar=1,pad=360:200:120:0:black,format=rgb24`,'-frames:v',String(count),'-f','rawvideo','-pix_fmt','rgb24','pipe:1']);
+  pcm=run(['-ss','0','-i',rotatedVideo,'-map','0:a:0','-vn','-af',`atrim=duration=${seconds},apad=whole_dur=${seconds},asetrate=${48000*(divider+2)},aresample=6250000,asetrate=${Math.round(actualRate)}`,'-ac','2','-f','f32le','pipe:1']);
+  assert.deepEqual(encode(),rotated,'rotated source CLI/WASM whole-file parity');
+  console.log(JSON.stringify({passed:true,profiles:[2,3],rotatedSource:true,palBytes:encoded.length,ntscBytes:ntsc.length,sha256:createHash('sha256').update(encoded).digest('hex'),peakSlots:e.mup_peak_slots()}));
 } finally { fs.rmSync(temporary,{recursive:true,force:true}); }
