@@ -10,6 +10,7 @@ function assetUrl(name) {
 }
 const $ = (id) => document.getElementById(id);
 const canvas = $("screen");
+const hardwareStage = document.querySelector(".hardware-stage");
 const controls = {
   c64: $("start-c64"),
 };
@@ -66,6 +67,7 @@ function updateUI(message) {
   };
   $("runtime-status").textContent = message || status[state.state] || state.state;
   canvas.dataset.state = state.state;
+  hardwareStage.toggleAttribute("data-powered", ["booting", "running", "paused"].includes(state.state));
   if (loading && !state.workerReady) showProgressDialog();
   else if (state.state !== "error") closeProgressDialog();
 }

@@ -32,6 +32,33 @@ main { width: min(1240px, 100%); min-height: 100vh; margin: 0 auto; padding: 12p
   flex-shrink: 0;
 }
 .hardware-art { position: absolute; inset: 0; z-index: 2; display: block; width: 100%; height: 100%; object-fit: contain; pointer-events: none; user-select: none; filter: drop-shadow(0 12px 18px #0008); }
+.monitor-led {
+  /* Power lamp center (735.5, 777.5) in the monitor's original artwork. */
+  position: absolute;
+  z-index: 3;
+  left: 61.69871795%;
+  top: 85.52479815%;
+  width: 1.28205128%;
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #314824, #14250e 65%, #10190b);
+  pointer-events: none;
+}
+.monitor-led::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: radial-gradient(circle at 40% 35%, #e0ffb2, #8ff649 28%, #48c51d 60%, #246b10);
+  filter: drop-shadow(0 0 2px #9aff60) drop-shadow(0 0 5px #6af332aa);
+  opacity: 0;
+  transition: opacity 350ms ease-out;
+}
+.hardware-stage[data-powered] .monitor-led::after { opacity: 1; }
+@media (prefers-reduced-motion: reduce) {
+  .monitor-led::after { transition: none; }
+}
 .screen-window { position: absolute; z-index: 1; left: var(--screen-left); top: var(--screen-top); width: var(--screen-width); aspect-ratio: 4 / 3; overflow: hidden; background: #020305; border-radius: 3.2% / 4.3%; }
 #screen { display: block; width: 100%; height: 100%; aspect-ratio: 4 / 3; image-rendering: auto; outline: none; }
 .screen-window:focus-within { box-shadow: 0 0 0 2px var(--cyan); }
