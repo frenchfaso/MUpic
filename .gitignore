@@ -10,3 +10,10 @@ site/media/
 reports/local-*
 .env
 *.log
+*.bak
+*.orig
+*.rej
+*.tmp
+*.swp
+*.swo
+*~

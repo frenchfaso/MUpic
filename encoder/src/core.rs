@@ -4,7 +4,7 @@ use crate::audio::sample_at_tick;
 use crate::{
     audio::{AudioConfig, AudioFormat},
     author_dither::AuthorDither,
-    dict4_rate, lut, sd,
+    dict4_rate, lut, sd, VideoProfile,
 };
 use sha2::{Digest, Sha256};
 
@@ -66,6 +66,7 @@ pub struct Quantizer {
     lut_blocks: Vec<bool>,
     lut_loaded: usize,
     lut_asset: Option<lut::AssetImporter>,
+    profile: VideoProfile,
 }
 impl Quantizer {
     pub fn new(threads: usize) -> Result<Self, String> {
@@ -80,7 +81,11 @@ impl Quantizer {
             lut_blocks: vec![false; lut::BLOCK_COUNT],
             lut_loaded: 0,
             lut_asset: None,
+            profile: VideoProfile::LegacyPalSd,
         })
+    }
+    pub fn set_profile(&mut self, profile: VideoProfile) {
+        self.profile = profile;
     }
     fn cache_limit() -> usize {
         if cfg!(target_arch = "wasm32") {
@@ -146,6 +151,7 @@ impl Quantizer {
         if self.lut_complete() && threads > 1 && rgb.len() > RGB_BYTES {
             let lut = &self.lut;
             let author = &self.author;
+            let guard = self.profile.guard_pixels();
             let frame_count = rgb.len() / RGB_BYTES;
             let workers = threads.min(frame_count);
             return std::thread::scope(|scope| {
@@ -157,7 +163,7 @@ impl Quantizer {
                         scope.spawn(move || {
                             chunk
                                 .chunks_exact(RGB_BYTES)
-                                .map(|frame| pack_lut_frame(author, lut, frame))
+                                .map(|frame| pack_lut_frame(author, lut, frame, guard))
                                 .collect::<Vec<_>>()
                         })
                     })
@@ -178,7 +184,7 @@ impl Quantizer {
         if !self.lut.is_empty() {
             let mut packed = vec![0; PACKED_BYTES];
             for y in 0..VIDEO_HEIGHT {
-                for x in 2..VIDEO_WIDTH - 2 {
+                for x in self.profile.guard_pixels()..VIDEO_WIDTH - self.profile.guard_pixels() {
                     let offset = (y * VIDEO_WIDTH + x) * 3;
                     let pixel = [rgb[offset], rgb[offset + 1], rgb[offset + 2]];
                     let key = (u32::from(pixel[0]) << 16
@@ -198,7 +204,7 @@ impl Quantizer {
         let plans = self.author.frame_plans(rgb);
         let mut packed = vec![0; PACKED_BYTES];
         for y in 0..VIDEO_HEIGHT {
-            for x in 2..VIDEO_WIDTH - 2 {
+            for x in self.profile.guard_pixels()..VIDEO_WIDTH - self.profile.guard_pixels() {
                 let color = self.author.colour(plans[y * VIDEO_WIDTH + x], x, y);
                 packed[y * 180 + x / 2] |= color << ((x & 1) * 4);
             }
@@ -215,7 +221,7 @@ impl Quantizer {
         {
             return Err("Frame plans must contain 72000 valid candidate ids".into());
         }
-        Ok(pack_pixels(|x, y| {
+        Ok(pack_pixels(self.profile.guard_pixels(), |x, y| {
             self.author
                 .colour(plans[y * VIDEO_WIDTH + x] as usize, x, y)
         }))
@@ -306,8 +312,9 @@ impl Quantizer {
     }
 }
 
-fn pack_lut_frame(author: &AuthorDither, lut: &[u32], rgb: &[u8]) -> Vec<u8> {
-    pack_pixels(|x, y| {
+#[cfg(not(target_arch = "wasm32"))]
+fn pack_lut_frame(author: &AuthorDither, lut: &[u32], rgb: &[u8], guard: usize) -> Vec<u8> {
+    pack_pixels(guard, |x, y| {
         let offset = (y * VIDEO_WIDTH + x) * 3;
         let key = (u32::from(rgb[offset]) << 16
             | u32::from(rgb[offset + 1]) << 8
@@ -316,10 +323,10 @@ fn pack_lut_frame(author: &AuthorDither, lut: &[u32], rgb: &[u8]) -> Vec<u8> {
     })
 }
 
-fn pack_pixels(mut colour: impl FnMut(usize, usize) -> u8) -> Vec<u8> {
+fn pack_pixels(guard: usize, mut colour: impl FnMut(usize, usize) -> u8) -> Vec<u8> {
     let mut packed = vec![0; PACKED_BYTES];
     for y in 0..VIDEO_HEIGHT {
-        for x in (2..VIDEO_WIDTH - 2).step_by(2) {
+        for x in (guard..VIDEO_WIDTH - guard).step_by(2) {
             packed[y * (VIDEO_WIDTH / 2) + x / 2] = colour(x, y) | (colour(x + 1, y) << 4);
         }
     }
@@ -327,12 +334,15 @@ fn pack_pixels(mut colour: impl FnMut(usize, usize) -> u8) -> Vec<u8> {
 }
 
 pub fn to_page_frame(packed: &[u8]) -> Result<Vec<u8>, String> {
+    to_page_frame_profile(packed, VideoProfile::LegacyPalSd)
+}
+pub fn to_page_frame_profile(packed: &[u8], profile: VideoProfile) -> Result<Vec<u8>, String> {
     if packed.len() != PACKED_BYTES {
         return Err("Packed input must contain 36000 row-major bytes".into());
     }
     let mut frame = vec![0; PAGE_FRAME_BYTES];
     for y in 0..VIDEO_HEIGHT {
-        if packed[y * 180] != 0 || packed[y * 180 + 179] != 0 {
+        if profile.guard_pixels() != 0 && (packed[y * 180] != 0 || packed[y * 180 + 179] != 0) {
             return Err("Native SD requires two black pixels at each side".into());
         }
         for x in 0..180 {
@@ -368,6 +378,7 @@ pub struct Encoder {
     title: String,
     pcm: Vec<u8>,
     audio: AudioConfig,
+    profile: VideoProfile,
     initial: Vec<u8>,
     previous: Vec<u8>,
     metric: dict4_rate::Prepared,
@@ -393,8 +404,17 @@ impl Encoder {
         title: String,
         audio: AudioConfig,
     ) -> Result<Self, String> {
-        if !(2..=MAX_FRAMES).contains(&frames) {
-            return Err(format!("Frame count must be 2..={MAX_FRAMES}"));
+        Self::with_profile(frames, pcm, title, audio, VideoProfile::LegacyPalSd)
+    }
+    pub fn with_profile(
+        frames: usize,
+        pcm: Vec<u8>,
+        title: String,
+        audio: AudioConfig,
+        profile: VideoProfile,
+    ) -> Result<Self, String> {
+        if !(2..=profile.max_frames()).contains(&frames) {
+            return Err(format!("Frame count must be 2..={}", profile.max_frames()));
         }
         if !pcm.len().is_multiple_of(audio.bytes_per_frame()) {
             return Err(match audio.format() {
@@ -412,6 +432,7 @@ impl Encoder {
             title,
             pcm,
             audio,
+            profile,
             initial: vec![],
             previous: vec![],
             metric: dict4_rate::Prepared::new(&PALETTE),
@@ -432,7 +453,7 @@ impl Encoder {
         if self.finished || self.received == self.frames {
             return Err("Encoder received too many frames or was already finished".into());
         }
-        let exact = to_page_frame(packed)?;
+        let exact = to_page_frame_profile(packed, self.profile)?;
         let reconstructed = if self.received == 0 {
             self.initial = exact.clone();
             exact
@@ -440,20 +461,27 @@ impl Encoder {
             let (after, plan) = self.metric.project_with_plan(
                 &self.previous,
                 &exact,
-                RATE_BUDGET,
+                self.profile.rate_budget(),
                 |before, after| {
                     // The last content frame is followed by empty display holds.
                     // Other following frames have not entered the stream yet.
                     let following_body = (self.received + 1 == self.frames).then_some(0);
-                    let plan = sd::prepare_at(before, after, self.ticks_in_block, following_body);
+                    let plan = sd::prepare_profile(
+                        before,
+                        after,
+                        self.ticks_in_block,
+                        following_body,
+                        self.profile.frame_ticks(),
+                    );
                     (plan.peak(), plan)
                 },
             )?;
             self.adapted_frames += usize::from(after != exact);
             let (records, peak) = sd::group_prepared(&self.previous, &after, plan)?;
-            if peak > RATE_BUDGET {
+            if peak > self.profile.rate_budget() {
                 return Err(format!(
-                    "Qualified cost model exceeds budget: {peak}/{RATE_BUDGET}"
+                    "Qualified cost model exceeds budget: {peak}/{}",
+                    self.profile.rate_budget()
                 ));
             }
             self.peak_slots = self.peak_slots.max(peak);
@@ -489,9 +517,12 @@ impl Encoder {
         }
         let begin = self
             .audio
-            .sample_at_tick(self.total_ticks - self.ticks_in_block)
+            .sample_at_tick_profile(self.total_ticks - self.ticks_in_block, self.profile)
             * self.audio.bytes_per_frame();
-        let end = self.audio.sample_at_tick(self.total_ticks) * self.audio.bytes_per_frame();
+        let end = self
+            .audio
+            .sample_at_tick_profile(self.total_ticks, self.profile)
+            * self.audio.bytes_per_frame();
         let length = end - begin;
         let audio_offset = self.audio.audio_offset();
         if length > CACHE_BYTES - audio_offset {
@@ -526,7 +557,7 @@ impl Encoder {
         self.received
     }
     pub fn stream_offset(&self) -> usize {
-        stream_offset(self.frames)
+        stream_offset_profile(self.frames, self.profile.frame_ticks())
     }
     pub fn finish(&mut self) -> Result<Vec<u8>, String> {
         if self.finished || self.received != self.frames {
@@ -535,19 +566,23 @@ impl Encoder {
                 self.frames, self.received
             ));
         }
-        let (holds, peak) = sd::holds(&self.previous, self.ticks_in_block)?;
+        let (holds, peak) = sd::holds_profile(
+            &self.previous,
+            self.ticks_in_block,
+            self.profile.frame_ticks(),
+        )?;
         self.peak_slots = self.peak_slots.max(peak);
         for record in holds {
             self.packet(&record)?;
         }
         self.flush()?;
-        let records = self.frames * FRAME_TICKS;
+        let records = self.frames * self.profile.frame_ticks();
         let blocks = records.div_ceil(CACHE_TICKS);
         if self.total_ticks != records || self.block_count != blocks {
             return Err("Container cadence mismatch".into());
         }
         let initial_offset = align(256 + blocks * 3, 256);
-        let stream_offset = stream_offset(self.frames);
+        let stream_offset = self.stream_offset();
         let mut prefix = vec![0; stream_offset];
         prefix[..4].copy_from_slice(b"MUP9");
         let values: &[(usize, usize, usize)] = &[
@@ -566,10 +601,10 @@ impl Encoder {
             (8, 2, 256),
             (10, 2, 360),
             (12, 2, 200),
-            (14, 2, 356),
+            (14, 2, self.profile.active_width()),
             (16, 2, 200),
             (18, 2, 0),
-            (20, 1, 3),
+            (20, 1, self.profile.frame_ticks()),
             (21, 1, 0),
             (22, 1, 13),
             (24, 4, records),
@@ -587,6 +622,7 @@ impl Encoder {
             (68, 4, self.frames),
             (72, 2, records - (blocks - 1) * CACHE_TICKS),
             (76, 4, self.audio.source_rate() as usize),
+            (80, 1, self.profile as usize),
         ];
         for &(at, count, value) in values {
             prefix[at..at + count].copy_from_slice(&(value as u32).to_le_bytes()[..count]);
@@ -601,7 +637,8 @@ impl Encoder {
         for block in 0..blocks {
             let start = block * CACHE_TICKS;
             let end = (start + CACHE_TICKS).min(records);
-            let bytes = (self.audio.sample_at_tick(end) - self.audio.sample_at_tick(start))
+            let bytes = (self.audio.sample_at_tick_profile(end, self.profile)
+                - self.audio.sample_at_tick_profile(start, self.profile))
                 * self.audio.bytes_per_frame();
             prefix[256 + block * 3..259 + block * 3]
                 .copy_from_slice(&(bytes as u32).to_le_bytes()[..3]);
@@ -614,9 +651,9 @@ impl Encoder {
 fn align(n: usize, alignment: usize) -> usize {
     n.div_ceil(alignment) * alignment
 }
-fn stream_offset(frames: usize) -> usize {
+fn stream_offset_profile(frames: usize, ticks: usize) -> usize {
     align(
-        align(256 + (frames * FRAME_TICKS).div_ceil(CACHE_TICKS) * 3, 256) + PAGE_FRAME_BYTES,
+        align(256 + (frames * ticks).div_ceil(CACHE_TICKS) * 3, 256) + PAGE_FRAME_BYTES,
         65536,
     )
 }
@@ -624,6 +661,56 @@ fn stream_offset(frames: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn all_profiles_keep_full_width_cadence_and_source_rate_audio_across_cache_boundaries() {
+        for id in 1..=4 {
+            let profile = VideoProfile::try_from(id).unwrap();
+            for format in [AudioFormat::Pcm16, AudioFormat::Pcm8] {
+                let audio = AudioConfig::source(format, 48000).unwrap();
+                let frames = 9;
+                let ticks = frames * profile.frame_ticks();
+                let samples = audio.sample_at_tick_profile(ticks, profile);
+                let pcm: Vec<u8> = (0..samples * audio.bytes_per_frame())
+                    .map(|n| (n % 251) as u8)
+                    .collect();
+                let mut encoder =
+                    Encoder::with_profile(frames, pcm.clone(), "Profile".into(), audio, profile)
+                        .unwrap();
+                for f in 0..frames {
+                    let mut frame = vec![0; PACKED_BYTES];
+                    for y in 0..VIDEO_HEIGHT {
+                        frame[y * 180] = 0x12 + (f % 2) as u8;
+                        frame[y * 180 + 179] = 0x34 + (f % 2) as u8;
+                    }
+                    encoder.push(&frame).unwrap();
+                    assert_eq!(encoder.preview(), frame);
+                }
+                let prefix = encoder.finish().unwrap();
+                assert_eq!(prefix[80], id as u8);
+                assert_eq!(prefix[20] as usize, profile.frame_ticks());
+                assert_eq!(u16::from_le_bytes(prefix[14..16].try_into().unwrap()), 360);
+                assert_eq!(
+                    u32::from_le_bytes(prefix[24..28].try_into().unwrap()) as usize,
+                    ticks
+                );
+                let mut rebuilt = Vec::new();
+                for block in 0..ticks.div_ceil(CACHE_TICKS) {
+                    let at = 256 + block * 3;
+                    let length = usize::from(prefix[at])
+                        | usize::from(prefix[at + 1]) << 8
+                        | usize::from(prefix[at + 2]) << 16;
+                    if block == 0 && format == AudioFormat::Pcm16 && !profile.is_ntsc() {
+                        assert!(length > 65535);
+                    }
+                    let start = block * CACHE_BYTES + audio.audio_offset();
+                    rebuilt.extend_from_slice(&encoder.output()[start..start + length]);
+                }
+                assert_eq!(rebuilt, pcm);
+                assert!(encoder.peak_slots <= profile.rate_budget());
+            }
+        }
+    }
+
     #[test]
     fn pcm8_container_uses_signed_bytes_fractional_lengths_and_valid_checksums() {
         for rate in [8000, 11025, 22050, 44100, 48000] {
@@ -832,12 +919,20 @@ mod tests {
                 colors[(position / (frame + 1) + frame) % colors.len()]
             })
             .collect();
-        let scalar = q.pack_batch(&rgb, 1).unwrap();
-        assert!(scalar.windows(2).all(|pair| pair[0] != pair[1]));
-        for threads in [2, 3, 4, 6, 8] {
-            assert_eq!(q.pack_batch(&rgb, threads).unwrap(), scalar);
+        for profile in [VideoProfile::LegacyPalSd, VideoProfile::PalHd] {
+            q.set_profile(profile);
+            let scalar = q.pack_batch(&rgb, 1).unwrap();
+            assert!(scalar.windows(2).all(|pair| pair[0] != pair[1]));
+            for threads in [2, 3, 4, 6, 8] {
+                assert_eq!(q.pack_batch(&rgb, threads).unwrap(), scalar);
+            }
+            assert_eq!(q.pack_batch(&rgb[..RGB_BYTES], 4).unwrap(), scalar[..1]);
+            if profile.guard_pixels() == 0 {
+                assert!(scalar[0]
+                    .chunks_exact(180)
+                    .any(|row| row[0] != 0 && row[179] != 0));
+            }
         }
-        assert_eq!(q.pack_batch(&rgb[..RGB_BYTES], 4).unwrap(), scalar[..1]);
         assert!(q.pack_batch(&rgb, 0).is_err());
         assert!(q.pack_batch(&rgb[..rgb.len() - 1], 4).is_err());
     }

@@ -1,4 +1,4 @@
-import {EncoderCore} from './wasm-core.mjs?v=f7d118df66d5212e';
+import {EncoderCore} from './wasm-core.mjs?v=523dcdea31bf18f8';
 let core,frames=[],sharedLut;
 self.onmessage = async ({data}) => {
   const {id,method,args={}}=data;
@@ -6,9 +6,13 @@ self.onmessage = async ({data}) => {
     let result,transfer=[];
     if(method==='init') {
       core=await EncoderCore.load(args.url,args.module);
+      if(args.profile!==undefined)core.setProfile(args.profile);
       if(args.sharedLut)sharedLut=new Uint32Array(args.sharedLut);
       result={ready:true,module:core.module};
     }
+    else if(method==='setProfile')core.setProfile(args.profile);
+    else if(method==='videoPlan')result={profile:core.profileInfo(args.profile),fit:core.fit(args.profile,args.width,args.height)};
+    else if(method==='audioInfo')result=core.audioInfo(args.audioFormat,args.sampleRate);
     else if(method==='shareLut') {
       const buffer=core.sharedLut();
       if(buffer)sharedLut=new Uint32Array(buffer);

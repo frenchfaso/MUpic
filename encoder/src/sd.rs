@@ -7,6 +7,7 @@ const COLS: usize = 180;
 const ROWS: usize = 200;
 const WORDS: usize = ROWS / 4;
 const PREFETCH: usize = 13;
+#[cfg(test)]
 const TICKS: usize = 3;
 const REGIONS: [(usize, usize, usize); 2] = [(0, 2048, 0xe000), (2048, 44032, 0x1800)];
 const LUT_BYTES: usize = 1024;
@@ -372,6 +373,68 @@ fn partition(
     }
     vec![0..cuts.0, cuts.0..cuts.1, cuts.1..n]
 }
+// Four-refresh NTSC uses the same lookahead-aware minimax objective. Every
+// possible ascending split is considered; cached interval scores make the
+// cubic boundary search inexpensive and avoid assuming monotonic costs.
+fn partition_four(
+    columns: &[Column],
+    first_tick: usize,
+    following_body: Option<usize>,
+) -> Vec<std::ops::Range<usize>> {
+    let n = columns.len();
+    let costs = Costs::new(columns);
+    let size = n + 1;
+    let mut decode = vec![0; size * size];
+    let mut prepare = vec![0; size * size];
+    for start in 0..=n {
+        for end in start..=n {
+            decode[start * size + end] = costs.score(start, end, false);
+            prepare[start * size + end] = next_cost(Some(costs.body(start, end, false)), false);
+        }
+    }
+    let first = (0..=n)
+        .map(|end| costs.score(0, end, true))
+        .collect::<Vec<_>>();
+    // Cache switches add a fixed cost, independent of the following length.
+    let extra = |tick| {
+        if switching(first_tick, tick) {
+            next_cost(Some(0), true) - next_cost(Some(0), false)
+        } else {
+            0
+        }
+    };
+    let tail = next_cost(following_body, switching(first_tick, 3));
+    let mut best = usize::MAX;
+    let mut cuts = (0, 0, 0);
+    for third in 0..=n {
+        let fourth = decode[third * size + n] + tail;
+        if fourth >= best {
+            continue;
+        }
+        for second in 0..=third {
+            let third_cost = decode[second * size + third] + prepare[third * size + n] + extra(2);
+            let suffix = fourth.max(third_cost);
+            if suffix >= best {
+                continue;
+            }
+            for first_cut in 0..=second {
+                let initial = first[first_cut] + prepare[first_cut * size + second] + extra(0);
+                if initial >= best {
+                    continue;
+                }
+                let middle =
+                    decode[first_cut * size + second] + prepare[second * size + third] + extra(1);
+                let peak = initial.max(middle).max(suffix);
+                if peak < best {
+                    best = peak;
+                    cuts = (first_cut, second, third);
+                }
+            }
+        }
+    }
+    vec![0..cuts.0, cuts.0..cuts.1, cuts.1..cuts.2, cuts.2..n]
+}
+
 fn planned_peak(
     columns: &[Column],
     parts: &[std::ops::Range<usize>],
@@ -413,14 +476,28 @@ impl Prepared {
         self.peak
     }
 }
+#[cfg(test)]
 pub(super) fn prepare_at(
     before: &[u8],
     after: &[u8],
     first_tick: usize,
     following_body: Option<usize>,
 ) -> Prepared {
+    prepare_profile(before, after, first_tick, following_body, TICKS)
+}
+pub(super) fn prepare_profile(
+    before: &[u8],
+    after: &[u8],
+    first_tick: usize,
+    following_body: Option<usize>,
+    ticks: usize,
+) -> Prepared {
     let plan = plan(before, after);
-    let parts = partition(&plan.columns, first_tick, following_body);
+    let parts = if ticks == 4 {
+        partition_four(&plan.columns, first_tick, following_body)
+    } else {
+        partition(&plan.columns, first_tick, following_body)
+    };
     let peak = planned_peak(&plan.columns, &parts, first_tick, true, following_body);
     Prepared {
         plan,
@@ -550,13 +627,21 @@ fn group(before: &[u8], after: Option<&[u8]>) -> Result<(Vec<Vec<u8>>, usize), S
         return Err("SD frame must contain 46080 page-stride bytes".into());
     }
     let prepared = after.map(|target| prepare_at(before, target, 0, None));
-    group_from_plan(before, after, prepared, 0)
+    group_from_plan(before, after, prepared, 0, TICKS)
 }
+#[cfg(test)]
 pub(super) fn holds(before: &[u8], first_tick: usize) -> Result<(Vec<Vec<u8>>, usize), String> {
+    holds_profile(before, first_tick, TICKS)
+}
+pub(super) fn holds_profile(
+    before: &[u8],
+    first_tick: usize,
+    ticks: usize,
+) -> Result<(Vec<Vec<u8>>, usize), String> {
     if before.len() != FRAME {
         return Err("SD frame must contain 46080 page-stride bytes".into());
     }
-    group_from_plan(before, None, None, first_tick)
+    group_from_plan(before, None, None, first_tick, ticks)
 }
 pub(super) fn group_prepared(
     before: &[u8],
@@ -566,13 +651,15 @@ pub(super) fn group_prepared(
     if before.len() != FRAME || after.len() != FRAME {
         return Err("SD frame must contain 46080 page-stride bytes".into());
     }
-    group_from_plan(before, Some(after), Some(prepared), 0)
+    let ticks = prepared.parts.len();
+    group_from_plan(before, Some(after), Some(prepared), 0, ticks)
 }
 fn group_from_plan(
     before: &[u8],
     after: Option<&[u8]>,
     prepared: Option<Prepared>,
     holds_tick: usize,
+    ticks: usize,
 ) -> Result<(Vec<Vec<u8>>, usize), String> {
     let mut ram = vec![0xaa; 65536];
     for &(at, count, address) in &REGIONS {
@@ -581,7 +668,7 @@ fn group_from_plan(
     let mut decoder = State::new();
     let expected_peak = prepared.as_ref().map(Prepared::peak);
     let (plan, parts, first_tick, following_body) = prepared.map_or_else(
-        || (None, vec![0..0; TICKS], holds_tick, Some(0)),
+        || (None, vec![0..0; ticks], holds_tick, Some(0)),
         |prepared| {
             (
                 Some(prepared.plan),
@@ -598,10 +685,10 @@ fn group_from_plan(
         after.is_some(),
         following_body,
     );
-    let mut packets = Vec::with_capacity(TICKS);
+    let mut packets = Vec::with_capacity(ticks);
     for (tick, range) in parts.into_iter().enumerate() {
         let reset = after.is_some() && tick == 0;
-        let complete = after.is_some() && tick + 1 == TICKS;
+        let complete = after.is_some() && tick + 1 == ticks;
         let columns = plan.as_ref().map_or(&[][..], |p| &p.columns[range]);
         let cost = cost(columns, reset);
         let mut payload = vec![
@@ -920,6 +1007,38 @@ mod timing_partition_tests {
                             costs.score(begin, end, false),
                             cost(&columns[begin..end], false).slots,
                             "n={n},variant={variant},range={begin}..{end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn four_refresh_partitions_match_independent_exhaustive_record_costs() {
+        for n in [0, 1, 3, 8, 12] {
+            for variant in 0..4 {
+                let columns = fixture(n, variant);
+                for first_tick in [0, 16, 17, 18, 19] {
+                    for following in [None, Some(0), Some(2587)] {
+                        let mut expected = (usize::MAX, Vec::new());
+                        for third in 0..=n {
+                            for second in 0..=third {
+                                for first in 0..=second {
+                                    let parts =
+                                        vec![0..first, first..second, second..third, third..n];
+                                    let peak =
+                                        planned_peak(&columns, &parts, first_tick, true, following);
+                                    if peak < expected.0 {
+                                        expected = (peak, parts);
+                                    }
+                                }
+                            }
+                        }
+                        let actual = partition_four(&columns, first_tick, following);
+                        assert_eq!(
+                            actual, expected.1,
+                            "n={n} variant={variant} first_tick={first_tick}"
                         );
                     }
                 }

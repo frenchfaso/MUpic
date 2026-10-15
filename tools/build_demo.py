@@ -20,6 +20,8 @@ def version_browser_entrypoints(site):
         ('worker-pool.mjs', 'lut-cache.mjs'),
         ('quantizer-worker.mjs', 'wasm-core.mjs'),
         ('encoder-worker.mjs', 'wasm-core.mjs'),
+        ('converter.mjs', 'mup-decoder.mjs'),
+        ('media.mjs', 'mup-decoder.mjs'),
         ('converter.mjs', 'worker-pool.mjs'),
         ('converter.mjs', 'media.mjs'),
         ('converter.mjs', 'conversion-progress.mjs'),

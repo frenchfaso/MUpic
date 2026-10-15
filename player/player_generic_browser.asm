@@ -2,6 +2,7 @@
 // resident bridge saves/restores the code from REU $080000 while IRQs are off.
 * = BROWSER_OVERLAY "Ultimate DOS directory browser and container loader"
 browser_main:
+    jsr detect_video_standard
     lda $dd00
     and #$fc
     ora #1 // VIC bank $8000: screen $a400, mixed-case character ROM at $9800.
@@ -94,6 +95,8 @@ browser_parent:
     jsr browser_path_parent
     jmp browser_refresh
 browser_enter:
+    lda #0
+    sta generic_error
     lda browser_count
     beq browser_idle
     lda browser_selected
@@ -114,8 +117,11 @@ browser_enter:
 !bad_container:
     jsr uci_close_file
 !failed:
+    lda generic_error
+    bne !have_error+
     lda #7
     sta generic_error
+!have_error:
     jsr browser_draw
     jmp browser_idle
 
@@ -124,6 +130,8 @@ browser_enter:
 browser_root: .byte 47,85,115,98,48,0
 browser_heading: .byte 77,85,112,105,99,32,80,108,97,121,101,114,0 // MUpic Player
 browser_error: .text "ERROR: FILE OR PROFILE NOT SUPPORTED"
+    .byte 0
+browser_standard_error: .text "SET ULTIMATE SYSTEM MODE TO MATCH FILE"
     .byte 0
 browser_empty: .text "NO .MUP FILES OR FOLDERS"
     .byte 0
@@ -247,6 +255,15 @@ browser_draw:
     inc browser_temp
     jmp !entry-
 !footer:
+    jsr browser_draw_profile
+    lda generic_error
+    cmp #8
+    bne !generic_error+
+    lda #<browser_standard_error
+    sta browser_text_ptr
+    lda #>browser_standard_error
+    jmp !message+
+!generic_error:
     lda generic_error
     beq !not_error+
     lda #<browser_error
@@ -278,6 +295,37 @@ browser_draw:
 browser_row_low: .fill 18, <($a4a0+i*40)
 browser_row_high: .fill 18, >($a4a0+i*40)
 
+browser_draw_profile:
+    lda browser_count
+    beq !done+
+    lda browser_selected
+    jsr browser_metadata_address
+    ldy #15
+    lda (browser_list_ptr),y
+    cmp #5
+    bcs !done+
+    tax
+    lda browser_profile_low,x
+    sta browser_text_ptr
+    lda browser_profile_high,x
+    sta browser_text_ptr+1
+    lda #<$a798
+    sta browser_screen_ptr
+    lda #>$a798
+    sta browser_screen_ptr+1
+    jsr browser_print
+!done:
+    rts
+browser_profile_low: .byte <browser_pal_sd,<browser_pal_sd,<browser_pal_hd,<browser_ntsc_sd,<browser_ntsc_hd
+browser_profile_high: .byte >browser_pal_sd,>browser_pal_sd,>browser_pal_hd,>browser_ntsc_sd,>browser_ntsc_hd
+browser_pal_sd: .text "PAL / HDMI SD (576P)"
+    .byte 0
+browser_pal_hd: .text "PAL / HDMI HD / FULLHD"
+    .byte 0
+browser_ntsc_sd: .text "NTSC / HDMI SD (480P)"
+    .byte 0
+browser_ntsc_hd: .text "NTSC / HDMI HD / FULLHD"
+    .byte 0
 browser_print:
     ldx #38
 browser_print_limited:
@@ -708,6 +756,10 @@ browser_load_container:
     bcc !counts_valid+
     jmp !bad+
 !counts_valid:
+    jsr browser_validate_machine
+    bcc !system_valid+
+    jmp !bad+
+!system_valid:
     // File pointer is now 256, precisely the start of the PCM-length table.
     lda active_stream_blocks
     sta bootstrap_length
@@ -810,6 +862,26 @@ browser_load_reu:
     rts
 browser_hex: .text "0123456789ABCDEF"
 
+// The file's HDMI scaling requirement is displayed in the browser. System
+// timing must already match: stock Commodore firmware cannot be assumed to
+// offer upstream UCI LOAD_CONFIG, and rendering with the wrong clock is unsafe.
+browser_validate_machine:
+    lda #0
+    ldx HEADER+80
+    cpx #3
+    bcc !system+
+    lda #1
+!system:
+    cmp hardware_standard
+    beq !valid+
+    lda #8
+    sta generic_error
+    sec
+    rts
+!valid:
+    clc
+    rts
+
 browser_validate_header:
     ldx #0
 !fixed:
@@ -830,24 +902,64 @@ browser_validate_header:
     beq !check_next+
     jmp !bad+
 !check_next:
+    lda HEADER+80
+    cmp #5
+    bcc !profile_known+
+    jmp !bad+
+!profile_known:
+    tax
+    lda HEADER+14
+    cmp browser_profile_width,x
+    beq !width_valid+
+    jmp !bad+
+!width_valid:
+    lda HEADER+15
+    cmp #1
+    beq !width_high_valid+
+    jmp !bad+
+!width_high_valid:
+    lda HEADER+20
+    cmp browser_profile_ticks,x
+    beq !ticks_valid+
+    jmp !bad+
+!ticks_valid:
     lda HEADER+7
     and #2
     beq !pcm16_offset+
     lda HEADER+37
     cmp #$60 // PCM8: $036000 leaves 40 KiB per stream block.
-    beq !check_next+
+    beq !offset_high+
     jmp !bad+
 !pcm16_offset:
+    lda HEADER+80
+    bne !source_pcm16+
     lda HEADER+37
-    cmp #$70 // PCM16: $037000 leaves 36 KiB per stream block.
-    beq !check_next+
+    cmp #$70 // Legacy PCM16: $037000 leaves 36 KiB.
+    beq !offset_high+
     jmp !bad+
-!check_next:
+!source_pcm16:
+    lda HEADER+37
+    cmp #$d0 // Source-rate PCM16: $02d000 leaves 76 KiB.
+    beq !source_offset_high+
+    jmp !bad+
+!source_offset_high:
+    lda HEADER+38
+    cmp #2
+    beq !validate_rate+
+    jmp !bad+
+!offset_high:
+    lda HEADER+38
+    cmp #3
+    beq !check_rate+
+    jmp !bad+
+!check_rate:
     lda HEADER+7
     and #2
-    beq !pcm8_valid+
-    // PCM8 uses the nearest physical divider for a nominal 8..48 kHz
-    // source. Keep legacy PCM16 metadata acceptance unchanged.
+    bne !validate_rate+
+    jmp !pcm8_valid+
+!validate_rate:
+    // Source-rate PCM8 and PCM16 use a nominal 8..48 kHz source.
+    // Preserve old PCM16 header acceptance for profile zero.
     lda HEADER+78
     ora HEADER+79
     beq !rate_low+
@@ -882,15 +994,28 @@ browser_validate_header:
     jmp !bad+
 !divider_maximum:
     lda HEADER+32
-    cmp #13 // up to 780 inclusive
+    cmp #13 // PCM8 max780; PCM16 max779 (different sampler tail).
+    bcc !divider_upper_tail+
+    jmp !bad+
+!divider_upper_tail:
+    cmp #12
     bcc !pcm8_valid+
+    lda HEADER+7
+    cmp #3
+    beq !pcm8_valid+
     jmp !bad+
 !divider_low:
     lda HEADER+33
     bne !pcm8_valid+
     lda HEADER+32
-    cmp #129
-    bcs !pcm8_valid+
+    cmp #128 // PCM16 at 48 kHz uses128; PCM8 needs at least129.
+    bcs !divider_lower_tail+
+    jmp !bad+
+!divider_lower_tail:
+    bne !pcm8_valid+
+    lda HEADER+7
+    cmp #3
+    bne !pcm8_valid+
     jmp !bad+
 !pcm8_valid:
     lda HEADER+26
@@ -1030,14 +1155,16 @@ browser_validate_header:
     sec
     rts
 browser_header_offsets:
-    .byte 0,1,2,3,4,5,6,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23
-    .byte 34,35,36,38,39,40,41,42,43,44,45,46,47,52,53,54,55
+    .byte 0,1,2,3,4,5,6,8,9,10,11,12,13,16,17,18,19,21,22,23
+    .byte 34,35,36,39,40,41,42,43,44,45,46,47,52,53,54,55
     .byte 60,61,64,65,73
 browser_header_values:
-    .byte 77,85,80,57,9,SPAN_VERSION,13,0,1,<WIDE_WIDTH,>WIDE_WIDTH,<WIDE_HEIGHT,>WIDE_HEIGHT,<ACTIVE_WIDTH,>ACTIVE_WIDTH,<ACTIVE_HEIGHT,>ACTIVE_HEIGHT,<ACTIVE_TOP,>ACTIVE_TOP,3,0,13,0
-    .byte 20,0,0,3,0,0,0,4,0,0,1,0,0,0,180,0,0
+    .byte 77,85,80,57,9,SPAN_VERSION,13,0,1,<WIDE_WIDTH,>WIDE_WIDTH,<WIDE_HEIGHT,>WIDE_HEIGHT,<ACTIVE_HEIGHT,>ACTIVE_HEIGHT,<ACTIVE_TOP,>ACTIVE_TOP,0,13,0
+    .byte 20,0,0,0,0,0,4,0,0,1,0,0,0,180,0,0
     .byte 0,0,0,0,0
 browser_header_values_end:
+browser_profile_width: .byte <356,<360,<360,<360,<360
+browser_profile_ticks: .byte 3,3,3,4,4
 
 // Semantic counts are checked before any payload DMA. Divider/geometry and
 // canonical offsets are validated separately; these divisions run only at OPEN.
@@ -1092,12 +1219,12 @@ browser_validate_counts:
     lda bootstrap_length+1
     bne !subtract_three+
     lda bootstrap_length
-    cmp #3
+    cmp HEADER+20
     bcc !three_remainder+
 !subtract_three:
     sec
     lda bootstrap_length
-    sbc #3
+    sbc HEADER+20
     sta bootstrap_length
     lda bootstrap_length+1
     sbc #0

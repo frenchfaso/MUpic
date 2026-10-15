@@ -118,11 +118,35 @@ export class EncoderCore {
   }
   abortLutAsset() {this.check(this.exports.mup_lut_asset_abort());}
   resetLut() { this.check(this.exports.mup_lut_reset()); }
-  begin(frameCount,pcm,title,{audioFormat='pcm16',sampleRate=22085}={}) {
+  resultWords() {
+    const e=this.exports,raw=this.bytes(e.mup_result_ptr(),e.mup_result_len()),view=new DataView(raw.buffer,raw.byteOffset,raw.byteLength);
+    return Array.from({length:raw.byteLength/4},(_,i)=>view.getUint32(i*4,true));
+  }
+  setProfile(profile) { this.check(this.exports.mup_set_profile(profile)); }
+  profileInfo(profile) {
+    this.check(this.exports.mup_profile_info(profile));
+    const [id,ticks,clockHz,lines,cyclesPerLine,pixelAspectNumerator,pixelAspectDenominator,rateBudget,maxFrames]=this.resultWords();
+    return {id,ticks,clockHz,lines,cyclesPerLine,pixelAspectNumerator,pixelAspectDenominator,rateBudget,maxFrames,
+      fps:clockHz/(lines*cyclesPerLine*ticks)};
+  }
+  fit(profile,width,height,sarNumerator=1,sarDenominator=1) {
+    this.check(this.exports.mup_fit(profile,width,height,sarNumerator,sarDenominator));
+    const [left,top,drawWidth,drawHeight]=this.resultWords();
+    return {left,top,width:drawWidth,height:drawHeight};
+  }
+  audioInfo(audioFormat,sampleRate) {
+    if(!['pcm16','pcm8'].includes(audioFormat))throw new Error('Unsupported audio format.');
+    this.check(this.exports.mup_audio_info(audioFormat==='pcm8'?8:16,sampleRate));
+    const [divider,rateNumerator,rateDenominator,audioOffset]=this.resultWords();
+    return {divider,rateNumerator,rateDenominator,audioOffset};
+  }
+  begin(frameCount,pcm,title,{audioFormat='pcm16',sampleRate=22085,profile}={}) {
     if(!['pcm16','pcm8'].includes(audioFormat))throw new Error('Unsupported audio format.');
     const titleBytes=new TextEncoder().encode(title), pcmPointer=this.allocate(pcm), titlePointer=this.allocate(titleBytes);
     try {
-      this.check(audioFormat==='pcm8'
+      this.check(profile!==undefined
+        ?this.exports.mup_begin_profile(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength,sampleRate,audioFormat==='pcm8'?8:16,profile)
+        :audioFormat==='pcm8'
         ?this.exports.mup_begin_pcm8(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength,sampleRate)
         :this.exports.mup_begin(frameCount,pcmPointer,pcm.byteLength,titlePointer,titleBytes.byteLength));
     }

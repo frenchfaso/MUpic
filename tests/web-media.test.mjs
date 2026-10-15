@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
-import {videoPlan,asciiTitle,interleavePcm,automaticGainDb,audioTrackPresence,audioSourceSampleRate,decodePcm,decodePcm8Source,awaitAbort,SAMPLE_RATE,MAX_FRAMES} from '../site/media.mjs';
+import {videoPlan,asciiTitle,interleavePcm,automaticGainDb,audioTrackPresence,audioSourceSampleRate,decodePcm,decodePcm8Source,decodePcmSource,awaitAbort,SAMPLE_RATE,MAX_FRAMES} from '../site/media.mjs';
 import {CONTENT_FPS} from '../site/mup-decoder.mjs';
 test('16:9 fits the native SD active area without stretching',()=>{
   const plan=videoPlan(60,1920,1080);assert.equal(plan.width,356);assert.equal(plan.height,200);assert.equal(plan.left,2);assert.equal(plan.top,0);
@@ -102,7 +102,9 @@ test('PCM8 rejects unknown, truncated, ambiguous and unsupported stream metadata
   for(const source of [new Blob(['unknown source']),mp4(mp4Track('vide'),mp4Track('soun')),mp4(aacTrack(48000)),mp4(aacTrack(44100,Uint8Array.of(0x12,0x10),{codec:'ac-3'})),webmAudio('A_FLAC',44100)])
     await assert.rejects(audioSourceSampleRate(source),/native CLI/);
   const truncated=mp4(aacTrack(44100));await assert.rejects(audioSourceSampleRate(truncated.slice(0,truncated.size-1)),/native CLI/);
-  await assert.rejects(audioSourceSampleRate(webmAudio('A_VORBIS',96000)),/96000 Hz.*Choose PCM16/);
+  await assert.rejects(audioSourceSampleRate(webmAudio('A_VORBIS',96000)),/96000 Hz.*Resample/);
+  for(const rate of [NaN,Infinity,-Infinity,44100.5])await assert.rejects(audioSourceSampleRate(webmAudio('A_VORBIS',rate)),/Invalid audio frequency/);
+  for(const rate of [0,-1,7999,48001])await assert.rejects(audioSourceSampleRate(webmAudio('A_VORBIS',rate)),/8 to 48 kHz/);
 });
 test('MP4 and MOV handler metadata distinguishes absent audio from undecodable tracks',async()=>{
   assert.equal(await audioTrackPresence(mp4(mp4Track('vide'))),false);
@@ -173,6 +175,26 @@ test('PCM8 supports the 8 kHz sampler rate below OfflineAudioContext minimum wit
 });
 test('PCM8 video-only sources produce empty audio without requiring browser audio contexts',async()=>{
   assert.deepEqual(await decodePcm8Source(mp4(mp4Track('vide')),0.12),{pcm:new Uint8Array(0),sampleRate:SAMPLE_RATE});
+  assert.deepEqual(await decodePcmSource(mp4(mp4Track('vide')),0.12),{pcm:new Uint8Array(0),sampleRate:44100});
+});
+test('PCM16 preserves source rate and the shared hardware clock without browser-side quantization',async t=>{
+  const left=Float32Array.of(0.25,-0.75),right=Float32Array.of(-0.5,0.125),calls=mockPcm8Audio(t,{left,right});
+  const rateNumerator=6250000,rateDenominator=142,actual=rateNumerator/rateDenominator;
+  const result=await decodePcmSource(mp4(aacTrack(44100)),2/actual,{audioInfo:async rate=>{
+    assert.equal(rate,44100);return {rateNumerator,rateDenominator};
+  }});
+  assert.equal(result.sampleRate,44100);assert.equal(calls.decodeRate,44100);
+  assert.equal(calls.samples,2);assert.equal(calls.playbackRate,calls.rate/actual);
+  const view=new DataView(result.pcm.buffer);
+  assert.deepEqual(Array.from({length:4},(_,i)=>view.getFloat32(i*4,true)),[0.25,-0.5,-0.75,0.125]);
+});
+test('profile plans use shared fitting, cadence and per-profile duration limits',()=>{
+  const profile={id:4,fps:1022730/(65*263*4),ticks:4,maxFrames:16383},fit={left:0,top:15,width:360,height:169};
+  const plan=videoPlan(2,1920,1080,{profile,fit});
+  assert.equal(plan.frameCount,30);assert.equal(plan.duration,30/profile.fps);
+  for(const key of ['left','top','width','height'])assert.equal(plan[key],fit[key]);
+  assert.equal(plan.estimatedBytes,65536+6*262144);
+  assert.throws(()=>videoPlan((profile.maxFrames+1)/profile.fps,1920,1080,{profile,fit}),/profile supports/);
 });
 test('audio decoding automatically normalizes rendered PCM and retains the full planned duration',async t=>{
   const left=Float32Array.of(0,0.125,0.25,0),right=Float32Array.of(0,-0.125,-0.25,0),calls=mockAudio(t,{left,right});

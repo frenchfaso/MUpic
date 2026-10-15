@@ -25,6 +25,7 @@ try {
       '--threads', '2', '--no-cache', '--title', 'PCM8 parity'], { stdio: ['ignore', 'pipe', 'inherit'] });
     const native = fs.readFileSync(target);
     assert.equal(native[7], 3);
+    assert.equal(native[80], 2);
     assert.equal(native.readUInt32LE(76), rate);
     assert.equal(native.readUInt32LE(36), 221184);
     const count = native.readUInt32LE(68), divider = native.readUInt16LE(32);
@@ -37,10 +38,10 @@ try {
       `atrim=duration=${seconds},apad=whole_dur=${seconds},asetrate=${rate * (divider * 2 + 3)},aresample=12500000,asetrate=${Math.round(actualRate)}`,
       '-ac', '2', '-f', 'f32le', 'pipe:1']);
     const rgb = run(['-ss', '0', '-i', source, '-an', '-vf',
-      `tpad=stop_mode=clone:stop_duration=${seconds},fps=${fps},scale=356:200:flags=lanczos,setsar=1,pad=360:200:2:0:black,format=rgb24`,
+      `tpad=stop_mode=clone:stop_duration=${seconds},fps=${fps},scale=360:190:flags=lanczos,setsar=1,pad=360:200:0:5:black,format=rgb24`,
       '-frames:v', String(count), '-f', 'rawvideo', '-pix_fmt', 'rgb24', 'pipe:1']);
     const title = Buffer.from('PCM8 parity'), tp = put(title), ap = put(pcm);
-    check(e.mup_begin_pcm8(count, ap, pcm.length, tp, title.length, rate));
+    check(e.mup_begin_profile(count, ap, pcm.length, tp, title.length, rate, 8, 2));
     e.mup_free(ap, pcm.length); e.mup_free(tp, title.length);
     const blocks = [];
     const drain = () => { if (e.mup_output_len()) { blocks.push(bytes(e.mup_output_ptr(), e.mup_output_len())); e.mup_output_clear(); } };

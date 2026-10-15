@@ -110,3 +110,18 @@ test('cancelling a shared batch cannot restore buffers to a closed pool',async()
   await new Promise(resolve=>setImmediate(resolve));pool.close();await rejected;
   assert.equal(pool.freeBuffers.length,0);
 });
+test('profile changes configure existing workers and are inherited by lazily created workers',async t=>{
+  const calls=[];
+  FakeWorker.prototype.handle=function({id,method,args}) {
+    calls.push({worker:this,method,args});
+    queueMicrotask(()=>this.onmessage({data:{id,result:method==='init'?{module:'shared-module'}:undefined}}));
+  };
+  t.after(()=>{delete FakeWorker.prototype.handle;});
+  const pool=new QuantizerPool(3,'worker.mjs');await pool.init('encoder.wasm');
+  await pool.setProfile(4);await pool.ensureWorkers();
+  assert.equal(calls.filter(call=>call.method==='setProfile').length,1);
+  assert.deepEqual(calls.filter(call=>call.method==='init').slice(1).map(call=>call.args.profile),[4,4]);
+  await pool.setProfile(1);
+  assert.equal(calls.filter(call=>call.method==='setProfile'&&call.args.profile===1).length,3);
+  assert.equal(pool.profile,1);pool.close();
+});

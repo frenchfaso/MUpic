@@ -1,8 +1,16 @@
-import {CONTENT_FPS} from './mup-decoder.mjs';
+import {CONTENT_FPS} from './mup-decoder.mjs?v=bf988c9a98d52290';
 export const SAMPLE_RATE = 22085;
 export const MAX_FRAMES = 21845;
-export function videoPlan(duration,width,height) {
+export function videoPlan(duration,width,height,options) {
   if(!Number.isFinite(duration) || duration<=0 || width<=0 || height<=0) throw new Error('This video has no readable duration or picture.');
+  if(options) {
+    const {profile,fit}=options;
+    const frameCount=Math.ceil(duration*profile.fps);
+    if(frameCount<2)throw new Error(`Please choose a video at least ${(2/profile.fps).toFixed(2)} seconds long.`);
+    if(frameCount>profile.maxFrames)throw new Error(`This profile supports videos up to about ${Math.floor(profile.maxFrames/profile.fps/60)} minutes. Split this video with the native CLI.`);
+    return {...fit,profile,fps:profile.fps,frameCount,duration:frameCount/profile.fps,
+      estimatedBytes:65536+Math.ceil(frameCount*profile.ticks/20)*262144};
+  }
   const frameCount=Math.ceil(duration*CONTENT_FPS);
   if(frameCount<2) throw new Error('Please choose a video at least 0.12 seconds long.');
   if(frameCount>MAX_FRAMES) throw new Error('The current C64 player supports videos up to about 21 minutes 47 seconds. Split this video with the native CLI.');
@@ -300,7 +308,7 @@ export async function audioSourceSampleRate(file,{signal}={}) {
     else if(new DataView(header.buffer).getUint32(0)===0x1a45dfa3)rate=await webmSourceRate(file,signal);
     else throw new ContainerError('Unknown audio container.');
     if(!Number.isInteger(rate)) throw new ContainerError('Invalid audio frequency.');
-    if(rate<8000 || rate>48000) throw new Error(`PCM8 preserves source frequencies from 8 to 48 kHz; this audio is ${rate} Hz. Choose PCM16 for this file.`);
+    if(rate<8000 || rate>48000) throw new Error(`PCM audio preserves source frequencies from 8 to 48 kHz; this audio is ${rate} Hz. Resample the source before encoding.`);
     return rate;
   } catch(error) {
     if(error instanceof ContainerError) throw new Error(`The original audio frequency could not be read safely (${error.message}). Please use the native CLI for this file.`);
@@ -308,8 +316,14 @@ export async function audioSourceSampleRate(file,{signal}={}) {
   }
 }
 export async function decodePcm8Source(file,duration,{signal}={}) {
+  return decodePcmSource(file,duration,{signal,silentSampleRate:SAMPLE_RATE,audioInfo:sampleRate=>{
+    const divider=Math.round(6250000/sampleRate-1.5);
+    return {rateNumerator:12500000,rateDenominator:divider*2+3};
+  }});
+}
+export async function decodePcmSource(file,duration,{signal,audioInfo,silentSampleRate=44100}={}) {
   const sampleRate=await audioSourceSampleRate(file,{signal});
-  if(sampleRate===null)return {pcm:new Uint8Array(0),sampleRate:SAMPLE_RATE};
+  if(sampleRate===null)return {pcm:new Uint8Array(0),sampleRate:silentSampleRate};
   const Context=globalThis.AudioContext || globalThis.webkitAudioContext,Offline=globalThis.OfflineAudioContext || globalThis.webkitOfflineAudioContext;
   if(!Context || !Offline) throw new Error('This browser cannot decode audio. Please use the native CLI.');
   let context,decoded;
@@ -322,7 +336,9 @@ export async function decodePcm8Source(file,duration,{signal}={}) {
     throw new Error('The browser could not decode this file\'s audio at its original frequency. Please use the native CLI.');
   } finally {if(context)await context.close();}
   checkAbort(signal);
-  const divisor=Math.round(6250000/sampleRate-1.5),actualRate=6250000/(divisor+1.5),renderRate=Math.max(8000,Math.round(actualRate)),samples=Math.round(duration*actualRate);
+  const {rateNumerator,rateDenominator}=await awaitAbort(audioInfo(sampleRate),signal);
+  checkAbort(signal);
+  const actualRate=rateNumerator/rateDenominator,renderRate=Math.max(8000,Math.round(actualRate)),samples=Math.round(duration*actualRate);
   const offline=new Offline(2,samples,renderRate),source=offline.createBufferSource();
   source.buffer=decoded;source.playbackRate.value=renderRate/actualRate;source.connect(offline.destination);source.start();
   const rendered=await awaitAbort(offline.startRendering(),signal);decoded=null;checkAbort(signal);

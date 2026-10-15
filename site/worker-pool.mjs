@@ -26,7 +26,7 @@ export class QuantizerPool {
   constructor(count,url,{eager=false,shared=globalThis.crossOriginIsolated===true&&typeof SharedArrayBuffer==='function'}={}) {
     if(!Number.isInteger(count)||count<1)throw new Error('Worker count must be positive.');
     this.count=count;this.url=url;this.closed=false;this.lutReady=false;this.pending=Promise.resolve();
-    this.shared=shared&&count>1;this.sharedLut=null;this.freeBuffers=[];
+    this.shared=shared&&count>1;this.sharedLut=null;this.freeBuffers=[];this.profile=undefined;
     this.workers=Array.from({length:eager?count:1},()=>new WorkerClient(url));
   }
   async init(wasmUrl) {
@@ -44,10 +44,17 @@ export class QuantizerPool {
     this.checkOwner();const additions=[];
     this.workers=this.workers.filter(worker=>!worker.closed);
     while(this.workers.length<count){const worker=new WorkerClient(this.url);this.workers.push(worker);additions.push(worker);}
-    try{await Promise.all(additions.map(worker=>worker.call('init',{url:this.wasmUrl,module:this.module,sharedLut:this.sharedLut})));}
+    try{await Promise.all(additions.map(worker=>worker.call('init',{url:this.wasmUrl,module:this.module,sharedLut:this.sharedLut,profile:this.profile})));}
     catch(error){for(const worker of additions)worker.close(error);throw error;}
   }
   stopLut(){this.loadingController?.abort();}
+  async setProfile(profile) {
+    await this.pending;this.checkOwner();
+    await Promise.all(this.workers.map(worker=>worker.call('setProfile',{profile})));
+    this.profile=profile;
+  }
+  videoPlan(profile,width,height) {this.checkOwner();return this.workers[0].call('videoPlan',{profile,width,height});}
+  audioInfo(audioFormat,sampleRate) {this.checkOwner();return this.workers[0].call('audioInfo',{audioFormat,sampleRate});}
   async loadLut(manifestUrl,{signal,onProgress,cacheOptions,fetch}={}) {
     this.checkOwner();if(this.loadingController)throw new Error('The color table is already loading.');
     const controller=new AbortController();this.loadingController=controller;

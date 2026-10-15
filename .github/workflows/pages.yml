@@ -2,7 +2,7 @@ name: Publish demo and converter
 on:
   push:
     branches: [main]
-    paths: ['site/**', 'media/**', 'releases/**', 'tools/build_demo.py', 'tools/package_disk.py', 'tools/stage_media.py', '.github/workflows/pages.yml']
+    paths: ['site/**', 'media/**', 'releases/**', 'tools/build_demo.py', 'tools/package_disk.py', 'tools/stage_media.py', 'tools/package_lut.py', 'tools/audit_publication.py', '.github/workflows/pages.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -18,6 +18,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           lfs: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: python3 tools/audit_publication.py
       - run: sudo apt-get update && sudo apt-get install -y mtools
       - run: python3 tools/build_demo.py
       - uses: actions/configure-pages@v5

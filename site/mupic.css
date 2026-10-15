@@ -5,6 +5,7 @@ body[data-preset="converter"] main {
   align-items: stretch;
   justify-content: flex-start;
   max-width: 1120px;
+  position: relative;
   padding: 32px 24px 28px;
 }
 .page-title { margin: 0 0 28px; text-align: center; }
@@ -17,13 +18,16 @@ body[data-preset="converter"] main {
   letter-spacing: -.04em;
   text-wrap: balance;
 }
+.page-expansion { margin: 2px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .page-subtitle { margin: 6px 0 0; color: var(--muted); font-size: clamp(12px, 1.8vw, 15px); line-height: 1.5; }
-.project-nav { display: flex; justify-content: center; gap: 24px; margin-top: 16px; font-size: 12px; line-height: 1.5; }
+.project-nav { position: absolute; top: 32px; right: 24px; display: flex; justify-content: flex-end; gap: 24px; margin: 0; font-size: 12px; line-height: 1.5; }
 .project-nav a, .tech-credit a { color: var(--yellow); text-decoration: none; }
 .project-nav a:hover, .tech-credit a:hover { color: var(--cyan); text-decoration: underline; text-underline-offset: 5px; }
 .project-nav [aria-current="page"] { color: var(--cyan); text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 5px; }
 .project-nav a:focus-visible, .tech-credit a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 5px; }
-.tech-credit { max-width: 700px; margin: 16px auto 0; text-align: center; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.tech-credit { max-width: 960px; margin: 16px auto 0; text-align: center; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.tech-credit p { margin: 0; }
+.tech-credit p + p { margin-top: 6px; }
 body[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(280px, calc(107.95848vh - 300px))); }
 .player-keys { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px 18px; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
 .player-keys span { white-space: nowrap; }
@@ -44,7 +48,7 @@ body[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(280px, c
 .mobile-player-key { min-width: 44px; min-height: 44px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 2px; color: var(--yellow); background: var(--surface); font-size: 12px; touch-action: manipulation; }
 .mobile-player-key:active { border-color: var(--cyan); color: var(--cyan); }
 body.keyboard-active[data-preset="mupic"] main { min-height: 0; padding-top: 16px; padding-bottom: 16px; }
-body.keyboard-active .page-title, body.keyboard-active .tech-credit, body.keyboard-active .main-controls { display: none; }
+body.keyboard-active .page-title, body.keyboard-active .project-nav, body.keyboard-active .tech-credit, body.keyboard-active .main-controls { display: none; }
 body.keyboard-active[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(128px, calc((var(--player-viewport-height, 100dvh) - 104px) * 1.0795848))); }
 @supports (height: 100svh) {
   body[data-preset="mupic"] .hardware-stage { width: min(100%, 960px, max(280px, calc(107.95848svh - 300px))); }
@@ -52,6 +56,7 @@ body.keyboard-active[data-preset="mupic"] .hardware-stage { width: min(100%, 960
 @media (max-width: 640px) {
   body[data-preset="mupic"] main, body[data-preset="converter"] main { padding: 20px 16px 24px; }
   .page-title { margin-bottom: 24px; }
+  .project-nav { position: static; justify-content: center; margin-bottom: 18px; }
   body[data-preset="mupic"] .hardware-stage { width: 100%; }
   .player-keys { gap: 4px 12px; font-size: 10px; }
   .progress-dialog { padding: 22px; }

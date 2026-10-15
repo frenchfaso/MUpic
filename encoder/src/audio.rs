@@ -1,9 +1,12 @@
-//! Shared audio quantization and exact cumulative PAL sampler timing.
+//! Shared audio quantization and exact cumulative PAL/NTSC sampler timing.
+#[cfg(test)]
 const PAL_PHI2_HZ: u64 = 985248;
+#[cfg(test)]
 const PAL_FRAME_PHI2: u64 = 312 * 63;
 const SAMPLER_CLOCK_HZ: u64 = 6250000;
 
 pub const PCM8_AUDIO_OFFSET: usize = 221184;
+pub const PCM16_SOURCE_AUDIO_OFFSET: usize = 184320;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioFormat {
@@ -17,6 +20,7 @@ pub struct AudioConfig {
     format: AudioFormat,
     source_rate: u32,
     divider: u16,
+    source_clock: bool,
 }
 impl Default for AudioConfig {
     fn default() -> Self {
@@ -24,20 +28,33 @@ impl Default for AudioConfig {
             format: AudioFormat::Pcm16,
             source_rate: crate::AUDIO_RATE,
             divider: crate::AUDIO_DIVIDER,
+            source_clock: false,
         }
     }
 }
 impl AudioConfig {
+    pub fn pcm16(source_rate: u32) -> Result<Self, String> {
+        Self::source(AudioFormat::Pcm16, source_rate)
+    }
     pub fn pcm8(source_rate: u32) -> Result<Self, String> {
+        Self::source(AudioFormat::Pcm8, source_rate)
+    }
+    pub fn source(format: AudioFormat, source_rate: u32) -> Result<Self, String> {
         if !(8000..=48000).contains(&source_rate) {
-            return Err("PCM8 preserves source rates from 8000 to 48000 Hz; this source is outside that range".into());
+            return Err("Audio preserves source rates from 8000 to 48000 Hz; this source is outside that range".into());
         }
         // Hardware PCM8 uses a half-cycle rather than PCM16's full-cycle tail.
-        let divider = (SAMPLER_CLOCK_HZ as f64 / f64::from(source_rate) - 1.5).round() as u16;
+        let tail = if format == AudioFormat::Pcm8 {
+            1.5
+        } else {
+            2.0
+        };
+        let divider = (SAMPLER_CLOCK_HZ as f64 / f64::from(source_rate) - tail).round() as u16;
         Ok(Self {
-            format: AudioFormat::Pcm8,
+            format,
             source_rate,
             divider,
+            source_clock: true,
         })
     }
     pub fn format(self) -> AudioFormat {
@@ -52,6 +69,8 @@ impl AudioConfig {
     pub fn audio_offset(self) -> usize {
         if self.format == AudioFormat::Pcm8 {
             PCM8_AUDIO_OFFSET
+        } else if self.source_clock {
+            PCM16_SOURCE_AUDIO_OFFSET
         } else {
             crate::AUDIO_OFFSET
         }
@@ -76,10 +95,13 @@ impl AudioConfig {
         f64::from(numerator) / f64::from(denominator)
     }
     pub fn sample_at_tick(self, tick: usize) -> usize {
+        self.sample_at_tick_profile(tick, crate::VideoProfile::LegacyPalSd)
+    }
+    pub fn sample_at_tick_profile(self, tick: usize, profile: crate::VideoProfile) -> usize {
         let (rate, divisor) = self.rate_ratio();
         round_ratio(
-            tick as u128 * u128::from(rate) * u128::from(PAL_FRAME_PHI2),
-            u128::from(divisor) * u128::from(PAL_PHI2_HZ),
+            tick as u128 * u128::from(rate) * u128::from(profile.refresh_cycles()),
+            u128::from(divisor) * u128::from(profile.phi2_hz()),
         )
     }
 }
@@ -135,6 +157,34 @@ pub fn prepare_pcm8_hq(raw_f32_interleaved: &[u8], source_rate: u32) -> Result<V
         }
     }
     Ok(output)
+}
+
+/// Source-rate stereo Float32LE to PCM16 with the same -6 dBFS peak target
+/// as PCM8. Scaling before integer conversion prevents clipping/wraparound.
+pub fn prepare_pcm16(raw: &[u8]) -> Result<Vec<u8>, String> {
+    if !raw.len().is_multiple_of(8) {
+        return Err("PCM16 input must be stereo Float32LE".into());
+    }
+    let mut peak = 0.0_f64;
+    for bytes in raw.chunks_exact(4) {
+        let value = f32::from_le_bytes(bytes.try_into().unwrap());
+        if !value.is_finite() {
+            return Err("PCM16 input contains a non-finite audio sample".into());
+        }
+        peak = peak.max(f64::from(value).abs());
+    }
+    let gain = if peak == 0.0 {
+        0.0
+    } else {
+        10.0_f64.powf(-6.0 / 20.0) / peak
+    };
+    Ok(raw
+        .chunks_exact(4)
+        .flat_map(|bytes| {
+            let sample = f32::from_le_bytes(bytes.try_into().unwrap());
+            ((f64::from(sample) * gain * 32768.0).round_ties_even() as i16).to_le_bytes()
+        })
+        .collect())
 }
 
 fn quantize(input: &[u8], coefficients: &[f64], gain: f64, output: &mut [u8]) -> bool {
@@ -365,6 +415,36 @@ const SHIBATA: &[(u32, &[f64])] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcm16_source_clock_and_normalization_preserve_headroom() {
+        for rate in [8000, 11025, 16000, 22050, 32000, 44100, 48000] {
+            let audio = AudioConfig::pcm16(rate).unwrap();
+            assert_eq!(audio.source_rate(), rate);
+            assert_eq!(audio.audio_offset(), PCM16_SOURCE_AUDIO_OFFSET);
+            for profile in [crate::VideoProfile::PalHd, crate::VideoProfile::NtscHd] {
+                for start in (0..65535).step_by(20) {
+                    let end = (start + 20).min(65535);
+                    let bytes = (audio.sample_at_tick_profile(end, profile)
+                        - audio.sample_at_tick_profile(start, profile))
+                        * 4;
+                    assert!(bytes <= crate::CACHE_BYTES - audio.audio_offset());
+                }
+            }
+        }
+        let input: Vec<u8> = [4.0_f32, -4.0, 2.0, -2.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let output = prepare_pcm16(&input).unwrap();
+        let values: Vec<i16> = output
+            .chunks_exact(2)
+            .map(|v| i16::from_le_bytes(v.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, [16423, -16423, 8211, -8211]);
+        assert_eq!(prepare_pcm16(&[0; 16]).unwrap(), [0; 8]);
+        assert!(prepare_pcm16(&f32::NAN.to_le_bytes().repeat(2)).is_err());
+    }
 
     #[test]
     fn hq_matches_audio_lab_known_vectors_and_signed_hardware_bytes() {

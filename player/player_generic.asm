@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// 360x200 dictionary/SKIP/RAW PAL3 standalone player.
+// 360x200 dictionary/SKIP/RAW PAL3 / NTSC4 standalone player.
 // UPIC1.3: Aleksi Eeben's indexed LDX / eighth-pair immediate LDX,
 // 126 CPU slots per sixteen dots and the corrected two-NOP footer.
 // UCI streams video and PCM through two REU cache slots.
@@ -63,9 +63,9 @@
 .label browser_temp=$070d
 .label browser_limit=$070e
 .label playback_paused=$070f
-.label pause_request=$0710 // 1=pause, 2=resume, applied at the next PAL setup IRQ
-.label audio_tick_count=$0715 // elapsed PAL ticks in this PCM block, including before pauses
-.label audio_resume_offset=$0716 // u16, stereo-frame aligned byte offset
+.label pause_request=$0710 // 1=pause, 2=resume, applied at the next setup IRQ
+.label audio_tick_count=$0715 // elapsed refresh ticks in this PCM block, including before pauses
+.label audio_resume_offset=$0732 // u24, stereo-frame aligned byte offset
 .label audio_resume_active=$0718
 .label audio_calc_samples=$071b // u16
 .label audio_calc_sum=$071d // u24 numerator, then quotient
@@ -78,6 +78,9 @@
 .label browser_multiplier=$072d // u16
 .label browser_digits=$072f
 .label browser_leading=$0730
+.label hardware_standard=$0731 // 0=PAL, 1=NTSC, 255=unsupported raster timing
+.label audio_calc_samples_high=$0735
+.label browser_metadata_clock=$0736 // u24 browsing-only divisor
 .const DIRECTORY_METADATA=$3a00 // 96 cached, formatted 16-byte rows; inside overlay
 .const DIRECTORY_ENTRIES=$4400
 .const DIRECTORY_CAPACITY=96
@@ -191,8 +194,8 @@ start:
     sta $dc0e
     sta $dc0f
     // Stock Ultimate firmware holds turbo for 2.06 seconds after reset.
-    // This wait precedes playback and matches the proven legacy startup.
-    ldx #110
+    // 125 wraps cover that interval even at the faster NTSC refresh rate.
+    ldx #125
 !wrap:
     bit $d011
     bpl !wrap-
@@ -1244,6 +1247,41 @@ lz_prefix_divide:
     pla
     tax
     rts
+// Measure one frame with CIA1 PHI2 timing. PAL-N, PAL-60 and old NTSC
+// have different frame lengths and are deliberately not accepted as PAL/NTSC.
+detect_video_standard:
+!high:
+    bit $d011
+    bpl !high-
+!start:
+    bit $d011
+    bmi !start-
+    lda #$ff
+    sta $dc04
+    sta $dc05
+    lda #$11
+    sta $dc0e
+!frame_high:
+    bit $d011
+    bpl !frame_high-
+!end:
+    bit $d011
+    bmi !end-
+    lda #0
+    sta $dc0e
+    ldx #$ff
+    lda $dc05
+    cmp #$b3 // 65535 - 312*63
+    bne !ntsc+
+    ldx #0
+    beq !done+
+!ntsc:
+    cmp #$bd // 65535 - 263*65
+    bne !done+
+    ldx #1
+!done:
+    stx hardware_standard
+    rts
 .label low_program_end = *
 .assert "Wide resident program overlaps page framebuffer", * <= $1800, true
 
@@ -1299,6 +1337,7 @@ generic_browser:
     sta audio_resume_active
     sta audio_resume_offset
     sta audio_resume_offset+1
+    sta audio_resume_offset+2
     jsr browser_main
     lda #0
     ldx #$7f
@@ -1375,20 +1414,29 @@ generic_audio_length:
     sta $df06
     lda #$91
     sta $df01
+    // A source-rate PCM16 block can exceed 64 KiB. Bound its u24
+    // length by the actual space left after the validated header offset.
+    sec
+    lda #0
+    sbc HEADER+36
+    sta bootstrap_length
+    lda #0
+    sbc HEADER+37
+    sta bootstrap_length+1
+    lda #4
+    sbc HEADER+38
+    sta bootstrap_length+2
     lda active_audio_length+2
+    cmp bootstrap_length+2
+    bcc !bounded+
     bne !bad+
-    ldx #$90 // PCM16 reserves 36 KiB; PCM8 reserves 40 KiB.
-    lda HEADER+7
-    and #2
-    beq !limit+
-    ldx #$a0
-!limit:
-    stx bootstrap_length
     lda active_audio_length+1
-    cmp bootstrap_length
+    cmp bootstrap_length+1
     bcc !bounded+
     bne !bad+
     lda active_audio_length
+    cmp bootstrap_length
+    bcc !bounded+
     bne !bad+
 !bounded:
     lda active_audio_length
@@ -1404,6 +1452,7 @@ generic_audio_length:
 !aligned:
     lda active_audio_length
     ora active_audio_length+1
+    ora active_audio_length+2
     beq !bad+
     rts
 !bad:
@@ -1443,7 +1492,7 @@ audio_prepare:
         adc audio_resume_offset+1
         sta audio_calc_sum+1
         lda HEADER+38
-        adc #0
+        adc audio_resume_offset+2
         sta audio_calc_sum+2
         .if (voice==1) {
             ldx #2
@@ -1475,20 +1524,16 @@ audio_prepare:
         sta base+7
         lda #1
         sta base+4
-        lda active_audio_length+2
-        sta base+9
-        lda active_audio_length+1
-        ldx active_audio_length
-        pha
-        txa
         sec
+        lda active_audio_length
         sbc audio_resume_offset
-        tax
-        pla
+        sta base+11
+        lda active_audio_length+1
         sbc audio_resume_offset+1
         sta base+10
-        txa
-        sta base+11
+        lda active_audio_length+2
+        sbc audio_resume_offset+2
+        sta base+9
         lda HEADER+33
         sta base+14
         lda HEADER+32
@@ -1499,6 +1544,7 @@ audio_prepare:
     lda #0
     sta audio_resume_offset
     sta audio_resume_offset+1
+    sta audio_resume_offset+2
     sta audio_resume_active
     rts
 audio_start:
@@ -1765,7 +1811,7 @@ lz_copy_group:
 .label buffered_shadow_end = *
 .assert "Dictionary decoder exceeds shadowRAM", * <= CHUNK_BUFFER, true
 
-* = $fc00 "Single PAL frame IRQ with primary UPIC1.3 raster polling"
+* = $fc00 "PAL/NTSC frame IRQ with primary UPIC1.3 raster polling"
 frame_irq:
     pha
     txa

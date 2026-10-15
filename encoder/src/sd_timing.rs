@@ -276,7 +276,7 @@ mod tests {
         }
         assert_eq!(
             format!("{:x}", digest.finalize()),
-            "e6a09484cc64be9a98bd82fb15a5e63fc39553cfa5748441e2a404e76463e13f",
+            "656d44e35c2a9324d2fd81784557dd61542d11891a59bb11b6ab740f9b87904a",
             "Player assembly changed: rerun assembled decoder timing calibration"
         );
     }

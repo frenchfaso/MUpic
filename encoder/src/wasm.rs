@@ -87,6 +87,7 @@ pub extern "C" fn mup_begin(
         let title = std::str::from_utf8(r.input(title, title_length)?)
             .map_err(|_| "Title must be ASCII")?
             .to_owned();
+        r.quantizer()?.set_profile(VideoProfile::LegacyPalSd);
         r.encoder = Some(Encoder::new(frames, pcm, title)?);
         r.result.clear();
         Ok(())
@@ -108,6 +109,7 @@ pub extern "C" fn mup_begin_pcm8(
         let title = std::str::from_utf8(r.input(title, title_length)?)
             .map_err(|_| "Title must be ASCII")?
             .to_owned();
+        r.quantizer()?.set_profile(VideoProfile::LegacyPalSd);
         r.encoder = Some(Encoder::with_audio(frames, pcm, title, audio)?);
         r.result.clear();
         Ok(())
@@ -127,6 +129,106 @@ pub extern "C" fn mup_pcm8_info(source_rate: u32) -> i32 {
         .into_iter()
         .flat_map(u32::to_le_bytes)
         .collect();
+        Ok(())
+    })
+}
+/// Profile metadata: id, ticks, clock, lines, cycles/line, pixel aspect
+/// numerator/denominator, decoder budget, maximum frame count (all u32LE).
+#[no_mangle]
+pub extern "C" fn mup_profile_info(id: u32) -> i32 {
+    operation(|r| {
+        let p = VideoProfile::try_from(id)?;
+        let (pn, pd) = p.pixel_aspect();
+        r.result = [
+            id,
+            p.frame_ticks() as u32,
+            p.phi2_hz(),
+            p.raster_lines(),
+            p.cycles_per_line(),
+            pn,
+            pd,
+            p.rate_budget() as u32,
+            p.max_frames() as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_fit(id: u32, width: u32, height: u32, sar_num: u32, sar_den: u32) -> i32 {
+    operation(|r| {
+        let fit = VideoProfile::try_from(id)?.fit(width, height, sar_num, sar_den)?;
+        r.result = [
+            fit.left as u32,
+            fit.top as u32,
+            fit.width as u32,
+            fit.height as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        Ok(())
+    })
+}
+#[no_mangle]
+pub extern "C" fn mup_set_profile(id: u32) -> i32 {
+    operation(|r| {
+        r.quantizer()?.set_profile(VideoProfile::try_from(id)?);
+        Ok(())
+    })
+}
+fn audio_format(format: u32) -> Result<AudioFormat, String> {
+    match format {
+        8 => Ok(AudioFormat::Pcm8),
+        16 => Ok(AudioFormat::Pcm16),
+        _ => Err("Audio format must be 8 or 16".into()),
+    }
+}
+#[no_mangle]
+pub extern "C" fn mup_audio_info(format: u32, source_rate: u32) -> i32 {
+    operation(|r| {
+        let audio = AudioConfig::source(audio_format(format)?, source_rate)?;
+        let (n, d) = audio.rate_ratio();
+        r.result = [
+            u32::from(audio.divider()),
+            n,
+            d,
+            audio.audio_offset() as u32,
+        ]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+        Ok(())
+    })
+}
+/// Both formats accept stereo Float32LE resampled to the exact hardware rate.
+#[no_mangle]
+pub extern "C" fn mup_begin_profile(
+    frames: usize,
+    float_pointer: usize,
+    float_bytes: usize,
+    title: usize,
+    title_length: usize,
+    source_rate: u32,
+    format: u32,
+    id: u32,
+) -> i32 {
+    operation(|r| {
+        let profile = VideoProfile::try_from(id)?;
+        let audio = AudioConfig::source(audio_format(format)?, source_rate)?;
+        let raw = r.input(float_pointer, float_bytes)?;
+        let pcm = match audio.format() {
+            AudioFormat::Pcm8 => prepare_pcm8_hq(raw, source_rate)?,
+            AudioFormat::Pcm16 => prepare_pcm16(raw)?,
+        };
+        let title = std::str::from_utf8(r.input(title, title_length)?)
+            .map_err(|_| "Title must be ASCII")?
+            .to_owned();
+        r.quantizer()?.set_profile(profile);
+        r.encoder = Some(Encoder::with_profile(frames, pcm, title, audio, profile)?);
+        r.result.clear();
         Ok(())
     })
 }

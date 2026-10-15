@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {MupPlayer} from '../site/preview-player.mjs';
-import {CONTENT_FPS} from '../site/mup-decoder.mjs';
+import {CONTENT_FPS,NTSC_HZ} from '../site/mup-decoder.mjs';
 
 const flush=()=>new Promise(resolve=>setImmediate(resolve));
 function deferred() {let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no;});return {promise,resolve,reject};}
@@ -124,6 +124,17 @@ test('native PAL timing draws changed MUP frames only, independently of display 
   assert.equal(env.calls.frames.length,3);
   await env.advance(10);assert.equal(env.drawn.at(-1).index,59);assert.equal(env.player.snapshot.time,preview.header.duration);
   env.player.dispose();
+});
+test('NTSC four-refresh playback follows its own frame cadence and PCM16 source clock',async()=>{
+  const env=environment(),preview=env.makePreview('NTSC'),fps=NTSC_HZ/4;
+  preview.header={duration:30/fps,frameCount:30,sampleRate:48000,audioHz:6250000/130};
+  await env.player.load(preview);await env.player.play();
+  await env.advance(1/60);await env.advance(1/60);await env.advance(1/60);
+  assert.deepEqual(env.calls.frames.map(frame=>frame.index),[0]);
+  await env.advance(1/50);assert.equal(env.drawn.at(-1).index,1);
+  await env.player.seek(1);assert.equal(env.drawn.at(-1).index,14);
+  assert.equal(env.sources.at(-1).startAt.offset,preview.header.audioHz/48000);
+  assert.equal(env.sources.at(-1).playbackRate.value,preview.header.audioHz/48000);env.player.dispose();
 });
 test('playback errors are reported once and leave the player stopped',async()=>{
   const decode=deferred(),env=environment({decode});await env.player.load(env.makePreview());const playing=env.player.play();

@@ -46,6 +46,9 @@ browser_read_metadata:
     sta (browser_list_ptr),y
     ldy #14
     sta (browser_list_ptr),y
+    iny
+    lda #$ff
+    sta (browser_list_ptr),y
     ldy #0
     lda (browser_entry_ptr),y
     and #$10
@@ -83,17 +86,28 @@ browser_read_metadata:
     jmp !entry-
 
 browser_format_metadata:
-    // Exact PAL duration, rounded to the nearest second:
-    // (record_count * 63 * 312 + 985248/2) / 985248.
-    // This runs only while browsing; no approximation of PAL as 50 Hz.
+    // Round the duration using the profile's exact PHI2 frame length/clock.
+    // The decoder always consumes one record per raster refresh.
     lda HEADER+24
     sta browser_multiplier
     lda HEADER+25
     sta browser_multiplier+1
-    lda #<(63*312)
+    ldx #0
+    lda HEADER+80
+    cmp #3
+    bcc !standard+
+    inx
+!standard:
+    lda browser_frame_low,x
     sta browser_factor
-    lda #>(63*312)
+    lda browser_frame_high,x
     sta browser_factor+1
+    lda browser_clock_0,x
+    sta browser_metadata_clock+0
+    lda browser_clock_1,x
+    sta browser_metadata_clock+1
+    lda browser_clock_2,x
+    sta browser_metadata_clock+2
     lda #0
     sta browser_factor+2
     sta browser_factor+3
@@ -119,12 +133,25 @@ browser_format_metadata:
     rol browser_factor+3
     dex
     bne !multiply-
+    ldx #0
+    lda HEADER+80
+    cmp #3
+    bcc !rounding+
+    inx
+!rounding:
     clc
-    .for (var part=0;part<4;part++) {
-        lda browser_number+part
-        adc #((492624 >> (part*8)) & 255)
-        sta browser_number+part
-    }
+    lda browser_number+0
+    adc browser_half_clock_0,x
+    sta browser_number+0
+    lda browser_number+1
+    adc browser_half_clock_1,x
+    sta browser_number+1
+    lda browser_number+2
+    adc browser_half_clock_2,x
+    sta browser_number+2
+    lda browser_number+3
+    adc #0
+    sta browser_number+3
     lda #0
     sta browser_factor
     sta browser_factor+1
@@ -132,23 +159,30 @@ browser_format_metadata:
     lda browser_number+3
     bne !subtract+
     lda browser_number+2
-    cmp #((985248 >> 16) & 255)
+    cmp browser_metadata_clock+2
     bcc !minutes+
     bne !subtract+
     lda browser_number+1
-    cmp #((985248 >> 8) & 255)
+    cmp browser_metadata_clock+1
     bcc !minutes+
     bne !subtract+
     lda browser_number
-    cmp #(985248 & 255)
+    cmp browser_metadata_clock
     bcc !minutes+
 !subtract:
     sec
-    .for (var part=0;part<4;part++) {
-        lda browser_number+part
-        sbc #((985248 >> (part*8)) & 255)
-        sta browser_number+part
-    }
+    lda browser_number+0
+    sbc browser_metadata_clock+0
+    sta browser_number+0
+    lda browser_number+1
+    sbc browser_metadata_clock+1
+    sta browser_number+1
+    lda browser_number+2
+    sbc browser_metadata_clock+2
+    sta browser_number+2
+    lda browser_number+3
+    sbc #0
+    sta browser_number+3
     inc browser_factor
     bne !seconds-
     inc browser_factor+1
@@ -298,7 +332,18 @@ browser_format_metadata:
     iny
     lda #0
     sta (browser_list_ptr),y
+    ldy #15
+    lda HEADER+80
+    sta (browser_list_ptr),y
     rts
+browser_frame_low: .byte <(63*312),<(65*263)
+browser_frame_high: .byte >(63*312),>(65*263)
+browser_clock_0: .byte 160,10
+browser_half_clock_0: .byte 80,133
+browser_clock_1: .byte 8,155
+browser_half_clock_1: .byte 132,205
+browser_clock_2: .byte 15,15
+browser_half_clock_2: .byte 7,7
 browser_size_low: .byte <1000,<100,<10
 browser_size_high: .byte >1000,>100,>10
 

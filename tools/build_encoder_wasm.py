@@ -26,6 +26,7 @@ REQUIRED = {
     "mup_lut_identity", "mup_lut_info", "mup_lut_patterns", "mup_lut_asset_begin", "mup_lut_asset_chunk",
     "mup_lut_asset_end", "mup_lut_asset_abort", "mup_lut_reset",
     "mup_lut_plans_ptr", "mup_lut_plans_len", "mup_pack_plans",
+    "mup_profile_info", "mup_fit", "mup_set_profile", "mup_audio_info", "mup_begin_profile",
 }
 
 def main() -> None:

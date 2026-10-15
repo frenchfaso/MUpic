@@ -1,7 +1,7 @@
-import {MupPreview,CONTENT_FPS} from './mup-decoder.mjs';
-import {MupPlayer} from './preview-player.mjs?v=6fb2d3e599591c82';
-import {videoPlan,asciiTitle,decodePcm,decodePcm8Source,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=0dd23ebe63904142';
-import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=771804d54a1c14b7';
+import {MupPreview} from './mup-decoder.mjs?v=bf988c9a98d52290';
+import {MupPlayer} from './preview-player.mjs?v=ba45601c5bfd1eb3';
+import {videoPlan,asciiTitle,decodePcmSource,seekFrame,captureRgb,checkAbort,waitEvent,awaitAbort} from './media.mjs?v=99d5e4f3a5b246a4';
+import {WorkerClient,QuantizerPool} from './worker-pool.mjs?v=e358799a317c3c0d';
 import {ConversionProgress} from './conversion-progress.mjs?v=ff2c0e223da601a2';
 import { ensureIsolation } from './isolation.mjs?v=26c03e13fa61303e';
 await ensureIsolation();
@@ -24,6 +24,24 @@ const hasLut=()=>Boolean(pool?.lutReady&&!pool.closed&&!pool.workers[0]?.closed)
 const originalControls=$('original-controls'),mupControls=$('mup-controls');
 let originalStarting=false,originalPlaySerial=0,originalFrame=null;
 const conversionDialog=$('conversion-dialog'),tableDialog=$('lut-dialog');
+function settings() {
+  const value=name=>document.querySelector(`input[name="${name}"]:checked`).value;
+  const ntsc=value('system-mode')==='ntsc',hd=value('video-profile')==='hd';
+  return {profile:(ntsc?3:1)+(hd?1:0),ntsc,hd,audioFormat:value('audio-format')};
+}
+function updateOptionHints() {
+  const {ntsc,hd,audioFormat}=settings();
+  $('profile-hint').textContent=hd?'720p / 1080p':ntsc?'480p':'576p';
+  $('audio-hint').textContent=`Source rate · Auto level${audioFormat==='pcm8'?'\nHQ noise shaping':''}`;
+}
+async function selectedPlan(signal) {
+  const active=await awaitAbort(readyPool(),signal);checkAbort(signal);
+  const info=await awaitAbort(active.videoPlan(settings().profile,decoder.videoWidth,decoder.videoHeight),signal);
+  const next=videoPlan(decoder.duration,decoder.videoWidth,decoder.videoHeight,info);
+  $('comparison').style.setProperty('--preview-aspect',`${360*info.profile.pixelAspectNumerator} / ${200*info.profile.pixelAspectDenominator}`);
+  return next;
+}
+updateOptionHints();
 function status(message,{error=false}={}) {
   $('conversion-status').textContent=message;
   $('conversion-status').classList.toggle('error',error);
@@ -114,7 +132,7 @@ function clearOutput() {
 function setBusy(value) {
   busy=value;$('choose-video').disabled=value;$('video-file').disabled=value;
   $('encode').disabled=value||!selected||!plan;
-  $('audio-format').disabled=value;
+  for(const fieldset of $('encoding-options').querySelectorAll('fieldset'))fieldset.disabled=value;
   $('drop-zone').classList.toggle('busy',value);
 }
 async function readyPool() {
@@ -176,10 +194,10 @@ async function selectFile(file) {
   try {
     await waitEvent(decoder,'loadedmetadata',{signal});checkAbort(signal);
     if(serial!==loadSerial)return;
-    plan=videoPlan(decoder.duration,decoder.videoWidth,decoder.videoHeight);selected=file;
+    plan=await selectedPlan(signal);checkAbort(signal);selected=file;
     $('comparison').hidden=false;
     $('file-details').textContent=`${file.name} · ${timeLabel(decoder.duration)} · ${sizeLabel(file.size)}`;
-    resultStatus('Video ready. Choose the audio format, then press Encode.');
+    resultStatus('Video ready. Choose your options, then press Encode.');
   } catch(error) {
     selected=null;plan=null;
     clearOutput();
@@ -197,6 +215,7 @@ async function encodeSelected() {
   abortController=new AbortController();const signal=abortController.signal;
   setBusy(true);
   try {
+    plan=await selectedPlan(signal);checkAbort(signal);
     await convertSelected(signal);
   } catch(error) {
     clearOutput();
@@ -209,10 +228,11 @@ async function encodeSelected() {
   }
 }
 $('encode').addEventListener('click',encodeSelected);
-$('audio-format').addEventListener('change',()=>{
+$('encoding-options').addEventListener('change',()=>{
+  updateOptionHints();
   if(selected&&!busy) {
     clearOutput();
-    resultStatus('Audio format updated. Press Encode when ready.');
+    resultStatus('Options updated. Press Encode when ready.');
   }
 });
 $('choose-video').addEventListener('click',()=>{$('video-file').value='';$('video-file').click();});
@@ -254,17 +274,15 @@ async function convertSelected(signal) {
     if(!hasLut()&&!standardEncoding)throw new DOMException('Color table loading was cancelled.','AbortError');
   }
   await awaitAbort(readyPool(),signal);checkAbort(signal);status('Preparing audio…');
-  let audioFormat=document.querySelector('input[name="audio-format"]:checked').value;
-  const audio=audioFormat==='pcm8'
-    ?await decodePcm8Source(selected,plan.duration,{signal})
-    :{pcm:await decodePcm(selected,plan.duration,{signal}),sampleRate:22085};
+  await awaitAbort(pool.setProfile(plan.profile.id),signal);checkAbort(signal);
+  const {audioFormat}=settings();
+  const audio=await decodePcmSource(selected,plan.duration,{signal,audioInfo:sampleRate=>pool.audioInfo(audioFormat,sampleRate)});
   const {pcm,sampleRate}=audio;
-  if(audioFormat==='pcm8'&&!pcm.byteLength)audioFormat='pcm16';
   checkAbort(signal);
   encoder=new WorkerClient(assetUrl('./encoder-worker.mjs'));
   status('Preparing…');
   await encoder.call('init',{url:wasmUrl,module:pool.module});checkAbort(signal);
-  await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name),audioFormat,sampleRate},[pcm.buffer]);
+  await encoder.call('begin',{frameCount:plan.frameCount,pcm:pcm.buffer,title:asciiTitle(selected.name),audioFormat,sampleRate,profile:plan.profile.id},[pcm.buffer]);
   updateProgress(progress.start());
   const pending=[];
   const addChunks=chunks=>{for(const chunk of chunks)parts.push(new Blob([chunk]));};
@@ -283,7 +301,7 @@ async function convertSelected(signal) {
   for(let first=0;first<plan.frameCount;first+=batchFrames) {
     const frames=[],last=Math.min(first+batchFrames,plan.frameCount);
     for(let index=first;index<last;index++) {
-      checkAbort(signal);await seekFrame(decoder,index/CONTENT_FPS,signal);
+      checkAbort(signal);await seekFrame(decoder,index/plan.fps,signal);
       frames.push(captureRgb(decoder,captureContext,plan));
     }
     // Capture overlaps color planning; final codec writes retain frame order.
@@ -310,7 +328,7 @@ async function convertSelected(signal) {
   if(!painted)throw new Error('The MUpic preview could not be displayed.');
   $('download').hidden=false;
   $('conversion-progress').value=progress.complete().value;
-  resultStatus(`Ready · ${sizeLabel(movie.size)} · ${preview.header.pcm8?'PCM8 HQ':'PCM16'} · ${(preview.header.sampleRate/1000).toLocaleString(undefined,{maximumFractionDigits:3})} kHz`);
+  resultStatus(`Ready · ${sizeLabel(movie.size)} · ${plan.fps.toFixed(1)} fps · ${preview.header.pcm8?'PCM8 HQ':'PCM16'} · ${(preview.header.sampleRate/1000).toLocaleString(undefined,{maximumFractionDigits:3})} kHz`);
 }
 window.addEventListener('pagehide',event=>{
   abortController?.abort();preparationController?.abort();pool?.close();encoder?.close();pauseOriginal();

@@ -7,18 +7,19 @@
   <meta name="description" content="MUpic video on the Commodore 64 Ultimate. Sixteen colors, one player, and a little movie magic.">
   <title>MUpic</title>
   <link rel="stylesheet" href="style.css?v=2c2788e5b9182da6">
-  <link rel="stylesheet" href="mupic.css?v=a8e271e937ab32a9">
+  <link rel="stylesheet" href="mupic.css?v=0e86500b01dd4537">
 </head>
 <body data-preset="mupic">
   <main>
+    <nav class="project-nav" aria-label="Project">
+      <span aria-current="page">Demo</span>
+      <a href="convert.html">Encoder</a>
+      <a href="https://github.com/frenchfaso/MUpic">GitHub</a>
+    </nav>
     <header class="page-title">
       <h1>MUpic</h1>
+      <p class="page-expansion">(Motion UPIC)</p>
       <p class="page-subtitle">16 colors is all you need!</p>
-      <nav class="project-nav" aria-label="Project">
-        <span aria-current="page">Demo</span>
-        <a href="convert.html">Encoder</a>
-        <a href="https://github.com/frenchfaso/MUpic">GitHub</a>
-      </nav>
     </header>
     <section class="emulator" aria-label="MUpic Player on Commodore 64 Ultimate">
       <div class="hardware-stage">
@@ -40,7 +41,10 @@
         <p id="player-keys" class="sr-only">Up and Down select a video. Return plays it. Space pauses or resumes. Escape returns to the list.</p>
       </nav>
     </section>
-    <p class="tech-credit">UPIC by <a href="https://csdb.dk/release/?id=263980">Aleksi Eeben</a> · Color selection and dithering by <a href="https://bisqwit.iki.fi/story/howto/dither/jy/">Joel Yliluoma (Bisqwit)</a>.</p>
+    <footer class="tech-credit">
+      <p>MUpic is a video format for the C64 Ultimate — up to 360×200, 16 colors at 16.7 fps (PAL).</p>
+      <p>Made possible thanks to the invaluable work of <a href="https://csdb.dk/release/?id=263980">Aleksi Eeben</a> (UPIC) and <a href="https://bisqwit.iki.fi/story/howto/dither/jy/">Joel Yliluoma / Bisqwit</a> (color selection and dithering).</p>
+    </footer>
     <dialog id="player-progress" class="progress-dialog" aria-labelledby="player-progress-title" aria-describedby="runtime-status">
       <h2 id="player-progress-title">Starting player</h2>
       <p id="runtime-status" class="progress-status" role="status" aria-live="polite">Loading player…</p>
@@ -51,6 +55,6 @@
       </div>
     </dialog>
   </main>
-  <script type="module" src="app.js?v=559f37f2f295c7f3"></script>
+  <script type="module" src="app.js?v=06e4b43c618c7828"></script>
 </body>
 </html>

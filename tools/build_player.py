@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the SD, PAL/3 standalone player using KickAssembler and Java."""
+"""Build the PAL/3 and NTSC/4 standalone player using KickAssembler and Java."""
 import argparse, hashlib, json, re, shutil
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -119,7 +119,11 @@ def main():
     assemble(ROOT/'player/player_generic.asm',b/'mupic-core.prg')
     symbols={name:int(address,16) for address,name in re.findall(r'al C:([0-9a-fA-F]+) \.([^\s]+)',(b/'mupic-core.vs').read_text())}
     package_hardware_loader(b/'mupic-core.prg',symbols,b)
-    shutil.copy2(ROOT/'releases/ultimate-pal.cfg',b/'MUPIC.cfg')
+    # Per-program autoload must preserve the user's chosen PAL/NTSC and HDMI
+    # mode. The reference configuration's SD setting belongs to the demo.
+    settings=(ROOT/'releases/ultimate-pal.cfg').read_text().splitlines()
+    (b/'MUPIC.cfg').write_text('\n'.join(line for line in settings
+        if not line.startswith(('HDMI Scan Resolution=', 'System Mode=')))+'\n')
     if not (b/'MUPIC.PRG').exists() or not (b/'MUPIC.PRG').samefile(b/'mupic.prg'):
         shutil.copy2(b/'mupic.prg',b/'MUPIC.PRG')
     print(json.dumps(dict(player=str(b/'MUPIC.PRG'),sha256=hashlib.sha256((b/'MUPIC.PRG').read_bytes()).hexdigest()),indent=2))

@@ -24,7 +24,7 @@ playback_control:
 !done:
     rts
 
-// The sampler has no readable position/pause register. A PAL-edge pause is
+// The sampler has no readable position/pause register. A refresh-edge pause is
 // resumed at the nearest stereo sample interpolated within the authored PCM
 // block. Its full byte length anchors each calculation: no cross-block drift.
 // Main executes this arithmetic while IRQs continue scanning the frozen image.
@@ -32,6 +32,7 @@ prepare_audio_resume:
     lda #0
     sta audio_resume_offset
     sta audio_resume_offset+1
+    sta audio_resume_offset+2
     sta audio_resume_active
     lda audio_pending_start
     beq !current+
@@ -61,12 +62,16 @@ prepare_audio_resume:
     sta audio_calc_samples
     lda active_audio_length+1
     sta audio_calc_samples+1
-    lsr audio_calc_samples+1
+    lda active_audio_length+2
+    sta audio_calc_samples_high
+    lsr audio_calc_samples_high
+    ror audio_calc_samples+1
     ror audio_calc_samples
     lda HEADER+7
     and #2
     bne !samples_ready+
-    lsr audio_calc_samples+1
+    lsr audio_calc_samples_high
+    ror audio_calc_samples+1
     ror audio_calc_samples
 !samples_ready:
     lda #0
@@ -86,7 +91,7 @@ prepare_audio_resume:
     adc audio_calc_samples+1
     sta audio_calc_sum+1
     lda audio_calc_sum+2
-    adc #0
+    adc audio_calc_samples_high
     sta audio_calc_sum+2
     dey
     bne !multiply-
@@ -120,17 +125,25 @@ prepare_audio_resume:
 !rounded:
     asl audio_calc_sum
     rol audio_calc_sum+1
+    rol audio_calc_sum+2
     lda HEADER+7
     and #2
     bne !bytes_ready+
     asl audio_calc_sum
     rol audio_calc_sum+1
+    rol audio_calc_sum+2
 !bytes_ready:
     lda audio_calc_sum
     sta audio_resume_offset
     lda audio_calc_sum+1
     sta audio_resume_offset+1
+    lda audio_calc_sum+2
+    sta audio_resume_offset+2
     // Keep a nonzero aligned tail at extremely low sample rates.
+    cmp active_audio_length+2
+    bcc !done+
+    bne !clamp+
+    lda audio_resume_offset+1
     cmp active_audio_length+1
     bcc !done+
     bne !clamp+
@@ -152,5 +165,8 @@ prepare_audio_resume:
     lda active_audio_length+1
     sbc #0
     sta audio_resume_offset+1
+    lda active_audio_length+2
+    sbc #0
+    sta audio_resume_offset+2
 !done:
     rts
